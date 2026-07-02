@@ -1941,6 +1941,11 @@ def parse_args():
         action="store_true",
         help="启用可灵多镜头模式（intelligence 分镜），提升场景连贯性",
     )
+    parser.add_argument(
+        "--manual",
+        action="store_true",
+        help="手动模式：逐字段填写产品信息（默认为主题模式，输入一句话自动展开）",
+    )
     return parser.parse_args()
 
 
@@ -4080,6 +4085,65 @@ def run_one_click_create(
         raise
 
 
+def expand_theme_with_llm(theme: str, args) -> Optional[dict]:
+    """
+    主题模式核心：将一句主题描述交给 LLM 展开为完整的 product_info + args 参数包。
+
+    返回格式：
+        {
+            "product_info": { name, type, selling_point, audience, style, age, gender, outfit },
+            "args": { style, script_style, hook, rhythm_style, target_duration, voiceover, voice }
+        }
+    或 None（LLM 不可用 / 调用失败）。
+    """
+    from config import LLM_ENABLED
+    if not LLM_ENABLED:
+        return None
+
+    try:
+        from llm_client import generate_json
+    except ImportError:
+        return None
+
+    system_prompt = """你是专业的短视频广告策划专家。用户会给你一句产品主题描述，
+你需要根据主题自动推断出最适合的广告参数，以严格的 JSON 格式输出，不要有任何额外说明。
+
+输出字段说明：
+product_info:
+  name: 产品名称（简洁，2-8字）
+  type: 产品类型，从以下选择：美妆 食品 科技 服装 app 家居 健康 母婴 宠物 运动 default
+  selling_point: 核心卖点（一句话，10-25字，突出用户利益）
+  audience: 目标人群（如 18-30岁都市女性）
+  style: 广告风格（如 温暖治愈、科技感、青春活力、极简高端）
+  age: 主角年龄（数字，如 25）
+  gender: 主角性别（女 或 男）
+  outfit: 服装描述（英文，符合场景和受众，如 casual cozy sweater）
+
+args:
+  style: 电影风格，从以下选一个最合适的：hitchcock kubrick spielberg aronofsky scorsese nolan anderson wong-kar-wai tarkovsky zhang-yimou koreeda tarantino jia-zhangke hou-hsiao-hsien bong-joon-ho denis-villeneuve luc-besson miyazaki
+  script_style: 脚本风格，从以下选一个：pain_point_solution before_after storytelling demonstration social_proof
+  hook: 开场钩子，从以下选一个：question shocking before_after demonstration story challenge celeb_style pain_point
+  rhythm_style: 节奏风格，从以下选一个：fast moderate cinematic
+  target_duration: 目标总时长（秒，整数，建议 15/25/30/60 之一）
+  voiceover: 是否需要口播旁白（true 或 false）
+  voice: 音色，从以下选一个：female_young female_warm male_pro male_magnetic energetic_female
+
+选择原则：
+- 温暖/情感类产品 → miyazaki / wong-kar-wai + storytelling + story
+- 科技/功能类产品 → nolan / denis-villeneuve + demonstration + shocking
+- 美妆/时尚类产品 → luc-besson / zhang-yimou + pain_point_solution + pain_point
+- 食品/生活类产品 → spielberg / koreeda + before_after + question
+- 快节奏产品 → rhythm_style=fast；沉浸式产品 → rhythm_style=cinematic
+- 需要讲解的功能性产品开启 voiceover=true，纯视觉类 voiceover=false"""
+
+    prompt = f"请根据以下主题展开广告参数：\n\n{theme}"
+
+    result = generate_json(prompt, system_prompt=system_prompt)
+    if not result or "product_info" not in result:
+        return None
+    return result
+
+
 def main():
     """主函数：一键成片"""
     args = parse_args()
@@ -4307,28 +4371,97 @@ def main():
         print("✅ 环境检查通过")
         print()
 
-        print("请输入产品信息（直接回车使用默认值）：")
-        print()
+        # ── 主题模式（默认）vs 手动模式（--manual）──────────────────
+        _use_manual = getattr(args, "manual", False)
 
-        product_name = input_with_default("产品名称", "我的产品")
-        product_type = input_with_default("产品类型（美妆/食品/科技/服装/app）", "default")
-        selling_point = input_with_default("核心卖点", "卓越品质，值得拥有")
-        audience = input_with_default("目标人群", "18-35岁")
-        style = input_with_default("广告风格", "现代简约")
-        character_age = input_with_default("角色年龄", "25")
-        character_gender = input_with_default("角色性别（女/男）", "女")
-        outfit = input_with_default("服装描述", "casual everyday clothes")
+        if not _use_manual:
+            print("💡 主题模式：输入一句话描述你的产品，其余参数由 AI 自动决定")
+            print("   （例：一款帮助上班族缓解颈椎疼痛的按摩枕）")
+            print("   输入 'm' 切换到手动填写模式")
+            print()
+            _theme_input = input("请输入产品主题：").strip()
+            if _theme_input.lower() == "m":
+                _use_manual = True
+            elif not _theme_input:
+                print("⚠️  未输入主题，切换到手动模式")
+                _use_manual = True
 
-        product_info = {
-            "name": product_name,
-            "type": product_type,
-            "selling_point": selling_point,
-            "audience": audience,
-            "style": style,
-            "age": character_age,
-            "gender": character_gender,
-            "outfit": outfit,
-        }
+        if not _use_manual:
+            print()
+            print("🤖 AI 正在解析主题，生成最佳参数配置...")
+            _expanded = expand_theme_with_llm(_theme_input, args)
+            if _expanded is None:
+                print("⚠️  LLM 不可用（未配置或调用失败），切换到手动填写模式")
+                print("   提示：在 config.py 中配置 LLM_API_KEY 和 LLM_BASE_URL 以启用主题模式")
+                print()
+                _use_manual = True
+            else:
+                product_info = _expanded["product_info"]
+                # 将 LLM 推荐的 args 参数回写到 args 对象
+                _llm_args = _expanded.get("args", {})
+                _VALID_STYLES = {
+                    "hitchcock", "kubrick", "spielberg", "aronofsky", "scorsese",
+                    "nolan", "anderson", "wong-kar-wai", "tarkovsky", "zhang-yimou",
+                    "koreeda", "tarantino", "jia-zhangke", "hou-hsiao-hsien",
+                    "bong-joon-ho", "denis-villeneuve", "luc-besson", "miyazaki",
+                }
+                _VALID_SCRIPT_STYLES = {
+                    "pain_point_solution", "before_after", "storytelling",
+                    "demonstration", "social_proof",
+                }
+                _VALID_HOOKS = {
+                    "question", "shocking", "before_after", "demonstration",
+                    "story", "challenge", "celeb_style", "pain_point",
+                }
+                _VALID_RHYTHMS = {"fast", "moderate", "cinematic"}
+                _VALID_VOICES = {
+                    "female_young", "female_warm", "male_pro",
+                    "male_magnetic", "energetic_female",
+                }
+                if _llm_args.get("style") in _VALID_STYLES:
+                    args.style = _llm_args["style"]
+                if _llm_args.get("script_style") in _VALID_SCRIPT_STYLES:
+                    args.script_style = _llm_args["script_style"]
+                if _llm_args.get("hook") in _VALID_HOOKS:
+                    args.hook = _llm_args["hook"]
+                if _llm_args.get("rhythm_style") in _VALID_RHYTHMS:
+                    args.rhythm_style = _llm_args["rhythm_style"]
+                if isinstance(_llm_args.get("target_duration"), int):
+                    args.target_duration = _llm_args["target_duration"]
+                if isinstance(_llm_args.get("voiceover"), bool):
+                    args.voiceover = _llm_args["voiceover"]
+                if _llm_args.get("voice") in _VALID_VOICES:
+                    args.voice = _llm_args["voice"]
+                print("✅ AI 参数配置完成")
+                # 主题模式下询问商品参考图（可选）
+                print()
+                _img_input = input("🖼️  商品参考图路径或 URL（直接回车跳过）：").strip()
+                if _img_input:
+                    args.product_image = _img_input
+                else:
+                    args.allow_no_product_image = True
+
+        if _use_manual:
+            print("请输入产品信息（直接回车使用默认值）：")
+            print()
+            product_name = input_with_default("产品名称", "我的产品")
+            product_type = input_with_default("产品类型（美妆/食品/科技/服装/app）", "default")
+            selling_point = input_with_default("核心卖点", "卓越品质，值得拥有")
+            audience = input_with_default("目标人群", "18-35岁")
+            style = input_with_default("广告风格", "现代简约")
+            character_age = input_with_default("角色年龄", "25")
+            character_gender = input_with_default("角色性别（女/男）", "女")
+            outfit = input_with_default("服装描述", "casual everyday clothes")
+            product_info = {
+                "name": product_name,
+                "type": product_type,
+                "selling_point": selling_point,
+                "audience": audience,
+                "style": style,
+                "age": character_age,
+                "gender": character_gender,
+                "outfit": outfit,
+            }
 
         print()
         print("=" * 60)
@@ -4360,7 +4493,7 @@ def main():
         # 文件大小预估
         from douyin_adapter import DOUYIN_CONFIG
         est_size = estimate_file_size(
-            duration=target_duration if target_duration else 25,
+            duration=getattr(args, "target_duration", None) or 25,
             bitrate=DOUYIN_CONFIG["bitrate"],
             audio_bitrate=DOUYIN_CONFIG.get("audio_bitrate", "160k"),
         )
