@@ -67,6 +67,10 @@ class VideoQualityResult:
     # 产品出现检测
     product_similarity: float = 0.0  # 产品参考图与抽帧的最高相似度
     product_detected: bool = False
+    # 语义/一致性门禁
+    character_similarity: float = 0.0  # 角色参考图与抽帧人物区域的最高相似度
+    character_consistent: bool = True
+    semantic_issues: List[str] = field(default_factory=list)
     # 通用
     issues: List[str] = field(default_factory=list)
     details: List[FrameQuality] = field(default_factory=list)
@@ -444,6 +448,26 @@ def _hist_similarity(h1: List[float], h2: List[float]) -> float:
     return sum(min(a, b) for a, b in zip(h1, h2))
 
 
+def _center_crop(img, ratio: float):
+    """返回中心裁剪区域。"""
+    w, h = img.size
+    cw, ch = int(w * ratio), int(h * ratio)
+    x1, y1 = (w - cw) // 2, (h - ch) // 2
+    return img.crop((x1, y1, x1 + cw, y1 + ch))
+
+
+def _visual_similarity(ref_img, cand_img) -> float:
+    """
+    轻量视觉相似度：感知哈希 + 颜色直方图。
+
+    这不是 CLIP/人脸 embedding，但比单一颜色或肤色面积稳定，
+    适合作为无额外模型依赖的发布门禁下限。
+    """
+    hash_score = _hash_similarity(_average_hash(ref_img), _average_hash(cand_img))
+    hist_score = _hist_similarity(_color_histogram(ref_img), _color_histogram(cand_img))
+    return hash_score * 0.45 + hist_score * 0.55
+
+
 def _product_similarity(product_image: Path, frame_paths: List[Path]) -> float:
     """
     轻量产品出现检测：比较商品参考图与抽帧/中心裁剪的感知哈希和颜色直方图。
@@ -462,23 +486,66 @@ def _product_similarity(product_image: Path, frame_paths: List[Path]) -> float:
         try:
             with Image.open(frame_path) as src:
                 frame = src.convert("RGB")
-            w, h = frame.size
             crops = [frame]
             # 商品广告通常主体在中心，额外比较中心 70% 和 50%。
             for ratio in (0.70, 0.50):
-                cw, ch = int(w * ratio), int(h * ratio)
-                x1, y1 = (w - cw) // 2, (h - ch) // 2
-                crops.append(frame.crop((x1, y1, x1 + cw, y1 + ch)))
+                crops.append(_center_crop(frame, ratio))
 
             for crop in crops:
-                hash_score = _hash_similarity(ref_hash, _average_hash(crop))
-                hist_score = _hist_similarity(ref_hist, _color_histogram(crop))
-                score = hash_score * 0.45 + hist_score * 0.55
+                score = _visual_similarity(ref, crop)
                 if score > best:
                     best = score
         except Exception:
             continue
 
+    return best
+
+
+def _crop_largest_skin_region(img_rgb):
+    """裁出最大肤色区域；找不到时返回中心 60% 兜底。"""
+    regions = _detect_skin_regions(img_rgb)
+    if not regions:
+        return _center_crop(img_rgb, 0.60)
+    x1, y1, x2, y2 = regions[0]["bbox"]
+    w, h = img_rgb.size
+    pad_x = max(8, int((x2 - x1) * 0.25))
+    pad_y = max(8, int((y2 - y1) * 0.25))
+    return img_rgb.crop((
+        max(0, x1 - pad_x),
+        max(0, y1 - pad_y),
+        min(w, x2 + pad_x),
+        min(h, y2 + pad_y),
+    ))
+
+
+def _character_similarity(character_reference_image: Path, frame_paths: List[Path]) -> float:
+    """
+    轻量角色一致性检测：参考图人物区域 vs 视频抽帧人物区域。
+
+    没有额外模型依赖，阈值需保守使用；目标是拦截明显换人/无人/构图漂移，
+    而不是替代专业人脸识别。
+    """
+    from PIL import Image
+
+    with Image.open(character_reference_image) as src:
+        ref = _crop_largest_skin_region(src.convert("RGB"))
+
+    best = 0.0
+    for frame_path in frame_paths:
+        try:
+            with Image.open(frame_path) as src:
+                frame = src.convert("RGB")
+            candidates = [
+                _crop_largest_skin_region(frame),
+                _center_crop(frame, 0.70),
+                _center_crop(frame, 0.50),
+            ]
+            for cand in candidates:
+                score = _visual_similarity(ref, cand)
+                if score > best:
+                    best = score
+        except Exception:
+            continue
     return best
 
 
@@ -651,6 +718,8 @@ def check_video_quality(
     content_focus: str = "default",
     require_audio: bool = False,
     product_reference_image: Optional[Path] = None,
+    character_reference_image: Optional[Path] = None,
+    require_semantic_alignment: bool = False,
 ) -> VideoQualityResult:
     """
     检测视频质量（画面 + 音频 + 黑帧）
@@ -661,6 +730,8 @@ def check_video_quality(
         content_focus: 内容关注点（default/center）
         require_audio: 是否要求视频必须包含音轨（最终成片应开启，AI原始片段可关闭）
         product_reference_image: 商品参考图；提供时启用轻量产品出现检测
+        character_reference_image: 角色参考图；提供时启用轻量角色一致性检测
+        require_semantic_alignment: 是否把语义一致性问题作为硬失败
 
     Returns:
         质量检测结果
@@ -844,6 +915,41 @@ def check_video_quality(
                 except Exception as e:
                     result.issues.append(f"[产品检测] 商品参考图检测失败：{e}")
 
+        # 角色一致性检测（有角色定妆照时启用）
+        if character_reference_image:
+            character_reference_image = Path(character_reference_image)
+            if character_reference_image.exists():
+                try:
+                    result.character_similarity = _character_similarity(character_reference_image, frames)
+                    severe_mismatch = result.character_similarity < 0.35
+                    result.character_consistent = result.character_similarity >= 0.50
+                    if severe_mismatch:
+                        msg = (
+                            f"[角色一致性] 严重缺少角色参考图特征"
+                            f"（相似度 {result.character_similarity:.2f} < 0.35），"
+                            "人物可能换脸/换人/缺失"
+                        )
+                        result.semantic_issues.append(msg)
+                        result.issues.append(msg)
+                        if require_semantic_alignment:
+                            result.passed = False
+                    elif result.character_similarity < 0.50:
+                        msg = (
+                            f"[角色一致性] 角色特征不足"
+                            f"（相似度 {result.character_similarity:.2f} < 0.50），建议人工确认人物连续性"
+                        )
+                        result.semantic_issues.append(msg)
+                        result.issues.append(msg)
+                    elif result.character_similarity < 0.60:
+                        msg = (
+                            f"[角色一致性] 角色特征较弱"
+                            f"（相似度 {result.character_similarity:.2f}），建议人工确认人物连续性"
+                        )
+                        result.semantic_issues.append(msg)
+                        result.issues.append(msg)
+                except Exception as e:
+                    result.issues.append(f"[角色一致性] 角色参考图检测失败：{e}")
+
         # 综合评分（0-100）
         score = 100
 
@@ -900,6 +1006,12 @@ def check_video_quality(
                 result.passed = False
             elif result.product_similarity < 0.35:
                 score -= 10
+
+        if character_reference_image and character_reference_image.exists():
+            if not result.character_consistent:
+                score -= 25
+            elif result.character_similarity < 0.60:
+                score -= 8
 
         if content_focus == "center":
             if center_sharpness_values:
@@ -1022,6 +1134,12 @@ def print_quality_report(result: VideoQualityResult, video_name: str = ""):
         print(f"    人脸异常帧：{result.face_issue_frames}/{result.frames_analyzed}（轻量初筛，仅供参考）")
         for issue in result.face_issues[:3]:
             print(f"      - {issue}")
+    if result.product_similarity > 0:
+        print(f"    商品参考相似度：{result.product_similarity:.2f}（{'✅ 检测到' if result.product_detected else '❌ 未达标'}）")
+    if result.character_similarity > 0:
+        print(f"    角色参考相似度：{result.character_similarity:.2f}（{'✅ 一致' if result.character_consistent else '❌ 不一致'}）")
+    if result.semantic_issues:
+        print(f"    语义门禁问题：{len(result.semantic_issues)} 项")
     print()
     print(f"  🔊 音频质量：")
     if result.audio_lufs != 0 or result.audio_peak != 0:

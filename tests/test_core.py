@@ -18,7 +18,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest
 
-from config import CINEMATIC_STYLES, PRODUCT_PRESETS, get_preset, DEFAULT_CINEMATIC_STYLE, KLING_PRICING
+from config import (
+    CINEMATIC_STYLES,
+    PRODUCT_PRESETS,
+    get_preset,
+    DEFAULT_CINEMATIC_STYLE,
+    KLING_PRICING,
+    KLING_VIDEO_MODEL,
+)
 from one_click_create import (
     apply_cinematic_style,
     generate_clip_prompts,
@@ -26,6 +33,17 @@ from one_click_create import (
     estimate_cost,
     print_cost_estimate,
     parse_args,
+    build_stable_output_name,
+    _bind_reference_tags_to_prompt,
+    _build_video_idempotency_key,
+    _build_clip_manifest,
+    _build_character_manifest,
+    _manifest_matches,
+    _score_candidate_video_quality,
+    _check_segment_semantic_quality,
+    _is_product_required_narrative,
+    _validate_product_image_file,
+    _write_clip_manifest,
 )
 
 
@@ -558,6 +576,141 @@ class TestProductPresenceDetection:
         assert _product_similarity(product, [frame]) < 0.45
 
 
+class TestSemanticQualityGates:
+    """测试语义质量门禁基础能力"""
+
+    def test_character_similarity_same_image_high(self, tmp_path):
+        """同一角色参考图与帧图应有较高相似度"""
+        from PIL import Image, ImageDraw
+        from quality_checker import _character_similarity
+
+        ref = tmp_path / "char.png"
+        frame = tmp_path / "frame.png"
+
+        img = Image.new("RGB", (180, 240), (245, 245, 245))
+        draw = ImageDraw.Draw(img)
+        draw.ellipse((55, 35, 125, 115), fill=(230, 160, 120))
+        draw.rectangle((70, 115, 110, 210), fill=(40, 80, 180))
+        img.save(ref)
+        img.save(frame)
+
+        assert _character_similarity(ref, [frame]) >= 0.75
+
+    def test_check_video_quality_accepts_semantic_gate_args(self):
+        """发布级质检应支持商品/角色语义门禁参数"""
+        import inspect
+        from quality_checker import check_video_quality
+
+        sig = inspect.signature(check_video_quality)
+        assert "character_reference_image" in sig.parameters
+        assert "require_semantic_alignment" in sig.parameters
+
+
+class TestResumeAndIdempotency:
+    """测试断点续跑和幂等键"""
+
+    def test_parse_args_has_resume_output_name_and_product_escape_hatch(self):
+        """CLI 应暴露续跑参数和无商品图显式放行参数"""
+        with patch.object(
+            sys,
+            "argv",
+            ["one_click_create.py", "--resume", "--output-name", "demo_run", "--allow-no-product-image"],
+        ):
+            args = parse_args()
+        assert args.resume is True
+        assert args.output_name == "demo_run"
+        assert args.allow_no_product_image is True
+
+    def test_stable_output_name_is_deterministic(self):
+        """相同输入和关键参数应生成相同续跑输出名"""
+        product_info = {"name": "测试产品", "type": "美妆", "selling_point": "清爽"}
+        with patch.object(sys, "argv", ["one_click_create.py", "--style", "none", "--seed", "42"]):
+            args = parse_args()
+        first = build_stable_output_name(product_info, args)
+        second = build_stable_output_name(product_info, args)
+        assert first == second
+        assert first.startswith("测试产品_")
+
+    def test_idempotency_key_is_stable_for_same_candidate(self):
+        """同一候选视频的幂等键必须稳定，供 POST 重试复用"""
+        key1 = _build_video_idempotency_key(
+            "prompt",
+            ["data:image/png;base64,abc"],
+            1,
+            Path("clip_01_demo_cand1.mp4"),
+            model="kling-v3-omni",
+            mode="pro",
+            duration=5,
+            aspect_ratio="9:16",
+            seed=42,
+        )
+        key2 = _build_video_idempotency_key(
+            "prompt",
+            ["data:image/png;base64,abc"],
+            1,
+            Path("clip_01_demo_cand1.mp4"),
+            model="kling-v3-omni",
+            mode="pro",
+            duration=5,
+            aspect_ratio="9:16",
+            seed=42,
+        )
+        assert key1 == key2
+        assert key1.startswith("kaa-")
+
+    def test_reference_binding_is_structured(self):
+        """参考图 tag 应以结构化语义块绑定，不再依赖泛关键词插入"""
+        prompt = "A person uses the product in a clean room."
+        result = _bind_reference_tags_to_prompt(
+            prompt,
+            [
+                {"role": "product", "image": "img1"},
+                {"role": "character", "image": "img2"},
+                {"role": "continuity", "image": "img3"},
+            ],
+            "showcase",
+        )
+        assert result.startswith("Reference image binding:")
+        assert "Product reference: <<<image_1>>>" in result
+        assert "Character reference: <<<image_2>>>" in result
+        assert "Continuity frame: <<<image_3>>>" in result
+        assert prompt in result
+
+    def test_reference_binding_uses_roles_not_narrative_guess(self):
+        """展示段如果只有角色图，也不能误标为 Product reference"""
+        result = _bind_reference_tags_to_prompt(
+            "A person talks to camera.",
+            [{"role": "character", "image": "img1"}],
+            "showcase",
+        )
+        assert "Character reference: <<<image_1>>>" in result
+        assert "Product reference: <<<image_1>>>" not in result
+
+    def test_clip_manifest_must_match_for_cache(self, tmp_path):
+        """片段缓存必须严格匹配 manifest，避免旧画面配新字幕"""
+        clip = tmp_path / "clip_01_demo.mp4"
+        clip.write_bytes(b"x" * 1024)
+        manifest = _build_clip_manifest(
+            final_prompt="old prompt",
+            ref_images=[{"role": "character", "image": "img1"}],
+            idx=1,
+            model="kling-v3-omni",
+            mode="pro",
+            duration=5,
+            aspect_ratio="9:16",
+            seed=42,
+            negative_prompt="bad",
+        )
+        manifest["target_name"] = clip.name
+        _write_clip_manifest(clip, manifest)
+
+        assert _manifest_matches(clip, manifest) is True
+
+        changed = dict(manifest)
+        changed["prompt_sha256"] = "different"
+        assert _manifest_matches(clip, changed) is False
+
+
 class TestBatchQualityDefaults:
     """测试批量模式质量默认值"""
 
@@ -569,6 +722,7 @@ class TestBatchQualityDefaults:
         assert args["strict_mode"] is True
         assert args["stabilize"] is True
         assert args["best_of"] == 2
+        assert args["allow_no_product_image"] is False
 
 
 class TestTrimOffsetCompensation:
@@ -1061,6 +1215,180 @@ class TestSeventhReviewFixes:
         src = Path("one_click_create.py").read_text(encoding="utf-8")
         assert "best_score <= 0" in src
         assert "无法选出有效片段" in src
+
+
+class TestFinalVideoQualityFixes:
+    """回归测试：发布级成片质量收敛修复"""
+
+    def test_stable_output_name_uses_effective_default_kling_model(self):
+        """未显式传 --kling-model 时，稳定输出名应绑定真实默认模型"""
+        args_default = MagicMock()
+        args_default.style = "none"
+        args_default.duration = 5
+        args_default.mode = "std"
+        args_default.aspect_ratio = "9:16"
+        args_default.product_image = "product.png"
+        args_default.hook = "question"
+        args_default.script_style = "pain_point_solution"
+        args_default.target_duration = None
+        args_default.rhythm_style = "moderate"
+        args_default.seed = 7
+        args_default.kling_model = None
+        args_default.multi_shot = False
+
+        args_explicit = MagicMock()
+        args_explicit.style = args_default.style
+        args_explicit.duration = args_default.duration
+        args_explicit.mode = args_default.mode
+        args_explicit.aspect_ratio = args_default.aspect_ratio
+        args_explicit.product_image = args_default.product_image
+        args_explicit.hook = args_default.hook
+        args_explicit.script_style = args_default.script_style
+        args_explicit.target_duration = args_default.target_duration
+        args_explicit.rhythm_style = args_default.rhythm_style
+        args_explicit.seed = args_default.seed
+        args_explicit.kling_model = KLING_VIDEO_MODEL
+        args_explicit.multi_shot = args_default.multi_shot
+
+        product_info = {"name": "同款面霜", "type": "beauty"}
+        assert build_stable_output_name(product_info, args_default) == build_stable_output_name(product_info, args_explicit)
+
+    def test_character_ref_manifest_invalidates_changed_character(self, tmp_path):
+        """同一个 output_name 下，人设变化必须让角色定妆照缓存失效"""
+        char_path = tmp_path / "demo_charA_ref.png"
+        char_path.write_bytes(b"x" * 2048)
+        product_info = {"name": "面霜", "type": "beauty"}
+        character = {"name": "Character A", "description": "25-year-old woman"}
+        prompt = "portrait prompt"
+
+        manifest = _build_character_manifest(
+            product_info=product_info,
+            character=character,
+            prompt=prompt,
+        )
+        _write_clip_manifest(char_path, manifest)
+        assert _manifest_matches(char_path, manifest)
+
+        changed_manifest = _build_character_manifest(
+            product_info=product_info,
+            character={"name": "Character A", "description": "45-year-old man"},
+            prompt="portrait prompt for another person",
+        )
+        assert not _manifest_matches(char_path, changed_manifest)
+
+    def test_candidate_quality_scoring_zeroes_failed_semantic_candidate(self, tmp_path):
+        """best-of 候选一旦未通过语义/质量门禁，择优分数必须归零"""
+        video_path = tmp_path / "candidate.mp4"
+        video_path.write_bytes(b"fake")
+        product_ref = tmp_path / "product.png"
+        product_ref.write_bytes(b"fake-product")
+        character_ref = tmp_path / "character.png"
+        character_ref.write_bytes(b"fake-character")
+
+        fake_result = MagicMock()
+        fake_result.passed = False
+        fake_result.overall_score = 96
+        fake_result.issues = ["[产品检测] 未检测到足够的商品参考图特征"]
+
+        with patch("one_click_create.check_video_quality", return_value=fake_result) as mocked_check:
+            score, issues = _score_candidate_video_quality(
+                video_path,
+                quality_frames=12,
+                product_reference_image=product_ref,
+                character_reference_image=character_ref,
+            )
+
+        assert score == 0.0
+        assert issues == fake_result.issues
+        mocked_check.assert_called_once()
+        kwargs = mocked_check.call_args.kwargs
+        assert kwargs["product_reference_image"] == product_ref
+        assert kwargs["character_reference_image"] == character_ref
+        assert kwargs["require_semantic_alignment"] is True
+        assert kwargs["content_focus"] == "center"
+
+    def test_best_of_uses_semantic_candidate_scoring(self):
+        """best-of 不应退回只按通用清晰度评分"""
+        src = Path("one_click_create.py").read_text(encoding="utf-8")
+        assert "_score_candidate_video_quality(" in src
+        assert "product_ref_for_candidate" in src
+        assert "character_ref_for_candidate" in src
+        assert "scores[cand_path] = score" in src
+
+    def test_wide_output_uses_same_semantic_quality_gate(self):
+        """16:9 版本也必须校验产品和角色语义，避免横版裁切后不可发布"""
+        src = Path("one_click_create.py").read_text(encoding="utf-8")
+        wide_block = src[src.index("开始 16:9 版本发布级质量检测"):src.index("print_quality_report(wide_quality_result")]
+        assert "product_reference_image=product_image_path if product_image_path else None" in wide_block
+        assert "character_reference_image=main_char_path if main_char_path else None" in wide_block
+        assert "require_semantic_alignment=True" in wide_block
+
+    def test_product_required_narrative_covers_review_and_proof(self):
+        """review/proof/demo 等产品相关段必须纳入产品语义门禁"""
+        for narrative in ("showcase", "cta", "review", "proof", "demo", "detail", "reason", "effect"):
+            assert _is_product_required_narrative(narrative)
+        assert not _is_product_required_narrative("hook")
+
+    def test_local_product_image_validation_rejects_non_image(self, tmp_path):
+        """本地商品参考图不能只检查 exists，损坏文件必须提前失败"""
+        bad_image = tmp_path / "product.png"
+        bad_image.write_text("not an image", encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="商品参考图"):
+            _validate_product_image_file(bad_image)
+
+    def test_local_product_image_validation_accepts_real_image(self, tmp_path):
+        """合法商品图应通过预检，避免误杀正常输入"""
+        from PIL import Image
+
+        image_path = tmp_path / "product.png"
+        img = Image.new("RGB", (512, 512), (240, 80, 60))
+        for x in range(128, 384):
+            for y in range(128, 384):
+                img.putpixel((x, y), (60, 180, 220))
+        img.save(image_path)
+
+        _validate_product_image_file(image_path)
+
+    def test_segment_semantic_quality_blocks_failed_product_segment(self, tmp_path):
+        """关键分镜语义失败必须阻断，不能只靠整片抽帧兜底"""
+        clip_path = tmp_path / "clip.mp4"
+        clip_path.write_bytes(b"fake video")
+        product_ref = tmp_path / "product.png"
+        product_ref.write_bytes(b"fake product")
+
+        fake_result = MagicMock()
+        fake_result.passed = False
+        fake_result.issues = ["[产品检测] 未检测到足够的商品参考图特征"]
+
+        with patch("one_click_create.check_video_quality", return_value=fake_result) as mocked_check:
+            with pytest.raises(RuntimeError, match="分段语义质检未通过"):
+                _check_segment_semantic_quality(
+                    clip_paths=[clip_path],
+                    successful_clip_indices=[2],
+                    ad_script={"segments": [{"narrative": "hook"}, {"narrative": "turning"}, {"narrative": "showcase"}]},
+                    product_image_path=product_ref,
+                    main_char_path=None,
+                    quality_frames=12,
+                )
+
+        kwargs = mocked_check.call_args.kwargs
+        assert kwargs["product_reference_image"] == product_ref
+        assert kwargs["content_focus"] == "center"
+
+    def test_publish_mode_blocks_missing_segments(self):
+        """strict 发布级成片缺段时必须阻断，避免生成缺 CTA/产品段的视频"""
+        src = Path("one_click_create.py").read_text(encoding="utf-8")
+        failed_block = src[src.index("if failed_indices:"):src.index("# 最少成功段数")]
+        assert "strict_mode and not preview" in failed_block
+        assert "发布级成片要求分镜完整" in failed_block
+
+    def test_rhythm_over_limit_blocks_in_strict_mode(self):
+        """节奏模板超过后期拉伸能力时，strict 模式不能只警告后继续"""
+        src = Path("one_click_create.py").read_text(encoding="utf-8")
+        rhythm_block = src[src.index("if _over_limit_segs:"):src.index("# 生成完整广告脚本")]
+        assert "strict_mode and not preview" in rhythm_block
+        assert "节奏模板存在超过当前生成片段后期拉伸能力" in rhythm_block
 
 
 if __name__ == "__main__":

@@ -26,12 +26,13 @@ import argparse
 import subprocess
 import math
 import shutil
+import hashlib
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 from threading import Lock
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from urllib.parse import urlparse
 
 from config import (
@@ -44,6 +45,8 @@ from config import (
     DEFAULT_MODE,
     DEFAULT_IMAGE_FIDELITY,
     DEFAULT_HUMAN_FIDELITY,
+    KLING_IMAGE_MODEL,
+    KLING_VIDEO_MODEL,
     DEFAULT_TRANSITIONS,
     DEFAULT_SUBTITLE_TEMPLATE,
     BGM_PATH,
@@ -142,6 +145,316 @@ from quality_checker import (
     check_video_quality,
     print_quality_report,
 )
+
+
+def _safe_output_stem(value: str) -> str:
+    """生成安全文件名前缀。"""
+    return "".join(c for c in value if c.isalnum() or c in "-_").strip() or "product"
+
+
+def build_stable_output_name(product_info: dict, args: argparse.Namespace) -> str:
+    """
+    基于产品信息和关键生成参数生成稳定输出名，用于 --resume 命中片段缓存。
+    """
+    relevant = {
+        "product_info": product_info,
+        "style": getattr(args, "style", DEFAULT_CINEMATIC_STYLE),
+        "duration": getattr(args, "duration", DEFAULT_VIDEO_DURATION),
+        "mode": getattr(args, "mode", DEFAULT_MODE),
+        "aspect_ratio": getattr(args, "aspect_ratio", DEFAULT_ASPECT_RATIO),
+        "product_image": str(getattr(args, "product_image", "") or ""),
+        "hook": getattr(args, "hook", DEFAULT_HOOK_TYPE),
+        "script_style": getattr(args, "script_style", DEFAULT_SCRIPT_STYLE),
+        "target_duration": getattr(args, "target_duration", None),
+        "rhythm_style": getattr(args, "rhythm_style", "moderate"),
+        "seed": getattr(args, "seed", None),
+        "kling_model": getattr(args, "kling_model", None) or KLING_VIDEO_MODEL,
+        "multi_shot": getattr(args, "multi_shot", False),
+    }
+    digest = hashlib.sha256(
+        json.dumps(relevant, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:12]
+    return f"{_safe_output_stem(product_info.get('name', 'product'))}_{digest}"
+
+
+def _hash_reference_images(ref_images: list[str]) -> list[str]:
+    """把参考图内容压缩成短哈希，避免幂等键包含大段 base64。"""
+    hashes = []
+    for img in ref_images:
+        hashes.append(hashlib.sha256(str(img).encode("utf-8")).hexdigest()[:16])
+    return hashes
+
+
+def _ref_image_values(ref_images: list) -> list[str]:
+    """兼容旧字符串列表和带 role 的参考图条目。"""
+    values = []
+    for item in ref_images:
+        if isinstance(item, dict):
+            img = item.get("image", "")
+        else:
+            img = item
+        if img:
+            values.append(img)
+    return values
+
+
+def _clip_manifest_path(video_path: Path) -> Path:
+    """返回片段对应的 manifest 路径。"""
+    return video_path.with_name(f"{video_path.stem}.manifest.json")
+
+
+def _build_clip_manifest(
+    *,
+    final_prompt: str,
+    ref_images: list,
+    idx: int,
+    model: Optional[str],
+    mode: str,
+    duration: int,
+    aspect_ratio: str,
+    seed: Optional[int],
+    negative_prompt: str,
+) -> dict:
+    """构建片段缓存契约，只有契约一致才能复用旧片段。"""
+    ref_values = _ref_image_values(ref_images)
+    ref_roles = [
+        item.get("role", "unknown") if isinstance(item, dict) else "unknown"
+        for item in ref_images
+    ]
+    return {
+        "version": 1,
+        "clip_index": idx,
+        "prompt_sha256": hashlib.sha256(final_prompt.encode("utf-8")).hexdigest(),
+        "reference_hashes": _hash_reference_images(ref_values),
+        "reference_roles": ref_roles,
+        "model": model,
+        "mode": mode,
+        "duration": duration,
+        "aspect_ratio": aspect_ratio,
+        "seed": seed,
+        "negative_prompt_sha256": hashlib.sha256(negative_prompt.encode("utf-8")).hexdigest(),
+    }
+
+
+def _manifest_matches(video_path: Path, expected_manifest: dict) -> bool:
+    """检查片段 manifest 是否与当前生成契约一致。"""
+    manifest_path = _clip_manifest_path(video_path)
+    if not manifest_path.exists():
+        return False
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            actual = json.load(f)
+    except Exception:
+        return False
+    return actual == expected_manifest
+
+
+def _write_clip_manifest(video_path: Path, manifest: dict) -> None:
+    """写入片段 manifest。"""
+    manifest_path = _clip_manifest_path(video_path)
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+PRODUCT_REQUIRED_NARRATIVES = {
+    "showcase", "cta", "demonstration", "product", "result",
+    "review", "proof", "demo", "detail", "reason", "effect",
+    "highlight", "solution", "good_choice", "product_intro",
+    "effect_show", "compare_result", "reason_1", "reason_2",
+    "reason_3", "cta_summary", "cta_choose",
+}
+
+
+def _is_product_required_narrative(narrative: str) -> bool:
+    """判断某个叙事段是否必须强约束产品露出。"""
+    normalized = (narrative or "").lower().strip()
+    return normalized in PRODUCT_REQUIRED_NARRATIVES
+
+
+def _score_candidate_video_quality(
+    video_path: Path,
+    *,
+    quality_frames: int,
+    product_reference_image: Optional[Path] = None,
+    character_reference_image: Optional[Path] = None,
+) -> Tuple[float, List[str]]:
+    """候选片段择优评分；语义门禁失败的候选不能被选中。"""
+    quality_result = check_video_quality(
+        video_path,
+        num_frames=int(quality_frames or 12),
+        content_focus="center" if product_reference_image else "default",
+        product_reference_image=product_reference_image,
+        character_reference_image=character_reference_image,
+        require_semantic_alignment=bool(character_reference_image),
+    )
+    score = float(quality_result.overall_score or 0) if quality_result.passed else 0.0
+    return score, list(quality_result.issues or [])
+
+
+def _validate_product_image_file(image_path: Path) -> None:
+    """发布级商品参考图预检，避免损坏/低质素材污染生成。"""
+    from PIL import Image, ImageStat
+
+    if not image_path.exists():
+        raise FileNotFoundError(f"商品参考图不存在：{image_path}")
+    if image_path.stat().st_size < 1024:
+        raise RuntimeError(f"商品参考图文件过小，可能不是有效图片：{image_path}")
+
+    try:
+        with Image.open(image_path) as src:
+            src.verify()
+        with Image.open(image_path) as src:
+            img = src.convert("RGBA")
+    except Exception as e:
+        raise RuntimeError(f"商品参考图不可读取或格式损坏：{image_path}") from e
+
+    width, height = img.size
+    min_side = min(width, height)
+    if min_side < 256:
+        raise RuntimeError(
+            f"商品参考图分辨率过低（{width}x{height}），建议最短边至少 512px"
+        )
+
+    alpha = img.getchannel("A")
+    alpha_stat = ImageStat.Stat(alpha)
+    opaque_ratio = sum(1 for p in alpha.getdata() if p > 16) / max(1, width * height)
+    if alpha_stat.mean[0] < 8 or opaque_ratio < 0.05:
+        raise RuntimeError("商品参考图几乎全透明，无法约束产品露出")
+
+    rgb = img.convert("RGB")
+    stat = ImageStat.Stat(rgb)
+    channel_std = sum(stat.stddev) / max(1, len(stat.stddev))
+    brightness = sum(stat.mean) / max(1, len(stat.mean))
+    if channel_std < 3:
+        raise RuntimeError("商品参考图几乎是纯色/空白图，无法作为产品参考")
+    if brightness < 8 or brightness > 247:
+        raise RuntimeError("商品参考图整体过暗或过曝，无法稳定约束产品露出")
+
+
+def _check_segment_semantic_quality(
+    *,
+    clip_paths: List[Path],
+    successful_clip_indices: List[int],
+    ad_script: dict,
+    product_image_path: Optional[Path],
+    main_char_path: Optional[Path],
+    quality_frames: int,
+) -> None:
+    """按分镜检查关键段语义质量，避免整片抽帧漏掉产品/CTA 段问题。"""
+    segments = ad_script.get("segments", []) if isinstance(ad_script, dict) else []
+    issues = []
+
+    for pos, clip_path in enumerate(clip_paths):
+        if pos >= len(successful_clip_indices):
+            continue
+        seg_idx = successful_clip_indices[pos]
+        seg = segments[seg_idx] if 0 <= seg_idx < len(segments) else {}
+        narrative = str(seg.get("narrative") or seg.get("type") or "").lower().strip()
+        product_ref = product_image_path if product_image_path and _is_product_required_narrative(narrative) else None
+        character_ref = main_char_path if main_char_path and narrative in {"hook", "turning", "result", "review"} else None
+
+        if not product_ref and not character_ref:
+            continue
+
+        result = check_video_quality(
+            clip_path,
+            num_frames=max(6, int(quality_frames or 12)),
+            content_focus="center" if product_ref else "default",
+            product_reference_image=product_ref,
+            character_reference_image=character_ref,
+            require_semantic_alignment=bool(character_ref),
+        )
+        if not result.passed:
+            first_issue = result.issues[0] if result.issues else "未知质量问题"
+            issues.append(
+                f"段 {seg_idx + 1}（{narrative or 'unknown'}）未通过分段语义质检：{first_issue}"
+            )
+
+    if issues:
+        detail = "；".join(issues[:3])
+        if len(issues) > 3:
+            detail += f"；另有 {len(issues) - 3} 个问题"
+        raise RuntimeError(f"分段语义质检未通过，已阻断不可发布成片：{detail}")
+
+
+def _build_character_manifest(
+    *,
+    product_info: dict,
+    character: dict,
+    prompt: str,
+) -> dict:
+    """构建角色定妆照缓存契约，避免同名输出复用旧人设。"""
+    character_contract = {
+        "name": character.get("name", "Character A"),
+        "description": character.get("description", ""),
+    }
+    return {
+        "version": 1,
+        "product_info_sha256": hashlib.sha256(
+            json.dumps(product_info, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest(),
+        "character_sha256": hashlib.sha256(
+            json.dumps(character_contract, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest(),
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "model": KLING_IMAGE_MODEL,
+        "aspect_ratio": "2:3",
+        "resolution": "2k",
+    }
+
+
+def _build_video_idempotency_key(
+    prompt: str,
+    ref_images: list,
+    idx: int,
+    target_path: Path,
+    *,
+    model: Optional[str],
+    mode: str,
+    duration: int,
+    aspect_ratio: str,
+    seed: Optional[int],
+) -> str:
+    """为单个候选视频生成稳定幂等键。"""
+    payload = {
+        "prompt": prompt,
+        "refs": _hash_reference_images(_ref_image_values(ref_images)),
+        "idx": idx,
+        "target": target_path.name,
+        "model": model,
+        "mode": mode,
+        "duration": duration,
+        "aspect_ratio": aspect_ratio,
+        "seed": seed,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"kaa-{digest}"
+
+
+def _bind_reference_tags_to_prompt(prompt: str, ref_images: list, narrative: str = "") -> str:
+    """
+    用结构化段落绑定参考图语义，避免靠泛关键词把 tag 插错位置。
+    """
+    if not ref_images:
+        return prompt
+    lines = []
+    for i, item in enumerate(ref_images):
+        tag = f"<<<image_{i + 1}>>>"
+        role = item.get("role", "unknown") if isinstance(item, dict) else "unknown"
+        if role == "product":
+            label = "Product reference"
+            focus = "match packaging, shape, color, and logo placement"
+        elif role == "character":
+            label = "Character reference"
+            focus = "match identity, face, hairstyle, outfit, and body proportion"
+        else:
+            label = "Continuity frame"
+            focus = "match scene layout, camera angle, lighting, and temporal continuity"
+        lines.append(f"{label}: {tag} ({focus}).")
+    reference_block = "Reference image binding:\n" + "\n".join(lines)
+    return f"{reference_block}\n\n{prompt}"
 
 
 def cleanup_output(output_name: str, output_dir: Path = OUTPUT_DIR):
@@ -1429,6 +1742,16 @@ def parse_args():
         help="从模板 JSON 加载产品信息和参数，跳过交互输入",
     )
     parser.add_argument(
+        "--output-name",
+        default=None,
+        help="指定输出名前缀；配合 --resume 可复用已生成片段",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="断点续跑：使用稳定输出名并复用已生成的角色图/片段候选",
+    )
+    parser.add_argument(
         "--list-styles",
         action="store_true",
         help="列出所有可用的电影风格卡片",
@@ -1456,6 +1779,11 @@ def parse_args():
         metavar="PATH",
         default=None,
         help="商品参考图路径（展示类片段自动使用，提升商品一致性）",
+    )
+    parser.add_argument(
+        "--allow-no-product-image",
+        action="store_true",
+        help="允许不提供商品参考图继续生成（会降低产品露出质检可靠性）",
     )
     parser.add_argument(
         "--image-fidelity",
@@ -1630,6 +1958,7 @@ def save_template(product_info: dict, args: argparse.Namespace, output_path: Pat
             "human_fidelity": getattr(args, "human_fidelity", DEFAULT_HUMAN_FIDELITY),
             "seed": getattr(args, "seed", None),
             "product_image": str(args.product_image) if getattr(args, "product_image", None) else None,
+            "allow_no_product_image": getattr(args, "allow_no_product_image", False),
             "hook_type": getattr(args, "hook", DEFAULT_HOOK_TYPE),
             "script_style": getattr(args, "script_style", DEFAULT_SCRIPT_STYLE),
             "use_voiceover": getattr(args, "voiceover", False),
@@ -1650,6 +1979,8 @@ def save_template(product_info: dict, args: argparse.Namespace, output_path: Pat
             "strict_mode": getattr(args, "strict", True),
             "force": getattr(args, "force", False),
             "no_llm": getattr(args, "no_llm", False),
+            "output_name": getattr(args, "output_name", None),
+            "resume": getattr(args, "resume", False),
         },
         "created_at": datetime.now().isoformat(),
     }
@@ -1678,6 +2009,7 @@ def load_template(template_path: Path) -> tuple:
     args_dict.setdefault("human_fidelity", DEFAULT_HUMAN_FIDELITY)
     args_dict.setdefault("seed", None)
     args_dict.setdefault("product_image", None)
+    args_dict.setdefault("allow_no_product_image", False)
     args_dict.setdefault("hook_type", DEFAULT_HOOK_TYPE)
     args_dict.setdefault("script_style", DEFAULT_SCRIPT_STYLE)
     args_dict.setdefault("use_voiceover", False)
@@ -1698,6 +2030,8 @@ def load_template(template_path: Path) -> tuple:
     args_dict.setdefault("strict_mode", True)
     args_dict.setdefault("force", False)
     args_dict.setdefault("no_llm", False)
+    args_dict.setdefault("output_name", None)
+    args_dict.setdefault("resume", False)
 
     return product_info, args_dict
 
@@ -1711,6 +2045,7 @@ def run_generation_pipeline(
     output_name: str = None,
     dual_output: bool = False,
     product_image: Optional[Path] = None,
+    allow_no_product_image: bool = False,
     image_fidelity: float = DEFAULT_IMAGE_FIDELITY,
     human_fidelity: float = DEFAULT_HUMAN_FIDELITY,
     seed: Optional[int] = None,
@@ -1785,7 +2120,7 @@ def run_generation_pipeline(
     """
     if output_name is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_name = "".join(c for c in product_info.get("name", "product") if c.isalnum() or c in "-_").strip() or "product"
+        safe_name = _safe_output_stem(product_info.get("name", "product"))
         output_name = f"{safe_name}_{timestamp}"
 
     output_dir = Path(output_dir)
@@ -1799,6 +2134,7 @@ def run_generation_pipeline(
     # ── 预览模式：强制 std + 仅 1 段 + 跳过后期 ──
     if preview:
         mode = "std"
+    effective_kling_model = kling_model or KLING_VIDEO_MODEL
 
     # ============================================================
     # 第一步：生成所有角色定妆照
@@ -1824,26 +2160,41 @@ def run_generation_pipeline(
     if main_character.get("image_path"):
         main_char_path = Path(main_character["image_path"])
     else:
-        max_retries = 3
-        last_error = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                main_char_path = client.generate_character_ref(
-                    prompt=char_prompt,
-                    save_path=char_ref_dir / f"{output_name}_charA_ref.png",
-                )
-                print(f"✅ 主角色定妆照已生成：{main_char_path.name}")
-                break
-            except Exception as e:
-                last_error = e
-                if attempt < max_retries:
-                    wait = 5 * attempt
-                    print(f"⚠️  主角色定妆照第 {attempt} 次尝试失败：{e}")
-                    print(f"   等待 {wait} 秒后重试...")
-                    time.sleep(wait)
-                else:
-                    print(f"❌ 主角色定妆照生成失败（已重试 {max_retries} 次）：{e}")
-                    raise RuntimeError(f"主角色定妆照生成失败：{e}") from last_error
+        cached_char_path = char_ref_dir / f"{output_name}_charA_ref.png"
+        char_manifest = _build_character_manifest(
+            product_info=product_info,
+            character=main_character,
+            prompt=char_prompt,
+        )
+        if (
+            cached_char_path.exists()
+            and cached_char_path.stat().st_size > 1024
+            and _manifest_matches(cached_char_path, char_manifest)
+        ):
+            main_char_path = cached_char_path
+            print(f"✅ 主角色定妆照 manifest 缓存命中：{main_char_path.name}")
+        else:
+            max_retries = 3
+            last_error = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    main_char_path = client.generate_character_ref(
+                        prompt=char_prompt,
+                        save_path=cached_char_path,
+                    )
+                    _write_clip_manifest(main_char_path, char_manifest)
+                    print(f"✅ 主角色定妆照已生成：{main_char_path.name}")
+                    break
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_retries:
+                        wait = 5 * attempt
+                        print(f"⚠️  主角色定妆照第 {attempt} 次尝试失败：{e}")
+                        print(f"   等待 {wait} 秒后重试...")
+                        time.sleep(wait)
+                    else:
+                        print(f"❌ 主角色定妆照生成失败（已重试 {max_retries} 次）：{e}")
+                        raise RuntimeError(f"主角色定妆照生成失败：{e}") from last_error
 
     if main_char_path and main_char_path.exists():
         char_refs.append({
@@ -1906,9 +2257,13 @@ def run_generation_pipeline(
             print(f"🖼️ 商品参考图 URL 已下载：{product_image_path.name}")
         else:
             product_image_path = Path(product_image)
-        if not product_image_path.exists():
-            raise FileNotFoundError(f"商品参考图不存在：{product_image_path}")
+        _validate_product_image_file(product_image_path)
         product_img_b64 = base64.b64encode(product_image_path.read_bytes()).decode("utf-8")
+    elif not preview and not allow_no_product_image:
+        raise RuntimeError(
+            "发布级成片必须提供 --product-image，以便约束生成和质检产品露出。"
+            "如仅调试或非商品视频，请显式传入 --allow-no-product-image。"
+        )
 
     # ============================================================
     # 第二步：生成广告脚本 + 分镜片段
@@ -1956,6 +2311,11 @@ def run_generation_pipeline(
         )
         print(f"   建议：调小 --target-duration，或增大 --duration（如 --duration 10）")
         print()
+        if strict_mode and not preview:
+            raise RuntimeError(
+                "节奏模板存在超过当前生成片段后期拉伸能力的段落，继续生成会导致截断、卡顿或字幕口播错位。"
+                "请调小 --target-duration，或增大 --duration 后重新生成。"
+            )
 
     # 生成完整广告脚本
     # Bug1 修复：clip_prompts 尚未赋值，先用 styled_prompts 计算段数
@@ -2074,21 +2434,21 @@ def run_generation_pipeline(
         并行模式下 prev_clip_path=None 但 prev_last_frame_b64 可传入第 1 段尾帧。
         """
         narrative = _get_narrative_for_idx(idx).lower().strip()
-        product_first = narrative in {"showcase", "cta", "demonstration", "product", "result"}
+        product_first = _is_product_required_narrative(narrative)
 
         ref_images = []
         primary_char = char_refs[0] if char_refs else None
 
         if product_first:
             if product_img_b64:
-                ref_images.append(f"data:image/png;base64,{product_img_b64}")
+                ref_images.append({"role": "product", "image": f"data:image/png;base64,{product_img_b64}"})
             if primary_char:
-                ref_images.append(f"data:image/png;base64,{primary_char['img_b64']}")
+                ref_images.append({"role": "character", "image": f"data:image/png;base64,{primary_char['img_b64']}"})
         else:
             if primary_char:
-                ref_images.append(f"data:image/png;base64,{primary_char['img_b64']}")
+                ref_images.append({"role": "character", "image": f"data:image/png;base64,{primary_char['img_b64']}"})
             if product_img_b64:
-                ref_images.append(f"data:image/png;base64,{product_img_b64}")
+                ref_images.append({"role": "product", "image": f"data:image/png;base64,{product_img_b64}"})
 
         is_first = (idx == 1)
         # 第 2 层：全局场景锚点（仅并行模式或无前帧尾时使用）
@@ -2104,7 +2464,7 @@ def run_generation_pipeline(
         )
         if use_scene_anchor:
             # 只取第 1 张锚点帧（避免过载，最多 3 张参考图）
-            ref_images.append(scene_anchor_frames[0])
+            ref_images.append({"role": "continuity", "image": scene_anchor_frames[0]})
         # 第 3 层：前一段最后一帧
         if not is_first:
             # 串行模式：从前一段视频提取
@@ -2112,31 +2472,32 @@ def run_generation_pipeline(
                 try:
                     last_frame_b64 = _extract_frame_b64(prev_clip_path, time_sec=duration - 0.1)
                     if last_frame_b64:
-                        ref_images.append(last_frame_b64)
+                        ref_images.append({"role": "continuity", "image": last_frame_b64})
                 except Exception:
                     pass
             # P0-3 修复：并行模式下使用外部传入的尾帧（通常是第 1 段尾帧）
             elif prev_last_frame_b64 and scene_cfg.get("use_previous_last_frame", True):
-                ref_images.append(prev_last_frame_b64)
+                ref_images.append({"role": "continuity", "image": prev_last_frame_b64})
 
         if len(ref_images) < MAX_REF_IMAGES and len(char_refs) > 1:
             for extra in char_refs[1:]:
                 if len(ref_images) >= MAX_REF_IMAGES:
                     break
                 try:
-                    ref_images.append(f"data:image/png;base64,{extra['img_b64']}")
+                    ref_images.append({"role": "character", "image": f"data:image/png;base64,{extra['img_b64']}"})
                 except Exception:
                     continue
 
         seen = set()
         deduped = []
-        for img in ref_images:
+        for item in ref_images:
+            img = item.get("image", "") if isinstance(item, dict) else item
             if not img:
                 continue
             if img in seen:
                 continue
             seen.add(img)
-            deduped.append(img)
+            deduped.append(item)
 
         return deduped[:MAX_REF_IMAGES]
 
@@ -2144,89 +2505,73 @@ def run_generation_pipeline(
         """生成单个片段（含自动重试 + 缓存跳过），返回本地文件路径"""
         clip_path = clips_dir / f"clip_{idx:02d}_{output_name}.mp4"
 
-        # P1 #5 修复：片段级缓存 — 已有完整文件则跳过（断点续跑 + 幂等）
-        if clip_path.exists() and clip_path.stat().st_size > 100 * 1024:
-            try:
-                import subprocess as _sp
-                _probe = _sp.run(
-                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                     "-of", "default=noprint_wrappers=1:nokey=1", str(clip_path)],
-                    capture_output=True, text=True, timeout=5,
-                )
-                if _probe.returncode == 0 and _probe.stdout.strip():
-                    _dur = float(_probe.stdout.strip())
-                    if abs(_dur - duration) < 1.0:
-                        print(f"  ✅ 片段 {idx} 缓存命中（{_dur:.1f}s），跳过生成")
-                        return clip_path
-            except Exception:
-                pass
-
         ref_images = _build_ref_images(idx, prev_clip_path, prev_last_frame_b64)
         final_prompt = prompt
         if scene_cfg.get("inject_scene_prompt", True):
             final_prompt = _inject_scene_consistency_prompt(prompt, is_first_clip=(idx == 1))
 
-        # M2 修复：把 <<<image_N>>> 注入到 prompt 中对应描述的末尾，而非全部追加到末尾。
-        # kling_client.py 会把所有 <<<image_N>>> 追加到 prompt 末尾，导致模型无法区分哪张图
-        # 对应 prompt 里的哪个实体（产品 vs 角色）。
-        # 此处在把 final_prompt 传给 API 之前，提前把引用 tag 嵌入到各自描述区域，
-        # kling_client 的末尾追加逻辑被 _pre_injected=True 标记跳过（见下方 generate_video 调用）。
-        # 策略：
-        #   - ref_images[0] 对应产品图或角色图（取决于 product_first 顺序）
-        #   - ref_images[1] 如果存在，对应另一个实体
-        #   - ref_images[2+] 是尾帧/锚点帧，必须显式引用，否则模型可能忽略连续性参考
         if ref_images:
             narrative = _get_narrative_for_idx(idx).lower().strip()
-            product_first = narrative in {"showcase", "cta", "demonstration", "product", "result"}
-            _entity_tags = [f"<<<image_{i+1}>>>" for i in range(min(len(ref_images), 2))]
-            _continuity_tags = [f"<<<image_{i+1}>>>" for i in range(2, len(ref_images))]
-            # 在 prompt 中找到合适的注入点：产品关键词后插入产品 tag，角色关键词后插入角色 tag
-            _prod_keywords = ["product", "item", "bottle", "package", "device", "the ", "using"]
-            _char_keywords = ["person", "woman", "man", "character", "model", "she ", "he "]
-            _prompt_lower = final_prompt.lower()
-
-            def _find_inject_pos(keywords: list, text: str) -> int:
-                """找到关键词首次出现的位置，返回该句子的末尾（句号/逗号前）"""
-                for kw in keywords:
-                    pos = text.find(kw)
-                    if pos >= 0:
-                        # 找到最近的句子边界（逗号、句号、换行）
-                        end = min(
-                            (text.find(c, pos) for c in ",./\n" if text.find(c, pos) >= 0),
-                            default=min(pos + 60, len(text))
-                        )
-                        return end
-                return -1
-
-            if len(_entity_tags) >= 2:
-                # 有两张明确实体图：分别注入
-                _entity1_kws = _prod_keywords if product_first else _char_keywords
-                _entity2_kws = _char_keywords if product_first else _prod_keywords
-                _pos1 = _find_inject_pos(_entity1_kws, _prompt_lower)
-                _pos2 = _find_inject_pos(_entity2_kws, _prompt_lower)
-                if _pos1 >= 0 and _pos2 >= 0 and _pos1 != _pos2:
-                    # tag 必须按实体语义绑定，再按位置倒序插入避免偏移。
-                    _inserts = sorted([(_pos1, _entity_tags[0]), (_pos2, _entity_tags[1])], reverse=True)
-                    for _ipos, _itag in _inserts:
-                        final_prompt = final_prompt[:_ipos] + " " + _itag + final_prompt[_ipos:]
-                else:
-                    # 找不到明确位置，退化到末尾追加（兜底）
-                    final_prompt = final_prompt.rstrip() + " " + " ".join(_entity_tags)
-            elif len(_entity_tags) == 1:
-                # 只有一张图：追加到 prompt 末尾即可，与原逻辑一致
-                final_prompt = final_prompt.rstrip() + " " + _entity_tags[0]
-            if _continuity_tags:
-                final_prompt = (
-                    final_prompt.rstrip()
-                    + " Scene continuity reference "
-                    + " ".join(_continuity_tags)
-                )
+            final_prompt = _bind_reference_tags_to_prompt(final_prompt, ref_images, narrative)
 
         clip_seed = (seed + idx - 1) if seed is not None else None
+        ref_image_values = _ref_image_values(ref_images)
+        base_manifest = _build_clip_manifest(
+            final_prompt=final_prompt,
+            ref_images=ref_images,
+            idx=idx,
+            model=effective_kling_model,
+            mode=mode,
+            duration=duration,
+            aspect_ratio=aspect_ratio,
+            seed=clip_seed,
+            negative_prompt=NEGATIVE_PROMPT,
+        )
+        final_clip_manifest = dict(base_manifest)
+        final_clip_manifest["target_name"] = clip_path.name
+
+        def _valid_cached_clip(target_path: Path, manifest: dict) -> bool:
+            if not target_path.exists() or target_path.stat().st_size <= 100 * 1024:
+                return False
+            if not _manifest_matches(target_path, manifest):
+                return False
+            try:
+                import subprocess as _sp
+                _probe = _sp.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", str(target_path)],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if _probe.returncode == 0 and _probe.stdout.strip():
+                    _dur = float(_probe.stdout.strip())
+                    return abs(_dur - duration) < 1.0
+            except Exception:
+                return False
+            return False
+
+        if _valid_cached_clip(clip_path, final_clip_manifest):
+            print(f"  ✅ 片段 {idx} manifest 缓存命中，跳过生成")
+            return clip_path
 
         def _generate_to_path(target_path: Path) -> Path:
             max_retries = 3
             last_error = None
+            target_manifest = dict(base_manifest)
+            target_manifest["target_name"] = target_path.name
+            idempotency_key = _build_video_idempotency_key(
+                final_prompt,
+                ref_image_values,
+                idx,
+                target_path,
+                model=effective_kling_model,
+                mode=mode,
+                duration=duration,
+                aspect_ratio=aspect_ratio,
+                seed=clip_seed,
+            )
+            if _valid_cached_clip(target_path, target_manifest):
+                print(f"  ✅ 片段 {idx} 候选缓存命中：{target_path.name}")
+                return target_path
             for attempt in range(1, max_retries + 1):
                 try:
                     video_result = client.generate_video(
@@ -2234,13 +2579,14 @@ def run_generation_pipeline(
                         aspect_ratio=aspect_ratio,
                         duration=duration,
                         mode=mode,
-                        reference_images=ref_images if ref_images else None,
+                        reference_images=ref_image_values if ref_image_values else None,
                         image_fidelity=image_fidelity,
                         human_fidelity=human_fidelity,
                         seed=clip_seed,
                         negative_prompt=NEGATIVE_PROMPT,
+                        idempotency_key=idempotency_key,
                         # P2-C 高级参数
-                        model=kling_model,
+                        model=effective_kling_model,
                         multi_shot=multi_shot,
                     )
                     video_url = video_result.get("video_url") or video_result.get("url")
@@ -2252,10 +2598,12 @@ def run_generation_pipeline(
                     if _qc_issue:
                         try:
                             target_path.unlink(missing_ok=True)
+                            _clip_manifest_path(target_path).unlink(missing_ok=True)
                         except Exception:
                             pass
                         raise RuntimeError(f"片段 {idx} 质检失败：{_qc_issue}")
 
+                    _write_clip_manifest(target_path, target_manifest)
                     return target_path
                 except Exception as e:
                     last_error = e
@@ -2269,8 +2617,6 @@ def run_generation_pipeline(
         if best_of_n <= 1:
             return _generate_to_path(clip_path)
 
-        from quality_checker import check_video_quality as _check_video_quality
-
         candidates: List[Path] = []
         scores: Dict[Path, float] = {}
         issues: Dict[Path, List[str]] = {}
@@ -2278,29 +2624,34 @@ def run_generation_pipeline(
         for v in range(1, best_of_n + 1):
             cand_path = clips_dir / f"clip_{idx:02d}_{output_name}_cand{v}.mp4"
             candidates.append(cand_path)
-
-            if cand_path.exists() and cand_path.stat().st_size > 100 * 1024:
-                try:
-                    import subprocess as _sp
-                    _probe = _sp.run(
-                        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                         "-of", "default=noprint_wrappers=1:nokey=1", str(cand_path)],
-                        capture_output=True, text=True, timeout=5,
-                    )
-                    if _probe.returncode == 0 and _probe.stdout.strip():
-                        _dur = float(_probe.stdout.strip())
-                        if abs(_dur - duration) < 1.0:
-                            continue
-                except Exception:
-                    pass
-
             _generate_to_path(cand_path)
 
         for cand_path in candidates:
             try:
-                qr = _check_video_quality(cand_path, num_frames=int(quality_frames or 12))
-                scores[cand_path] = float(qr.overall_score or 0)
-                issues[cand_path] = list(qr.issues or [])
+                candidate_roles = {
+                    item.get("role", "unknown") for item in ref_images if isinstance(item, dict)
+                }
+                narrative = _get_narrative_for_idx(idx).lower().strip()
+                product_ref_for_candidate = (
+                    product_image_path
+                    if product_image_path
+                    and "product" in candidate_roles
+                    and _is_product_required_narrative(narrative)
+                    else None
+                )
+                character_ref_for_candidate = (
+                    main_char_path
+                    if main_char_path and "character" in candidate_roles
+                    else None
+                )
+                score, candidate_issues = _score_candidate_video_quality(
+                    cand_path,
+                    quality_frames=int(quality_frames or 12),
+                    product_reference_image=product_ref_for_candidate,
+                    character_reference_image=character_ref_for_candidate,
+                )
+                scores[cand_path] = score
+                issues[cand_path] = candidate_issues
             except Exception as e:
                 scores[cand_path] = 0.0
                 issues[cand_path] = [f"质量检测失败：{e}"]
@@ -2320,9 +2671,15 @@ def run_generation_pipeline(
         if best_path != clip_path:
             try:
                 clip_path.unlink(missing_ok=True)
+                _clip_manifest_path(clip_path).unlink(missing_ok=True)
             except Exception:
                 pass
             shutil.move(str(best_path), str(clip_path))
+            try:
+                _clip_manifest_path(best_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        _write_clip_manifest(clip_path, final_clip_manifest)
 
         if not keep_candidates:
             for p in candidates:
@@ -2330,6 +2687,7 @@ def run_generation_pipeline(
                     continue
                 try:
                     p.unlink(missing_ok=True)
+                    _clip_manifest_path(p).unlink(missing_ok=True)
                 except Exception:
                     pass
 
@@ -2460,6 +2818,11 @@ def run_generation_pipeline(
             success_count = len(clip_paths)
             print(f"\n⚠️  {len(failed_indices)} 个片段生成失败：{failed_indices}")
             print(f"   成功片段数：{success_count}/{total_clips}")
+            if strict_mode and not preview:
+                raise RuntimeError(
+                    f"发布级成片要求分镜完整，但片段 {failed_indices} 生成失败。"
+                    "已阻断缺段合成，避免丢失产品展示、效果证明或 CTA。"
+                )
             # 最少成功段数（默认 3，即 60%）
             min_required = max(2, min_clips)
             if success_count < min_required:
@@ -2629,6 +2992,7 @@ def run_generation_pipeline(
     # 部分成功时：按实际成功段的索引去节奏模板里找对应目标时长
     _adjusted_dir = clips_dir / f"{output_name}_rhythm_adjusted"
     _adjusted_dir.mkdir(parents=True, exist_ok=True)
+    _seg_indices_list = sorted(successful_clip_indices)
 
     # P0-C 修复：_seg_dur_map 提前在节奏适配前初始化，这样 B4 in-place 更新才能生效。
     # 原来放在 L2715（字幕生成前）导致 B4 写入时触发 NameError 被静默吞掉，
@@ -2636,7 +3000,6 @@ def run_generation_pipeline(
     _seg_dur_map: dict = {s["index"]: s["duration"] for s in rhythm_template["segments"]}
 
     try:
-        _seg_indices_list = sorted(successful_clip_indices)
         _rhythm_segs = {s["index"]: s for s in rhythm_template["segments"]}
         _adjusted_paths = []
         _any_adjusted = False
@@ -2700,6 +3063,18 @@ def run_generation_pipeline(
 
     except Exception as e:
         print(f"⚠️  节奏适配失败：{e}，继续使用原始时长片段")
+
+    if strict_mode and not preview:
+        print("🔍 开始分段语义质量检测...")
+        _check_segment_semantic_quality(
+            clip_paths=clip_paths,
+            successful_clip_indices=_seg_indices_list,
+            ad_script=ad_script,
+            product_image_path=product_image_path,
+            main_char_path=main_char_path,
+            quality_frames=quality_frames,
+        )
+        print("✅ 分段语义质量检测通过")
 
     # ============================================================
     # 第三步：拼接视频 + BGM
@@ -3477,6 +3852,8 @@ def run_generation_pipeline(
             content_focus="center" if product_image_path else "default",
             require_audio=True,
             product_reference_image=product_image_path if product_image_path else None,
+            character_reference_image=main_char_path if main_char_path else None,
+            require_semantic_alignment=True,
         )
         print_quality_report(quality_result, final_path.name)
         if not quality_result.passed:
@@ -3487,9 +3864,11 @@ def run_generation_pipeline(
             wide_quality_result = check_video_quality(
                 wide_path,
                 num_frames=15,
-                content_focus="default",
+                content_focus="center" if product_image_path else "default",
                 require_audio=True,
-                product_reference_image=None,
+                product_reference_image=product_image_path if product_image_path else None,
+                character_reference_image=main_char_path if main_char_path else None,
+                require_semantic_alignment=True,
             )
             print_quality_report(wide_quality_result, wide_path.name)
             if not wide_quality_result.passed:
@@ -3541,9 +3920,15 @@ def run_one_click_create(
         RuntimeError: 任何步骤失败时抛出异常
     """
     if output_name is None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_name = "".join(c for c in product_info.get("name", "product") if c.isalnum() or c in "-_").strip() or "product"
-        output_name = f"{safe_name}_{timestamp}"
+        if getattr(args, "output_name", None):
+            output_name = _safe_output_stem(str(args.output_name))
+        elif getattr(args, "resume", False):
+            output_name = build_stable_output_name(product_info, args)
+            print(f"🔁 断点续跑输出名：{output_name}")
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_name = _safe_output_stem(product_info.get("name", "product"))
+            output_name = f"{safe_name}_{timestamp}"
 
     if output_name_suffix:
         output_name = f"{output_name}_{output_name_suffix}"
@@ -3576,6 +3961,7 @@ def run_one_click_create(
             output_name=output_name,
             dual_output=args.dual_output,
             product_image=product_image,
+            allow_no_product_image=getattr(args, "allow_no_product_image", False),
             image_fidelity=getattr(args, "image_fidelity", DEFAULT_IMAGE_FIDELITY),
             human_fidelity=getattr(args, "human_fidelity", DEFAULT_HUMAN_FIDELITY),
             seed=getattr(args, "seed", None),
@@ -3863,6 +4249,12 @@ def main():
             args.force = args_dict["force"]
         if "no_llm" in args_dict:
             args.no_llm = args_dict["no_llm"]
+        if "output_name" in args_dict:
+            args.output_name = args_dict["output_name"]
+        if "resume" in args_dict:
+            args.resume = args_dict["resume"]
+        if "allow_no_product_image" in args_dict:
+            args.allow_no_product_image = args_dict["allow_no_product_image"]
 
         print("📋 已加载的参数：")
         for k, v in product_info.items():

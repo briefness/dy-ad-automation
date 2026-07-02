@@ -513,6 +513,7 @@ class KlingClient:
         human_fidelity: Optional[float] = None,
         seed: Optional[int] = None,
         negative_prompt: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         创建视频生成任务（异步）
@@ -535,6 +536,7 @@ class KlingClient:
             human_fidelity: 人物 fidelity [0,1]
             seed: 随机种子，相同种子+相同 prompt 可复现结果
             negative_prompt: 负向提示词（避免出现的元素）
+            idempotency_key: 稳定幂等键，同一生成请求重试时保持不变
 
         Returns:
             任务信息字典，包含 task_id 等
@@ -581,8 +583,11 @@ class KlingClient:
             payload["shot_type"] = shot_type
 
         # 可选参数（不含 image_fidelity/human_fidelity/seed，Omni 不支持）
+        request_id = idempotency_key or external_task_id or str(uuid.uuid4())
         if external_task_id:
             payload["external_task_id"] = external_task_id
+        elif idempotency_key:
+            payload["external_task_id"] = idempotency_key
         if callback_url:
             payload["callback_url"] = callback_url
         if negative_prompt:
@@ -595,8 +600,8 @@ class KlingClient:
         last_exc: Exception = RuntimeError("未知错误")
         for attempt in range(1, API_MAX_RETRIES + 1):
             try:
-                # P1 修复：每次重试生成独立请求 ID，服务端可据此幂等去重
-                headers = {**self.headers, "X-Api-Request-Id": str(uuid.uuid4())}
+                # 同一任务创建的所有重试必须复用同一个请求 ID，避免响应超时后重复计费。
+                headers = {**self.headers, "X-Api-Request-Id": request_id}
                 response = self.session.post(
                     url, headers=headers, json=payload,
                     timeout=API_TIMEOUT_CREATE,
@@ -676,6 +681,7 @@ class KlingClient:
         human_fidelity: Optional[float] = None,
         seed: Optional[int] = None,
         negative_prompt: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
         # P2-C 高级参数
         model: Optional[str] = None,
         multi_shot: bool = False,
@@ -712,6 +718,7 @@ class KlingClient:
             human_fidelity=human_fidelity,
             seed=seed,
             negative_prompt=negative_prompt,
+            idempotency_key=idempotency_key,
             # P2-C 高级参数透传
             model=model,
             multi_shot=multi_shot,

@@ -168,6 +168,7 @@ def create_task_args(task: dict, global_defaults: dict) -> dict:
         "human_fidelity": _coerce_float(_get_config_value(task, global_defaults, "human_fidelity", DEFAULT_HUMAN_FIDELITY), DEFAULT_HUMAN_FIDELITY),
         "seed": _coerce_int(_get_config_value(task, global_defaults, "seed", None), None),
         "product_image": product_image_path,
+        "allow_no_product_image": _coerce_bool(_get_config_value(task, global_defaults, "allow_no_product_image", False), False),
         "characters": task.get("characters", None),
         "target_duration": _coerce_int(_get_config_value(task, global_defaults, "target_duration", None), None),
         "rhythm_style": task.get("rhythm_style", global_defaults.get("rhythm_style", "moderate")),
