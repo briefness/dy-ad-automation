@@ -1,0 +1,8 @@
+requests>=2.28.0
+pyyaml>=6.0
+python-dotenv>=1.0.0
+pytest>=7.0.0
+Pillow>=9.0.0
+PyJWT>=2.8.0          # JWT 鉴权（kling_client.py）
+pyttsx3>=2.90         # 跨平台 TTS fallback（tts_client.py）
+fonttools>=4.43.0     # ASS 字幕字体名称读取（video_merger.py，可选）
