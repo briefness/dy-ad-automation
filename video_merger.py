@@ -80,8 +80,13 @@ def _video_vbv_args(bitrate: str = OUTPUT_BITRATE) -> List[str]:
 
 
 def _color_range_args() -> List[str]:
-    """标记 AI 生成视频常见的 full-range 色彩范围，避免暗部发灰/高光误裁。"""
-    return ["-color_range", "pc"]
+    """标记 BT.709 色彩空间 + full-range，避免 AI 生成视频在不同播放器出现色差/暗部发灰。"""
+    return [
+        "-color_range", "pc",
+        "-colorspace", "bt709",
+        "-color_trc", "bt709",
+        "-color_primaries", "bt709",
+    ]
 
 
 # ============================================================
@@ -1606,6 +1611,7 @@ def create_transition_ffmpeg(
         "-preset", "slow",
         "-crf", "16",
         *_video_vbv_args(),
+        "-pix_fmt", "yuv420p", *_color_range_args(),
     ])
     if audio_map:
         cmd.extend(["-c:a", "aac", "-b:a", "192k"])
@@ -2157,6 +2163,7 @@ def color_match_clips(
                 "-c:v", "libx264",
                 "-preset", "slow",
                 "-crf", "16",  # 与主流水线统一 CRF 16，减少重编码累积损耗
+                "-pix_fmt", "yuv420p", *_color_range_args(),
                 "-c:a", "copy",
                 str(matched_path),
             ]
@@ -2266,9 +2273,10 @@ def add_subtitles_ffmpeg(
         subtitle_filter = f"subtitles={_ffmpeg_escape_filter_path(srt_path)}"
         if font_path:
             escaped_font_path = _ffmpeg_escape_filter_path(font_path)
-            subtitle_filter += f":force_style='FontSize={font_size},PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=5,Shadow=3,Alignment=2,MarginV={bottom_margin},FontFile={escaped_font_path}'"
+            # P0 修复：Outline 从 5 降到 2，避免字幕描边过粗影响画面观感
+            subtitle_filter += f":force_style='FontSize={font_size},PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Shadow=3,Alignment=2,MarginV={bottom_margin},FontFile={escaped_font_path}'"
         else:
-            subtitle_filter += f":force_style='FontSize={font_size},PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=5,Shadow=3,Alignment=2,MarginV={bottom_margin}'"
+            subtitle_filter += f":force_style='FontSize={font_size},PrimaryColour=&HFFFFFF,OutlineColour=&H000000,Outline=2,Shadow=3,Alignment=2,MarginV={bottom_margin}'"
 
         # Bug #2 修复（SRT 路径）：同样补充 -c:v libx264
         cmd = [

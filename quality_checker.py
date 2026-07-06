@@ -71,6 +71,11 @@ class VideoQualityResult:
     character_similarity: float = 0.0  # 角色参考图与抽帧人物区域的最高相似度
     character_consistent: bool = True
     semantic_issues: List[str] = field(default_factory=list)
+    # 时间一致性检测
+    temporal_consistency_score: float = 0.0
+    motion_smoothness_score: float = 0.0
+    object_integrity_score: float = 0.0
+    temporal_issues: List[str] = field(default_factory=list)
     # 通用
     issues: List[str] = field(default_factory=list)
     details: List[FrameQuality] = field(default_factory=list)
@@ -720,6 +725,7 @@ def check_video_quality(
     product_reference_image: Optional[Path] = None,
     character_reference_image: Optional[Path] = None,
     require_semantic_alignment: bool = False,
+    check_temporal_consistency: bool = True,
 ) -> VideoQualityResult:
     """
     检测视频质量（画面 + 音频 + 黑帧）
@@ -949,6 +955,38 @@ def check_video_quality(
                         result.issues.append(msg)
                 except Exception as e:
                     result.issues.append(f"[角色一致性] 角色参考图检测失败：{e}")
+
+        # 时间一致性检测
+        if check_temporal_consistency:
+            try:
+                from temporal_consistency import TemporalConsistencyDetector
+                temporal_detector = TemporalConsistencyDetector()
+                temporal_analysis = temporal_detector.analyze_video(video_path)
+                
+                result.temporal_consistency_score = temporal_analysis.frame_consistency_score
+                result.motion_smoothness_score = temporal_analysis.motion_smoothness_score
+                result.object_integrity_score = temporal_analysis.object_integrity_score
+                
+                if temporal_analysis.flicker_severity > 0.2:
+                    result.temporal_issues.append(f"闪烁严重度 {temporal_analysis.flicker_severity:.2f}")
+                    result.issues.append(f"[时间一致性] 检测到画面闪烁（严重度 {temporal_analysis.flicker_severity:.2f}）")
+                
+                if temporal_analysis.frame_consistency_score < 0.5:
+                    result.temporal_issues.append(f"帧间一致性较差：{temporal_analysis.frame_consistency_score:.2f}")
+                    result.issues.append(f"[时间一致性] 帧间一致性较差（{temporal_analysis.frame_consistency_score:.2f}）")
+                
+                if temporal_analysis.motion_smoothness_score < 0.5:
+                    result.temporal_issues.append(f"运动平滑度较差：{temporal_analysis.motion_smoothness_score:.2f}")
+                    result.issues.append(f"[时间一致性] 运动平滑度较差（{temporal_analysis.motion_smoothness_score:.2f}）")
+                
+                if temporal_analysis.object_integrity_score < 0.5:
+                    result.temporal_issues.append(f"物体完整性较差：{temporal_analysis.object_integrity_score:.2f}")
+                    result.issues.append(f"[时间一致性] 物体完整性较差（{temporal_analysis.object_integrity_score:.2f}）")
+
+            except ImportError:
+                pass
+            except Exception as e:
+                print(f"  ⚠️  时间一致性检测跳过：{e}")
 
         # 综合评分（0-100）
         score = 100

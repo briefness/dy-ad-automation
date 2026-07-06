@@ -449,15 +449,17 @@ def pick_bgm_for_product(
     random_pick: bool = True,
     cinematic_style: Optional[str] = None,
     pace: Optional[str] = None,
+    music_contract: Optional[dict] = None,
 ) -> Optional[Path]:
     """
-    根据产品品类 + 电影风格 + 节奏等级自动选择并下载一首 BGM
+    根据产品品类 + 电影风格 + 节奏等级 + 音乐合同自动选择并下载一首 BGM
 
     选曲优先级：
-    1. 电影风格关键词（保证视听风格统一）
-    2. 节奏关键词（匹配视频运镜节奏）
-    3. 产品品类关键词（匹配产品调性）
-    4. default 兜底
+    1. 音乐合同关键词（genre + mood，脚本阶段确定的音乐策略）
+    2. 电影风格关键词（保证视听风格统一）
+    3. 节奏关键词（匹配视频运镜节奏）
+    4. 产品品类关键词（匹配产品调性）
+    5. default 兜底
 
     Args:
         product_type: 产品品类（如 "美妆"、"科技" 等）
@@ -465,6 +467,7 @@ def pick_bgm_for_product(
         random_pick: 是否随机选择（True=随机增加多样性，False=取最热门的）
         cinematic_style: 电影风格键值（如 "hitchcock"、"miyazaki"），有则优先匹配风格
         pace: 节奏等级（fast/medium/slow），有则匹配对应 BPM 的音乐
+        music_contract: 音乐合同字典，含 genre/mood/energy/bpm_min/bpm_max 等
 
     Returns:
         BGM 本地文件路径，失败返回 None
@@ -490,6 +493,19 @@ def pick_bgm_for_product(
 
     # 构建关键词搜索列表（优先级从高到低）
     all_keywords = []
+
+    # 0. 音乐合同关键词（最高优先级：脚本阶段确定的音乐策略）
+    contract_keywords = []
+    if music_contract:
+        contract_keywords = [
+            music_contract.get("genre", ""),
+            music_contract.get("mood", ""),
+            music_contract.get("energy", ""),
+        ]
+        contract_keywords = [k for k in contract_keywords if k]
+        if contract_keywords:
+            all_keywords.extend(contract_keywords)
+            print(f"  🎵 音乐合同关键词：{contract_keywords}")
 
     # 1. 电影风格关键词
     if cinematic_style and cinematic_style in CINEMATIC_STYLES:

@@ -24,6 +24,11 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
 
+# ── 新增：系统模块数据路径 ──
+ASSET_LIBRARY_PATH = PROJECT_ROOT / "data" / "assets"
+FEEDBACK_DB_PATH = PROJECT_ROOT / "data" / "feedback.db"
+EXPERIMENT_DB_PATH = PROJECT_ROOT / "data" / "experiments.db"
+
 # ============================================================
 # 可灵 API 配置
 # ============================================================
@@ -78,8 +83,9 @@ DEFAULT_IMAGE_FIDELITY = 0.9  # 参考图 fidelity [0,1]
 DEFAULT_HUMAN_FIDELITY = 0.9  # 人物 fidelity [0,1]
 DEFAULT_SEED = None  # 随机种子（None 表示不固定）
 
-# 参考图数量上限（过多会稀释注意力，导致人物/产品漂移）
-MAX_REF_IMAGES = 3
+# 参考图数量上限（性价比策略：生图远便宜于生视频，用更多参考图换视频一次成功率）
+# 主角色2张(正面+角度) + 产品1张 + 关键帧1张 + 场景连续帧1张 = 5张最优组合
+MAX_REF_IMAGES = 5
 
 # ============================================================
 # LLM 文案生成配置
@@ -149,29 +155,78 @@ SFX_CACHE_DIR = "output/sfx_cache"  # 音效本地缓存目录（相对于项目
 # 提示词模板配置
 # ============================================================
 
-# 负面提示词（固定）
+# 负面提示词（通用视频生成）
+# 注意：禁止加入 "multiple people" / "crowd" / "group shot"，与多角色功能矛盾
 NEGATIVE_PROMPT = (
+    # 人物一致性问题
     "different person, different face, different outfit, "
+    "face swap, identity change, inconsistent facial features, "
+    "changing hair color, changing hairstyle, changing clothes, "
+    # 质量基础问题
     "blurry, low quality, distorted face, extra limbs, "
-    "text watermark, logo, brand mark, multiple people, crowd, group shot, "
-    # O2 修复：补充中文 watermark 场景抑制（可灵中文 prompt 下有时生成带汉字的画面）
+    "ugly, deformed, malformed, poorly drawn, "
+    # 文字水印问题
+    "text watermark, unrelated logo, unrelated brand mark, "
     "Chinese text, watermark text, in-frame text overlay, embedded subtitles, "
-    # AI 视频特有问题（#4 修复）
+    "sign text, poster text, newspaper text, "
+    # AI 视频特有时间一致性问题
     "flickering, flicker, frame flicker, temporal inconsistency, "
     "morphing face, face morphing, melting skin, warped body, "
     "jitter, jittering, shaking artifacts, pixel noise, "
     "ghosting, double exposure artifact, color banding, "
-    "sudden jump cut artifact, limb deformation, finger distortion, "
-    # P2-15：补充镜头质量防护词
+    "sudden jump cut artifact, limb deformation, "
+    "shape shifting, object morphing, size changing, "
+    # 手部/手指精细问题（Kling 重灾区）
+    "finger distortion, extra fingers, missing fingers, fused fingers, "
+    "deformed hands, extra hands, missing hands, "
+    "abnormal finger count, malformed fingers, twisted fingers, "
+    "broken fingers, floating fingers, "
+    # 面部精细问题
+    "cross-eyed, lazy eye, asymmetric eyes, uneven eyes, "
+    "deformed mouth, crooked teeth, missing teeth, "
+    "plastic skin, smooth waxy skin, doll-like face, "
+    "unrealistic eyes, dead eyes, glassy eyes, "
+    # 肢体/人体结构问题
+    "long neck, extra arms, extra legs, missing limbs, "
+    "disconnected limbs, floating limbs, "
+    "bad anatomy, wrong proportions, unrealistic proportions, "
+    # 场景/物理问题
+    "floating objects, defying gravity, physics-defying, "
+    "transparent objects, see-through, clipping, "
+    "mirror artifact, reflection error, "
+    # 镜头质量问题
     "handheld camera shake, camera shake, shaky footage, "
     "lens distortion, barrel distortion, fisheye distortion, "
     "chromatic aberration, color fringing, purple fringing, "
     "overexposed background, blown out highlights, washed out sky, "
-    "motion blur artifacts, motion smear"
+    "motion blur artifacts, motion smear, "
+    # 色彩/曝光问题
+    "overexposed, underexposed, washed out, faded colors, "
+    "color cast, yellow tint, green tint, magenta tint, "
+    "high contrast, flat lighting, "
+    # 构图问题
+    "cropped head, cut off head, cut off face, "
+    "out of frame, partially visible, truncated subject"
 )
 
-# 角色定妆照负面提示词（与通用负面提示词一致，统一维护）
-CHARACTER_NEGATIVE_PROMPT = NEGATIVE_PROMPT
+# 角色定妆照负面提示词（图片生成专用，更强调肖像质量）
+CHARACTER_NEGATIVE_PROMPT = (
+    "different person, different face, different outfit, "
+    "blurry, low quality, distorted face, extra limbs, "
+    "ugly, deformed, malformed, poorly drawn, "
+    "text watermark, unrelated logo, unrelated brand mark, "
+    "Chinese text, watermark text, in-frame text overlay, "
+    "plastic skin, smooth waxy skin, doll-like face, "
+    "cross-eyed, lazy eye, asymmetric eyes, uneven eyes, "
+    "deformed mouth, crooked teeth, missing teeth, "
+    "finger distortion, extra fingers, missing fingers, fused fingers, "
+    "deformed hands, extra hands, missing hands, "
+    "bad anatomy, wrong proportions, unrealistic proportions, "
+    "overexposed, underexposed, washed out, "
+    "chromatic aberration, color fringing, "
+    "cropped head, cut off head, cut off face, "
+    "out of frame, partially visible"
+)
 
 # 一致性描述模板（用于生成片段 Prompt 时注入）
 CONSISTENCY_TEMPLATES = {
@@ -1012,3 +1067,550 @@ class ConfigError(KlingAIError):
     """配置错误"""
     error_code = "E3001"
     message = "配置错误"
+
+
+# ============================================================
+# 质量前置控制配置（Quality Gate - 生成前预检）
+# ============================================================
+# 核心理念：在调用API生成前，通过预检查消除质量隐患，
+# 避免"生成→检测→失败→重试"的成本浪费模式。
+
+QUALITY_GATE_CONFIG = {
+    # 是否启用前置质量控制（推荐 True）
+    "enabled": True,
+
+    # ── 参考图预检 ──
+    "reference_check": {
+        "enabled": True,
+        # 参考图最小尺寸（像素）
+        "min_width": 512,
+        "min_height": 512,
+        # 参考图最大尺寸（像素，过大可能导致API拒绝或质量下降）
+        "max_width": 4096,
+        "max_height": 4096,
+        # 亮度范围（0-255，超出范围可能导致生成偏色）
+        "min_brightness": 15,
+        "max_brightness": 240,
+        # 对比度阈值（标准差，过低表示图像几乎纯色）
+        "min_contrast": 5,
+        # 透明像素比例上限（过高表示主体不清晰）
+        "max_transparent_ratio": 0.95,
+        # 是否允许空白/纯色图
+        "allow_blank": False,
+    },
+
+    # ── Prompt 预校验 ──
+    "prompt_check": {
+        "enabled": True,
+        # 最小长度（字符）
+        "min_length": 50,
+        # 最大长度（字符，过长可能被截断）
+        "max_length": 2000,
+        # 必须包含的关键词类型（按优先级）
+        "required_keywords": {
+            "character": ["person", "face", "same", "reference"],
+            "product": ["product", "packaging", "same", "reference"],
+            "action": ["holding", "using", "showing", "applying"],
+            "quality": ["sharp", "high quality", "cinematic", "professional"],
+        },
+        # 是否检查负面提示词完整性
+        "check_negative_prompt": True,
+        # 负面提示词必须包含的关键词
+        "required_negative_keywords": [
+            "blurry", "low quality", "distorted", "extra limbs",
+            "text", "watermark", "flickering", "jitter",
+        ],
+        # ── 新增：自动优化机制 ──
+        # 是否自动应用优化后的 Prompt（推荐 True）
+        "auto_apply_optimization": True,
+        # 是否自动修复语义冲突（推荐 True）
+        "auto_fix_conflicts": True,
+        # 是否自动去除重复描述（推荐 True）
+        "auto_remove_repetitions": True,
+        # 是否自动补全缺失关键词（推荐 True）
+        "auto_complete_keywords": True,
+    },
+
+    # ── 新增：片段连贯性预检 ──
+    "coherence_check": {
+        "enabled": True,
+        # 是否检查叙事流畅度
+        "check_narrative_flow": True,
+        # 是否检查场景过渡合理性
+        "check_scene_transition": True,
+        # 是否检查情绪曲线合理性
+        "check_emotion_curve": True,
+        # 是否检查角色一致性描述
+        "check_character_consistency": True,
+        # 是否检查产品展示逻辑
+        "check_product_logic": True,
+        # 叙事段顺序（严格）
+        "required_segment_order": ["hook", "turning_point", "showcase", "result", "cta"],
+        # 情绪曲线要求（hook高→turning低→showcase中→result高→cta稳）
+        "emotion_curve_expectation": {
+            "hook": "high",
+            "turning_point": "low",
+            "showcase": "medium",
+            "result": "high",
+            "cta": "stable",
+        },
+    },
+
+    # ── 新增：历史数据驱动优化 ──
+    "history_driven_optimization": {
+        "enabled": True,
+        # 成功案例数据库路径
+        "success_cases_db": "success_cases.json",
+        # 失败案例数据库路径
+        "failure_cases_db": "failure_cases.json",
+        # 是否基于历史成功率调整参数
+        "adjust_parameters_by_history": True,
+        # 高成功率阈值（>= 此值使用历史最优参数）
+        "high_success_threshold": 0.85,
+        # 低成功率阈值（<= 此值自动预警）
+        "low_success_threshold": 0.30,
+        # 是否记录当前配置到历史数据库
+        "record_to_history": True,
+    },
+
+    # ── 新增：失败预测模型 ──
+    "failure_prediction": {
+        "enabled": True,
+        # 是否预测当前配置成功率
+        "predict_success_rate": True,
+        # 预测失败时是否阻止生成
+        "block_on_low_prediction": True,
+        # 低预测成功率阈值（低于此值阻止生成）
+        "min_prediction_threshold": 0.50,
+        # 失败特征权重
+        "failure_feature_weights": {
+            "reference_image_quality": 0.25,
+            "prompt_quality": 0.30,
+            "parameter_config": 0.15,
+            "script_structure": 0.15,
+            "coherence": 0.15,
+        },
+    },
+
+    # ── 参数锁定机制（保证可复现性）──
+    "parameter_lock": {
+        # 是否强制使用固定 seed（推荐 True，保证结果稳定）
+        "force_seed": True,
+        # 默认 seed 值（None 表示自动生成一个固定值）
+        "default_seed": 42,
+        # 是否锁定 image_fidelity
+        "lock_fidelity": True,
+        # 是否锁定 negative_prompt
+        "lock_negative_prompt": True,
+        # 是否锁定 aspect_ratio
+        "lock_aspect_ratio": True,
+        # 是否锁定 duration
+        "lock_duration": True,
+    },
+
+    # ── 成本控制 ──
+    "cost_control": {
+        "enabled": True,
+        # 单次生成预算上限（元）
+        "max_budget": 100.0,
+        # 单片段最大重试次数
+        "max_retries_per_clip": 2,
+        # 总片段最大重试次数
+        "max_total_retries": 5,
+        # 是否在超预算时自动降级（降低模式/分辨率）
+        "auto_downgrade": True,
+        # 降级策略：standard -> std, pro -> standard, 4k -> pro
+        "downgrade_order": ["4k", "pro", "standard", "std"],
+    },
+
+    # ── 契约验证 ──
+    "contract_verification": {
+        "enabled": True,
+        # 检查脚本完整性（必须包含所有叙事段）
+        "check_script_structure": True,
+        # 检查角色圣经完整性
+        "check_character_bible": True,
+        # 检查商品圣经完整性
+        "check_product_bible": True,
+        # 检查场景连续性配置
+        "check_scene_continuity": True,
+    },
+
+    # ── 新增：图片先行验证策略 ──
+    "image_first_strategy": {
+        "enabled": True,
+        # 默认模式：minimal/standard/full
+        "default_mode": "standard",
+        # 每个片段生成几张备选图片
+        "n_variants_per_segment": 2,
+        # 是否使用生成的最佳图片作为视频首帧参考
+        "use_best_keyframe_as_reference": True,
+        # 图片质量门严格程度
+        "strict_quality_gate": True,
+        # 图片生成分辨率（1k足够验证，成本最低）
+        "image_resolution": "1k",
+        # 图片生成模式（std足够验证）
+        "image_generation_mode": "std",
+        # 是否允许图片未通过时降级到直接生成视频
+        "allow_fallback_to_direct_video": False,
+        # 图片质量评分阈值（低于此值不通过）
+        "min_quality_score": 70.0,
+        # 商品一致性阈值
+        "min_product_similarity": 0.65,
+        # 角色一致性阈值
+        "min_character_similarity": 0.55,
+    },
+
+    # ── 预检失败行为 ──
+    "failure_behavior": {
+        # 是否阻止生成（True=严格模式，False=警告但继续）
+        "block_on_failure": True,
+        # 是否提供自动修复建议
+        "suggest_fixes": True,
+        # 是否允许用户手动确认继续
+        "allow_override": True,
+    },
+}
+
+
+# ============================================================
+# 参考图质量标准（Reference Image Quality Standards）
+# ============================================================
+# 不同类型参考图的质量要求
+
+REFERENCE_QUALITY_STANDARDS = {
+    "product": {
+        "name": "商品参考图",
+        "requirements": [
+            "主体完整，无遮挡",
+            "背景简洁，便于AI识别",
+            "光照均匀，无过曝或过暗",
+            "分辨率 >= 512x512",
+            "无明显水印或文字",
+            "包装/logo清晰可见",
+        ],
+        "checks": [
+            "主体检测（是否居中）",
+            "背景复杂度检测",
+            "文字水印检测",
+            "包装完整性检测",
+        ],
+    },
+    "character": {
+        "name": "角色参考图",
+        "requirements": [
+            "正面清晰肖像",
+            "面部特征完整可见",
+            "发型/发色清晰",
+            "服装完整可见",
+            "无遮挡或模糊",
+            "自然表情",
+        ],
+        "checks": [
+            "人脸检测",
+            "面部关键点检测",
+            "表情分析",
+            "服装识别",
+        ],
+    },
+    "scene": {
+        "name": "场景参考图",
+        "requirements": [
+            "空间布局清晰",
+            "主要物体位置明确",
+            "光照方向一致",
+            "无杂乱元素",
+        ],
+        "checks": [
+            "场景结构分析",
+            "光照方向检测",
+            "物体识别",
+        ],
+    },
+}
+
+
+# ============================================================
+# Prompt 质量评分标准（Prompt Quality Scoring）
+# ============================================================
+# Prompt 质量评估规则
+
+PROMPT_QUALITY_RULES = {
+    "length": {
+        "weight": 0.2,
+        "rules": [
+            {"condition": lambda x: len(x) < 50, "score": 20, "message": "Prompt 过短"},
+            {"condition": lambda x: 50 <= len(x) < 100, "score": 50, "message": "Prompt 偏短"},
+            {"condition": lambda x: 100 <= len(x) < 500, "score": 80, "message": "Prompt 长度适中"},
+            {"condition": lambda x: 500 <= len(x) <= 1500, "score": 100, "message": "Prompt 长度理想"},
+            {"condition": lambda x: len(x) > 1500, "score": 70, "message": "Prompt 过长可能被截断"},
+        ],
+    },
+    "keyword_coverage": {
+        "weight": 0.3,
+        "rules": [
+            {"condition": lambda x: len([k for k in ["same", "reference", "consistent"] if k in x.lower()]) >= 2, "score": 100, "message": "一致性关键词充足"},
+            {"condition": lambda x: len([k for k in ["same", "reference", "consistent"] if k in x.lower()]) == 1, "score": 60, "message": "一致性关键词不足"},
+            {"condition": lambda x: len([k for k in ["same", "reference", "consistent"] if k in x.lower()]) == 0, "score": 20, "message": "缺少一致性关键词"},
+        ],
+    },
+    "action_clarity": {
+        "weight": 0.2,
+        "rules": [
+            {"condition": lambda x: len([k for k in ["holding", "using", "showing", "applying", "demonstrating"] if k in x.lower()]) >= 1, "score": 100, "message": "动作描述清晰"},
+            {"condition": lambda x: len([k for k in ["holding", "using", "showing", "applying", "demonstrating"] if k in x.lower()]) == 0, "score": 40, "message": "缺少动作描述"},
+        ],
+    },
+    "quality_adjectives": {
+        "weight": 0.15,
+        "rules": [
+            {"condition": lambda x: len([k for k in ["sharp", "high quality", "cinematic", "professional", "realistic"] if k in x.lower()]) >= 2, "score": 100, "message": "质量形容词充足"},
+            {"condition": lambda x: len([k for k in ["sharp", "high quality", "cinematic", "professional", "realistic"] if k in x.lower()]) == 1, "score": 60, "message": "质量形容词不足"},
+            {"condition": lambda x: len([k for k in ["sharp", "high quality", "cinematic", "professional", "realistic"] if k in x.lower()]) == 0, "score": 20, "message": "缺少质量形容词"},
+        ],
+    },
+    "composition": {
+        "weight": 0.15,
+        "rules": [
+            {"condition": lambda x: len([k for k in ["close-up", "medium shot", "wide shot", "frame", "composition"] if k in x.lower()]) >= 1, "score": 100, "message": "构图描述清晰"},
+            {"condition": lambda x: len([k for k in ["close-up", "medium shot", "wide shot", "frame", "composition"] if k in x.lower()]) == 0, "score": 40, "message": "缺少构图描述"},
+        ],
+    },
+}
+
+
+# ============================================================
+# 成本估算规则（Cost Estimation Rules）
+# ============================================================
+
+COST_ESTIMATION_RULES = {
+    # 图片生成成本（元/张）
+    "image": {
+        "std": 0.05,
+        "pro": 0.10,
+        "hd": 0.20,
+    },
+    # 视频生成成本（元/秒）
+    "video": {
+        "std": 0.30,
+        "standard": 0.45,
+        "pro": 0.60,
+        "hd": 0.80,
+        "4k": 1.20,
+    },
+    # 额外费用
+    "additional": {
+        "tts": 0.02,          # 口播生成（元/字符）
+        "bgm_search": 0.00,   # BGM搜索（免费）
+        "quality_check": 0.00, # 质量检测（本地）
+        "post_processing": 0.00, # 后处理（本地）
+    },
+}
+
+
+# ============================================================
+# 生成参数模板（Generation Parameter Templates）
+# ============================================================
+# 预定义的高质量参数组合，避免手动配置错误
+
+GENERATION_PARAMETER_TEMPLATES = {
+    "standard": {
+        "name": "标准模式",
+        "mode": "standard",
+        "fidelity": 0.9,
+        "seed": None,
+        "duration": 5,
+        "aspect_ratio": "9:16",
+        "cost_per_clip": 0.45 * 5,  # 元
+    },
+    "pro": {
+        "name": "专业模式",
+        "mode": "pro",
+        "fidelity": 0.95,
+        "seed": None,
+        "duration": 5,
+        "aspect_ratio": "9:16",
+        "cost_per_clip": 0.60 * 5,
+    },
+    "fast": {
+        "name": "快速模式",
+        "mode": "standard",
+        "fidelity": 0.85,
+        "seed": None,
+        "duration": 3,
+        "aspect_ratio": "9:16",
+        "cost_per_clip": 0.45 * 3,
+    },
+    "high_quality": {
+        "name": "高质量模式",
+        "mode": "pro",
+        "fidelity": 0.98,
+        "seed": 42,
+        "duration": 5,
+        "aspect_ratio": "9:16",
+        "cost_per_clip": 0.60 * 5,
+    },
+    "4k_cinematic": {
+        "name": "4K电影模式",
+        "mode": "4k",
+        "fidelity": 0.98,
+        "seed": 42,
+        "duration": 5,
+        "aspect_ratio": "16:9",
+        "cost_per_clip": 1.20 * 5,
+    },
+}
+
+
+# ============================================================
+# 新增模块配置（v2.0 系统增强）
+# ============================================================
+
+# ── 素材资产库配置 ──
+ASSET_LIBRARY_CONFIG = {
+    "enabled": True,
+    "auto_save_generated": True,      # 自动生成时保存到资产库
+    "deduplication": True,            # 去重检测
+    "max_versions_per_asset": 5,      # 每个资产最多保存几个版本
+}
+
+# ── 多模型路由器配置 ──
+MODEL_ROUTER_CONFIG = {
+    "enabled": True,
+    "default_mode": "balanced",       # quality / speed / cost / balanced
+    "fallback_enabled": True,         # 启用故障转移
+    "max_consecutive_failures": 3,    # 连续失败几次触发熔断
+    "circuit_breaker_timeout": 300,   # 熔断恢复时间（秒）
+    "backends": {
+        "kling": {
+            "cost_per_sec": 0.60,
+            "success_rate": 0.85,
+            "avg_latency": 45,
+            "queue_time": 30,
+            "supports_reference": True,
+            "max_duration": 10,
+        },
+        # 预留其他后端配置位
+        "runway": {
+            "cost_per_sec": 0.80,
+            "success_rate": 0.80,
+            "avg_latency": 60,
+            "queue_time": 60,
+            "supports_reference": True,
+            "max_duration": 16,
+        },
+        "pika": {
+            "cost_per_sec": 0.50,
+            "success_rate": 0.75,
+            "avg_latency": 30,
+            "queue_time": 15,
+            "supports_reference": True,
+            "max_duration": 3,
+        },
+    },
+}
+
+# ── 反馈闭环配置 ──
+FEEDBACK_LOOP_CONFIG = {
+    "enabled": True,
+    "auto_collect": True,             # 自动生成后收集反馈
+    "min_rating_for_success": 4,      # 4星以上视为成功案例
+    "issue_threshold": 3,             # 同一问题出现几次触发自动修复
+    "export_report_interval": 7,      # 几天导出一次学习报告
+}
+
+# ── 实验追踪配置 ──
+EXPERIMENT_TRACKER_CONFIG = {
+    "enabled": True,
+    "auto_track": True,               # 自动生成时自动追踪
+    "min_experiments_for_recommendation": 10,  # 最少几次实验才推荐参数
+    "param_candidates": [             # 可实验的参数
+        "seed",
+        "image_fidelity",
+        "human_fidelity",
+        "mode",
+        "duration",
+    ],
+}
+
+# ── AutoPrompt优化器配置 ──
+AUTOPROMPT_CONFIG = {
+    "enabled": True,
+    "max_generations": 3,
+    "population_size": 5,
+    "auto_optimize_on_low_score": True,
+    "score_threshold": 60,
+}
+
+# ── 故事板生成器配置 ──
+STORYBOARD_CONFIG = {
+    "enabled": True,
+    "default_style": "cinematic",
+    "default_shots": 6,
+    "min_duration_per_shot": 2.0,
+    "max_duration_per_shot": 5.0,
+}
+
+# ── 多人物一致性管理器配置 ──
+MULTI_CHARACTER_CONFIG = {
+    "enabled": True,
+    "consistency_threshold": 0.55,
+    "generate_group_reference": True,
+    "max_characters_per_group": 10,
+}
+
+# ── 电影级运镜系统配置 ──
+CINEMATIC_CAMERA_CONFIG = {
+    "enabled": True,
+    "default_preset": "cinematic_warm",
+    "prefer_extreme_slow_movement": True,
+    "emotion_curve_enabled": True,
+}
+
+# ── 品牌尾帧生成器配置 ──
+BRAND_ENDING_CONFIG = {
+    "enabled": True,
+    "default_template": "cinematic",
+    "default_duration": 3.0,
+    "available_templates": ["cinematic", "minimal", "warm", "tech", "commercial"],
+}
+
+# ── 时间一致性检测器配置 ──
+TEMPORAL_CONSISTENCY_CONFIG = {
+    "enabled": True,
+    "sample_interval": 2,
+    "consistency_threshold": 0.5,
+    "motion_smoothness_threshold": 0.5,
+    "object_integrity_threshold": 0.5,
+}
+
+# ── AI视频增强器配置 ──
+AI_ENHANCEMENT_CONFIG = {
+    "enabled": True,
+    "default_enhancements": ["upscale", "denoise", "color_enhance", "deflicker"],
+    "target_resolution": "1080p",
+    "target_fps": 30,
+}
+
+# ── 场景过渡检查器配置 ──
+SCENE_TRANSITION_CONFIG = {
+    "enabled": True,
+    "color_match_threshold": 0.5,
+    "brightness_match_threshold": 0.5,
+    "alignment_threshold": 0.3,
+    "motion_continuity_threshold": 0.3,
+}
+
+# ── 角色分析器配置 ──
+CHARACTER_ANALYZER_CONFIG = {
+    "enabled": True,
+    "min_characters": 1,
+    "max_characters": 6,
+    "auto_detect_background": True,
+    "consistency_levels": {
+        "protagonist": 0.95,
+        "supporting": 0.85,
+        "service": 0.75,
+        "background": 0.0,
+    },
+}

@@ -669,6 +669,10 @@ def generate_full_voiceover(
 
             new_segments = []
             new_subtitles = []
+            # P0 修复：atempo 加速后必须重新计算时间轴，基于前一段实际结束时间顺序排列，
+            # 否则使用原始 seg["start"] 会导致段间出现与压缩比例成正比的累积空隙，
+            # 字幕与音频严重错位。
+            current_start = float(audio_segments[0]["start"]) if audio_segments else 0.0
 
             for i, seg in enumerate(audio_segments):
                 fast_path = tmp_dir / f"fast_{i:03d}.m4a"
@@ -686,7 +690,7 @@ def generate_full_voiceover(
                     new_duration = seg["duration"]
 
                 sub = aligned_subtitles[i]
-                new_start = float(seg["start"])
+                new_start = current_start
                 new_end = new_start + new_duration
                 if new_end > total_duration - 0.1:
                     new_end = total_duration - 0.1
@@ -706,6 +710,8 @@ def generate_full_voiceover(
                     "end": new_end,
                     "segment": sub.get("segment", 0),
                 })
+
+                current_start = new_end
 
                 if new_end >= total_duration - 0.1:
                     break

@@ -44,6 +44,21 @@ from one_click_create import (
     _is_product_required_narrative,
     _validate_product_image_file,
     _write_clip_manifest,
+    _sanitize_prompt_for_image_generation,
+    _preflight_keyframe_check,
+    _estimate_image_first_segment_count,
+    apply_low_cost_generation_policy,
+    _record_production_workflow_completion,
+    build_character_bibles,
+    build_product_bible,
+    character_bible_to_prompt,
+    product_bible_to_prompt,
+    _get_primary_char_for_clip,
+    build_music_contract,
+    _repair_prompt_by_issues,
+    MusicContract,
+    CharacterBible,
+    ProductBible,
 )
 
 
@@ -252,17 +267,17 @@ class TestEstimateCost:
     def test_pro_mode_5_clips_5s(self):
         """pro 模式 5 段 5 秒的成本估算"""
         result = estimate_cost(mode="pro", duration_per_clip=5, num_clips=5, num_characters=1)
-        assert result["image_count"] == 1
+        assert result["image_count"] == 2  # 1 角色 × 2 张/角色
         assert result["video_seconds"] == 25
-        expected_cost = 1 * KLING_PRICING["image"]["pro"] + 25 * KLING_PRICING["video"]["pro"]
+        expected_cost = 2 * KLING_PRICING["image"]["pro"] + 25 * KLING_PRICING["video"]["pro"]
         assert abs(result["estimated_cost"] - expected_cost) < 0.01
 
     def test_std_mode_1_clip_preview(self):
         """预览模式（std + 1 段）的成本估算"""
         result = estimate_cost(mode="std", duration_per_clip=5, num_clips=1, num_characters=1)
-        assert result["image_count"] == 1
+        assert result["image_count"] == 2  # 1 角色 × 2 张/角色
         assert result["video_seconds"] == 5
-        expected_cost = 1 * KLING_PRICING["image"]["std"] + 5 * KLING_PRICING["video"]["std"]
+        expected_cost = 2 * KLING_PRICING["image"]["std"] + 5 * KLING_PRICING["video"]["std"]
         assert abs(result["estimated_cost"] - expected_cost) < 0.01
 
     def test_preview_is_cheaper_than_pro(self):
@@ -284,6 +299,27 @@ class TestEstimateCost:
         cost_1 = estimate_cost(mode="pro", duration_per_clip=5, num_clips=5, ab_versions=1)
         cost_3 = estimate_cost(mode="pro", duration_per_clip=5, num_clips=5, ab_versions=3)
         assert abs(cost_3["estimated_cost"] - cost_1["estimated_cost"] * 3) < 0.01
+
+    def test_image_first_cost_counts_preflight_candidates(self):
+        """图片先行候选图应计入成本，避免低估发布级生成预算"""
+        result = estimate_cost(
+            mode="pro",
+            duration_per_clip=5,
+            num_clips=5,
+            num_characters=1,
+            image_first_segments=2,
+            image_first_variants=2,
+        )
+        # 2 张角色定妆照（1角色×2） + 4 张图片先行候选（2段×2张/段）= 6 张
+        assert result["image_count"] == 6
+        assert any("图片先行预检" in line for line in result["breakdown"])
+
+    def test_image_first_segment_count_by_mode(self):
+        """图片先行范围估算应匹配 minimal/standard/full 策略"""
+        assert _estimate_image_first_segment_count(5, "minimal") == 1
+        assert _estimate_image_first_segment_count(5, "standard") == 2
+        assert _estimate_image_first_segment_count(5, "full") == 5
+        assert _estimate_image_first_segment_count(5, "standard", enabled=False) == 0
 
 
 class TestParallelGeneration:
@@ -519,19 +555,24 @@ class TestCLIArguments:
         assert parallel is True
 
     def test_quality_defaults_are_publish_first(self):
-        """CLI 默认应启用发布级质量策略"""
+        """CLI 默认应启用发布级质量策略，同时避免默认视频抽卡"""
         with patch.object(sys, "argv", ["one_click_create.py"]):
             args = parse_args()
         assert args.strict is True
         assert args.stabilize is True
-        assert args.best_of == 2
+        assert args.best_of == 1
+        assert args.preflight_keyframe is True
+        assert args.image_first is True
+        assert args.image_first_mode == "standard"
+        assert args.image_first_variants == 2
 
     def test_quality_defaults_can_be_disabled_for_debug(self):
         """调试时应允许显式关闭严格模式和稳定化"""
-        with patch.object(sys, "argv", ["one_click_create.py", "--no-strict", "--no-stabilize", "--best-of", "1"]):
+        with patch.object(sys, "argv", ["one_click_create.py", "--no-strict", "--no-stabilize", "--no-image-first", "--best-of", "1"]):
             args = parse_args()
         assert args.strict is False
         assert args.stabilize is False
+        assert args.image_first is False
         assert args.best_of == 1
 
 
@@ -621,6 +662,16 @@ class TestResumeAndIdempotency:
         assert args.output_name == "demo_run"
         assert args.allow_no_product_image is True
 
+    def test_resume_is_enabled_by_default_and_can_be_disabled(self):
+        """默认应复用稳定输出名，必要时可显式关闭。"""
+        with patch.object(sys, "argv", ["one_click_create.py"]):
+            args = parse_args()
+        assert args.resume is True
+
+        with patch.object(sys, "argv", ["one_click_create.py", "--no-resume"]):
+            args = parse_args()
+        assert args.resume is False
+
     def test_stable_output_name_is_deterministic(self):
         """相同输入和关键参数应生成相同续跑输出名"""
         product_info = {"name": "测试产品", "type": "美妆", "selling_point": "清爽"}
@@ -670,11 +721,30 @@ class TestResumeAndIdempotency:
             ],
             "showcase",
         )
-        assert result.startswith("Reference image binding:")
-        assert "Product reference: <<<image_1>>>" in result
-        assert "Character reference: <<<image_2>>>" in result
-        assert "Continuity frame: <<<image_3>>>" in result
+        assert result.startswith("PRODUCT REFERENCE")
+        assert "<<<image_1>>>" in result
+        assert "<<<image_2>>>" in result
+        assert "<<<image_3>>>" in result
+        assert "must match exactly" in result
+        assert "Exact same person" in result
+        assert "continuity" in result.lower()
         assert prompt in result
+
+    def test_reference_binding_marks_approved_keyframe(self):
+        """图片先行通过的关键帧应作为强首帧参考绑定到视频 Prompt"""
+        result = _bind_reference_tags_to_prompt(
+            "A person presents the product.",
+            [{"role": "approved_keyframe", "image": "img1"}],
+            "showcase",
+        )
+        assert "APPROVED KEYFRAME REFERENCE" in result
+        assert "quality preflight passed" in result
+        assert "first-frame visual target" in result
+
+    def test_image_first_approved_keyframe_skips_duplicate_preflight(self):
+        """图片先行已通过的片段不应再额外触发单张首帧预检"""
+        src = Path("one_click_create.py").read_text(encoding="utf-8")
+        assert "and (idx - 1) not in approved_keyframes" in src
 
     def test_reference_binding_uses_roles_not_narrative_guess(self):
         """展示段如果只有角色图，也不能误标为 Product reference"""
@@ -683,8 +753,10 @@ class TestResumeAndIdempotency:
             [{"role": "character", "image": "img1"}],
             "showcase",
         )
-        assert "Character reference: <<<image_1>>>" in result
-        assert "Product reference: <<<image_1>>>" not in result
+        assert "CHARACTER REFERENCE" in result
+        assert "<<<image_1>>>" in result
+        assert "Exact same person" in result
+        assert "PRODUCT REFERENCE" not in result
 
     def test_clip_manifest_must_match_for_cache(self, tmp_path):
         """片段缓存必须严格匹配 manifest，避免旧画面配新字幕"""
@@ -710,19 +782,196 @@ class TestResumeAndIdempotency:
         changed["prompt_sha256"] = "different"
         assert _manifest_matches(clip, changed) is False
 
+    def test_low_cost_policy_reduces_best_of_before_mode(self):
+        """超预算时应优先减少候选数，再降低生成模式。"""
+        with patch.object(
+            sys,
+            "argv",
+            ["one_click_create.py", "--mode", "4k", "--best-of", "3", "--duration", "8"],
+        ):
+            args = parse_args()
+
+        changes = apply_low_cost_generation_policy(
+            args,
+            num_clips=5,
+            num_characters=1,
+            ab_versions=1,
+            budget_limit=20.0,
+        )
+
+        assert changes[0] == "best_of 3 -> 1"
+        assert args.best_of == 1
+        assert "mode 4k -> pro" in changes
+        assert args.mode in {"pro", "std"}
+
 
 class TestBatchQualityDefaults:
     """测试批量模式质量默认值"""
 
     def test_batch_defaults_match_publish_first_policy(self):
-        """批量生成默认也应使用发布级质量策略"""
+        """批量生成默认也应使用发布级质量策略，同时避免默认视频抽卡"""
         from batch import create_task_args
 
         args = create_task_args({"product_name": "测试产品"}, {})
         assert args["strict_mode"] is True
         assert args["stabilize"] is True
-        assert args["best_of"] == 2
+        assert args["best_of"] == 1
+        assert args["preflight_keyframe"] is True
+        assert args["image_first"] is True
+        assert args["image_first_mode"] == "standard"
+        assert args["image_first_variants"] == 2
         assert args["allow_no_product_image"] is False
+        assert args["resume"] is True
+
+    def test_batch_stable_output_name_is_deterministic(self):
+        """批量任务默认输出名应稳定，便于重跑命中缓存。"""
+        from batch import _build_stable_task_output_name
+
+        kwargs = {
+            "product_info": {"name": "测试产品", "type": "美妆"},
+            "style": "none",
+            "duration": 5,
+            "mode": "pro",
+            "aspect_ratio": "9:16",
+        }
+
+        first = _build_stable_task_output_name(1, "测试产品", kwargs)
+        second = _build_stable_task_output_name(1, "测试产品", dict(reversed(list(kwargs.items()))))
+
+        assert first == second
+        assert first.startswith("001_测试产品_")
+
+
+class TestProductionWorkflowBridge:
+    """回归测试：one_click 主流程接入工作流闭环"""
+
+    def test_completion_records_assets_feedback_and_experiment(self, tmp_path):
+        """最终质检通过后应登记资产、收集反馈并追踪实验。"""
+        from PIL import Image
+
+        image_path = tmp_path / "product.png"
+        Image.new("RGB", (64, 64), (80, 120, 200)).save(image_path)
+        final_path = tmp_path / "final.mp4"
+        final_path.write_bytes(b"fake-video")
+
+        class FakeQuality:
+            overall_score = 86.0
+            issues = []
+
+        class FakeAssetLibrary:
+            def __init__(self):
+                self.characters = []
+                self.products = []
+                self.scores = []
+
+            def add_character(self, **kwargs):
+                self.characters.append(kwargs)
+                return "char_1"
+
+            def add_product(self, **kwargs):
+                self.products.append(kwargs)
+                return "product_1"
+
+            def update_quality_score(self, asset_id, score):
+                self.scores.append((asset_id, score))
+
+        class FakeFeedbackLoop:
+            def __init__(self):
+                self.calls = []
+
+            def collect_feedback(self, **kwargs):
+                self.calls.append(kwargs)
+                return True
+
+        class FakeExperimentTracker:
+            def __init__(self):
+                self.started = []
+                self.completed = []
+
+            def start_experiment(self, **kwargs):
+                self.started.append(kwargs)
+                return True
+
+            def complete_experiment(self, **kwargs):
+                self.completed.append(kwargs)
+                return True
+
+        assets = FakeAssetLibrary()
+        feedback = FakeFeedbackLoop()
+        experiments = FakeExperimentTracker()
+
+        summary = _record_production_workflow_completion(
+            output_name="demo",
+            final_path=final_path,
+            quality_result=FakeQuality(),
+            product_info={"name": "测试产品", "type": "美妆"},
+            ad_script={"segments": [{"narrative": "hook"}]},
+            generation_params={"mode": "pro", "best_of": 1},
+            character_assets=[{"name": "主角", "image_path": image_path}],
+            product_image_path=image_path,
+            character_bibles=[{"name": "主角"}],
+            product_bible={"name": "测试产品"},
+            asset_library=assets,
+            feedback_loop=feedback,
+            experiment_tracker=experiments,
+        )
+
+        assert len(summary["registered_assets"]) == 2
+        assert summary["feedback_collected"] is True
+        assert summary["experiment_tracked"] is True
+        assert len(feedback.calls) == 1
+        assert len(experiments.started) == 1
+        assert len(experiments.completed) == 1
+
+    def test_one_click_pipeline_calls_workflow_bridge_after_quality_gate(self):
+        """主流水线源码应包含前置智能决策和完成闭环。"""
+        src = Path("one_click_create.py").read_text(encoding="utf-8")
+        assert "_run_pre_generation_smart_decision(" in src
+        assert "_record_production_workflow_completion(" in src
+
+    def test_workflow_orchestrator_uses_current_quality_gate_api(self):
+        """工作流编排器应调用当前质量门 API，而不是旧的 storyboard 参数。"""
+        src = Path("workflow_orchestrator.py").read_text(encoding="utf-8")
+        quality_block = src[src.index("def _step_quality_gate"):src.index("def _step_smart_decision")]
+        assert "ad_script=ad_script" in quality_block
+        assert "product_image_path=product_image_path" in quality_block
+        assert "run_quality_gate(\n            storyboard=" not in quality_block
+
+    def test_strict_quality_gate_failure_blocks_without_prompt(self):
+        """严格模式下质量门失败应直接阻断，不能进入人工确认再抽视频。"""
+        src = Path("one_click_create.py").read_text(encoding="utf-8")
+        block = src[src.index("if not quality_gate_result.passed:"):src.index("workflow_decision_result =")]
+        assert "if strict_mode:" in block
+        assert "避免进入高成本视频抽卡" in block
+        assert block.index("if strict_mode:") < block.index("input(")
+
+    def test_workflow_registers_video_clips_as_video_assets(self):
+        """工作流资产注册不能把 mp4 片段当商品图片资产。"""
+        src = Path("workflow_orchestrator.py").read_text(encoding="utf-8")
+        asset_block = src[src.index("def _step_asset_registration"):src.index("def _step_feedback_collection")]
+        block = asset_block[asset_block.index("for clip in video_clips:"):asset_block.index("print(f\"📦 资产注册完成")]
+        assert "add_video_clip(" in block
+        assert "add_product(" not in block
+
+    def test_asset_library_supports_video_clip_assets(self, tmp_path):
+        """资产库应原生支持视频片段资产类型。"""
+        from asset_library import AssetLibrary
+
+        video = tmp_path / "clip.mp4"
+        video.write_bytes(b"fake-video")
+
+        library = AssetLibrary(tmp_path / "assets")
+        asset_id = library.add_video_clip(
+            video_path=video,
+            name="clip_0",
+            metadata={"narrative": "hook"},
+            tags=["clip", "hook"],
+        )
+
+        asset = library.get_asset(asset_id)
+        assert asset["asset_type"] == "video_clip"
+        assert Path(asset["video_path"]).exists()
+        assert library.get_stats()["video_clips"] == 1
 
 
 class TestTrimOffsetCompensation:
@@ -884,7 +1133,7 @@ class TestBatchGlobalDefaults:
             "image_fidelity": 0.5,
             "human_fidelity": 0.5,
             "seed": None,
-            "best_of": 2,
+            "best_of": 1,
             "quality_frames": 12,
             "keep_candidates": False,
             "stabilize": True,
@@ -892,6 +1141,10 @@ class TestBatchGlobalDefaults:
             "brand_intro_outro": False,
             "kling_model": None,
             "multi_shot": False,
+            "preflight_keyframe": True,
+            "image_first": True,
+            "image_first_mode": "standard",
+            "image_first_variants": 2,
             "hook_type": "question",
             "use_voiceover": False,
             "voiceover_style": "standard",
@@ -904,6 +1157,7 @@ class TestBatchGlobalDefaults:
             "max_workers": 4,
             "target_duration": None,
             "rhythm_style": "moderate",
+            "resume": True,
             "total_tasks": 1,
         }
 
@@ -1057,10 +1311,14 @@ class TestFifthReviewFixes:
         assert "OUTPUT_DIR.mkdir(parents=True, exist_ok=True)" not in config_text
 
     def test_color_range_args_marks_full_range(self):
-        """重编码输出应显式标记 full-range，避免平台误读色彩范围"""
+        """重编码输出应显式标记 BT.709 + full-range，避免平台误读色彩范围"""
         from video_merger import _color_range_args
 
-        assert _color_range_args() == ["-color_range", "pc"]
+        args = _color_range_args()
+        assert "-color_range" in args and "pc" in args
+        assert "-colorspace" in args and "bt709" in args
+        assert "-color_trc" in args and "bt709" in args
+        assert "-color_primaries" in args and "bt709" in args
 
 
 class TestPublishableSuccessFixes:
@@ -1325,9 +1583,9 @@ class TestFinalVideoQualityFixes:
 
     def test_product_required_narrative_covers_review_and_proof(self):
         """review/proof/demo 等产品相关段必须纳入产品语义门禁"""
-        for narrative in ("showcase", "cta", "review", "proof", "demo", "detail", "reason", "effect"):
+        for narrative in ("hook", "showcase", "cta", "review", "proof", "demo", "detail", "reason", "effect"):
             assert _is_product_required_narrative(narrative)
-        assert not _is_product_required_narrative("hook")
+        assert not _is_product_required_narrative("pure_emotion")
 
     def test_local_product_image_validation_rejects_non_image(self, tmp_path):
         """本地商品参考图不能只检查 exists，损坏文件必须提前失败"""
@@ -1389,6 +1647,715 @@ class TestFinalVideoQualityFixes:
         rhythm_block = src[src.index("if _over_limit_segs:"):src.index("# 生成完整广告脚本")]
         assert "strict_mode and not preview" in rhythm_block
         assert "节奏模板存在超过当前生成片段后期拉伸能力" in rhythm_block
+
+
+class TestLowCostQualityStrategy:
+    """回归测试：低成本高质量生成策略"""
+
+    def test_negative_prompt_does_not_block_product_logo(self):
+        """负面词不能全局禁止商品包装自身 logo，只能禁止无关品牌/水印"""
+        from config import NEGATIVE_PROMPT
+
+        assert "unrelated logo" in NEGATIVE_PROMPT
+        assert "unrelated brand mark" in NEGATIVE_PROMPT
+        assert "text watermark" in NEGATIVE_PROMPT
+        assert "text watermark, logo, brand mark" not in NEGATIVE_PROMPT
+
+    def test_reference_strategy_product_segment_uses_quality_roles(self):
+        """产品段优先商品图 + 主角多角度 + 连续性（性价比策略：用图买成功率）"""
+        from one_click_create import _reference_strategy_for_narrative
+
+        roles = _reference_strategy_for_narrative(
+            "showcase",
+            product_available=True,
+            character_available=True,
+            continuity_available=True,
+            multi_angle_char=True,
+        )
+        assert roles[0] == "product"
+        assert "character_primary" in roles
+        assert "continuity" in roles
+        assert len(roles) <= 5
+
+    def test_reference_strategy_character_segment_prioritizes_character(self):
+        """非产品强制段应优先人物多角度，再补连续性"""
+        from one_click_create import _reference_strategy_for_narrative
+
+        roles = _reference_strategy_for_narrative(
+            "turning",
+            product_available=True,
+            character_available=True,
+            continuity_available=True,
+            multi_angle_char=True,
+        )
+        assert roles[0] == "character_primary"
+        assert "character_angle" in roles
+        assert "continuity" in roles
+
+    def test_preflight_contract_blocks_product_segment_without_product_name(self):
+        """产品强制分镜缺少产品名时应在视频生成前阻断，而不是生成后才质检失败"""
+        from one_click_create import _preflight_generation_contract
+
+        with pytest.raises(RuntimeError, match="生成前合同预检未通过"):
+            _preflight_generation_contract(
+                product_info={"name": "蓝罐汽水"},
+                ad_script={"segments": [{"narrative": "showcase", "product_visibility": "prominent"}]},
+                clip_prompts=["close-up lifestyle shot, cold drink on table"],
+                product_image_path=Path("product.png"),
+                char_refs=[{"img_b64": "abc"}],
+                strict_mode=True,
+            )
+
+    def test_prompt_compact_keeps_within_budget(self):
+        """最终 Prompt 调用前应压缩，避免泛词挤掉核心商品/动作信息"""
+        from one_click_create import _compact_prompt_for_generation
+
+        long_prompt = ", ".join(["蓝罐汽水 product hero shot"] + ["high quality"] * 200)
+        compacted = _compact_prompt_for_generation(long_prompt, max_chars=220)
+        assert len(compacted) <= 220
+        assert "蓝罐汽水 product hero shot" in compacted
+
+    def test_adaptive_best_of_has_early_stop_and_strategy_difference(self):
+        """best_of 应自适应早停，补候选时必须改变策略而非重复抽卡"""
+        src = Path("one_click_create.py").read_text(encoding="utf-8")
+        assert "early_stop_score = 85.0" in src
+        assert "停止继续生成候选以节省成本" in src
+        assert "product_rescue" in src
+        assert "character_rescue" in src
+
+    def test_parallel_generation_does_not_reuse_first_tail_as_fake_prev(self):
+        """并行模式不能把第 1 段尾帧伪装成所有后续段的上一帧"""
+        src = Path("one_click_create.py").read_text(encoding="utf-8")
+        assert "first_clip_last_frame" not in src
+        assert "_generate_one_clip(idx, prompt, None, None)" in src
+
+
+class TestPreflightKeyframe:
+    """测试首帧低成本预检逻辑"""
+
+    def test_sanitize_prompt_removes_camera_terms(self):
+        """运镜词汇应从图片 Prompt 中被清洗掉"""
+        prompt = "A woman holds a bottle, slow push in, dolly zoom, natural lighting"
+        result = _sanitize_prompt_for_image_generation(prompt)
+        assert "slow push in" not in result
+        assert "dolly zoom" not in result
+        assert "natural lighting" in result
+
+    def test_sanitize_prompt_removes_image_tags(self):
+        """参考图绑定标签应从图片 Prompt 中被清洗掉"""
+        prompt = "A product display, <<<image_1>>>, bright studio light"
+        result = _sanitize_prompt_for_image_generation(prompt)
+        assert "<<<image_1>>>" not in result
+        assert "product display" in result
+
+    def test_sanitize_prompt_preserves_content(self):
+        """非运镜的核心内容描述应保留"""
+        prompt = "Young woman, red dress, holding skincare bottle, soft window light, clean background"
+        result = _sanitize_prompt_for_image_generation(prompt)
+        assert "Young woman" in result
+        assert "skincare bottle" in result
+        assert "soft window light" in result
+
+    def test_preflight_skips_when_no_references(self):
+        """无参考图时首帧预检应直接跳过，避免无意义调用"""
+        client = MagicMock()
+        passed, issues, path = _preflight_keyframe_check(
+            client=client,
+            prompt="test prompt",
+            ref_images=[],
+            narrative="hook",
+            product_image_path=None,
+            main_char_path=None,
+            save_path=Path("/tmp/test_preflight.png"),
+        )
+        assert passed is True
+        assert not issues
+        assert path is None
+        client.generate_image.assert_not_called()
+
+    def test_preflight_calls_generate_image_with_sanitized_prompt(self, tmp_path):
+        """有参考图时应调用 generate_image，且 prompt 已被清洗"""
+        from PIL import Image
+
+        client = MagicMock()
+        # 构造一个假图片结果
+        client.session.get.return_value = MagicMock(
+            content=b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
+            raise_for_status=lambda: None,
+        )
+        client.generate_image.return_value = {
+            "data": {
+                "task_result": {
+                    "images": [{"url": "http://fake.url/img.png"}]
+                }
+            }
+        }
+
+        # 构造一张真实的小图片作为参考图
+        ref_img = tmp_path / "ref.png"
+        img = Image.new("RGB", (64, 64), color="red")
+        img.save(ref_img)
+
+        save_path = tmp_path / "preflight.png"
+        prompt = "Woman, slow push in, <<<image_1>>>, soft light"
+        passed, issues, kf_path = _preflight_keyframe_check(
+            client=client,
+            prompt=prompt,
+            ref_images=[],
+            narrative="hook",
+            product_image_path=None,
+            main_char_path=ref_img,
+            save_path=save_path,
+            aspect_ratio="9:16",
+            image_fidelity=0.85,
+        )
+
+        assert client.generate_image.called
+        call_kwargs = client.generate_image.call_args.kwargs
+        # prompt 应被清洗过
+        assert "slow push in" not in call_kwargs["prompt"]
+        assert "<<<image_" not in call_kwargs["prompt"]
+        # 参考图参数应正确
+        assert call_kwargs["image_reference"] == "face"
+        assert call_kwargs["resolution"] == "1k"
+        assert call_kwargs["aspect_ratio"] == "9:16"
+
+    def test_preflight_fails_when_image_generation_empty(self, tmp_path):
+        """图片生成返回空结果时预检应失败"""
+        client = MagicMock()
+        client.generate_image.return_value = {"data": {"task_result": {"images": []}}}
+
+        ref_img = tmp_path / "ref.png"
+        from PIL import Image
+        img = Image.new("RGB", (64, 64), color="red")
+        img.save(ref_img)
+
+        passed, issues, kf_path = _preflight_keyframe_check(
+            client=client,
+            prompt="test",
+            ref_images=[],
+            narrative="hook",
+            product_image_path=None,
+            main_char_path=ref_img,
+            save_path=tmp_path / "pf.png",
+        )
+        assert passed is False
+        assert any("结果为空" in i for i in issues)
+
+
+class TestCharacterBible:
+    """测试角色圣经 / 商品圣经结构"""
+
+    def test_build_character_bibles_single_role(self):
+        """单角色时从 product_info 构建默认圣经"""
+        product_info = {
+            "name": "TestProduct",
+            "age": "28",
+            "gender": "女",
+            "outfit": "white dress",
+        }
+        bibles = build_character_bibles(product_info, characters=None)
+        assert len(bibles) == 1
+        assert bibles[0]["id"] == "char_01"
+        assert bibles[0]["age"] == "28"
+        assert bibles[0]["gender"] == "女"
+        assert bibles[0]["outfit"] == "white dress"
+
+    def test_build_character_bibles_multi_role_with_description(self):
+        """多角色时从 description 解析结构化字段"""
+        product_info = {"age": "25", "gender": "女", "outfit": "casual"}
+        characters = [
+            {"name": "小雅", "description": "25-year-old Asian woman, long black hair"},
+            {"name": "Amy", "description": "30-year-old Caucasian woman, short blonde hair"},
+        ]
+        bibles = build_character_bibles(product_info, characters)
+        assert len(bibles) == 2
+        assert bibles[0]["name"] == "小雅"
+        assert bibles[0]["age"] == "25"
+        assert "long black hair" in bibles[0]["hair_style"]
+        assert bibles[1]["name"] == "Amy"
+        assert bibles[1]["age"] == "30"
+        assert "short blonde hair" in bibles[1]["hair_style"]
+
+    def test_infer_family_insurance_characters(self):
+        """家财险核心角色应包含父母+孩子+保险顾问（孩子是情感锚点必须定妆，顾问是服务场景核心）"""
+        from one_click_create import build_cast_plan, infer_characters_from_product
+
+        product_info = {
+            "name": "众安家财险",
+            "type": "app",
+            "selling_point": "全屋保障无忧，极速理赔守护家庭财产安全",
+            "audience": "2545",
+        }
+        cast_plan = build_cast_plan(product_info)
+        characters = infer_characters_from_product(product_info)
+
+        assert len(characters) == 4
+        core_names = [c["name"] for c in characters]
+        assert "Mother" in core_names
+        assert "Father" in core_names
+        assert "Child" in core_names
+        assert "Insurance Advisor" in core_names
+
+    def test_explicit_characters_are_preserved(self):
+        """LLM 或模板显式给出的角色列表优先，不被兜底推断覆盖"""
+        from one_click_create import infer_characters_from_product
+
+        product_info = {
+            "name": "家庭保险",
+            "characters": [
+                {
+                    "name": "Grandma",
+                    "role": "elder family member",
+                    "description": "68-year-old Chinese woman, silver hair, warm smile",
+                },
+                {
+                    "name": "Daughter",
+                    "role": "adult child",
+                    "description": "32-year-old Chinese woman, short black hair, office outfit",
+                },
+            ],
+        }
+        characters = infer_characters_from_product(product_info)
+
+        assert len(characters) == 2
+        assert [c["name"] for c in characters] == ["Grandma", "Daughter"]
+
+    def test_pet_product_can_use_animal_as_core_subject(self):
+        """宠物是主角时动物应作为核心主体，而不是背景路人式实体"""
+        from one_click_create import build_cast_plan
+
+        product_info = {
+            "name": "智能猫粮机",
+            "type": "宠物",
+            "selling_point": "自动定时喂猫，出差也能照顾猫咪",
+        }
+        cast_plan = build_cast_plan(product_info)
+
+        assert [c["name"] for c in cast_plan["core_characters"]] == ["Owner", "Pet"]
+        assert cast_plan["core_characters"][1]["role_type"] == "animal"
+
+    def test_character_bible_to_prompt_includes_all_fields(self):
+        """角色圣经转 prompt 应包含所有非空字段"""
+        bible = CharacterBible(
+            id="char_01", name="Test", age="25", gender="female",
+            ethnicity="Asian", hair_style="long black hair",
+            outfit="red dress", accessories="gold earrings",
+            facial_features="high cheekbones", expression_baseline="warm smile",
+        )
+        prompt = character_bible_to_prompt(bible)
+        assert "25-year-old female" in prompt
+        assert "Asian" in prompt
+        assert "long black hair" in prompt
+        assert "wearing red dress" in prompt
+        assert "gold earrings" in prompt
+        assert "high cheekbones" in prompt
+        assert "warm smile" in prompt
+
+    def test_generate_character_prompt_uses_bible(self):
+        """generate_character_prompt 优先使用圣经生成更精确的描述"""
+        bible = CharacterBible(
+            id="char_01", name="小雅", age="28", gender="female",
+            ethnicity="Asian", hair_style="long straight black hair",
+            outfit="white blouse and jeans", accessories="",
+            facial_features="", expression_baseline="confident",
+        )
+        product_info = {"name": "面霜", "type": "美妆", "age": "28", "gender": "女", "outfit": "casual"}
+        prompt = generate_character_prompt(product_info, bible=bible)
+        # 圣经描述应出现在 prompt 中
+        assert "long straight black hair" in prompt
+        assert "white blouse and jeans" in prompt
+        assert "confident" in prompt
+
+    def test_generate_clip_prompts_uses_bible_for_multi_role(self):
+        """多角色时分镜 prompt 应包含每个角色的精确圣经描述"""
+        product_info = {"name": "TestProduct", "type": "default"}
+        bibles = [
+            CharacterBible(
+                id="char_01", name="小雅", age="25", gender="female",
+                ethnicity="Asian", hair_style="long black hair",
+                outfit="red dress", accessories="", facial_features="",
+                expression_baseline="",
+            ),
+            CharacterBible(
+                id="char_02", name="Amy", age="30", gender="female",
+                ethnicity="Caucasian", hair_style="short blonde hair",
+                outfit="blue suit", accessories="", facial_features="",
+                expression_baseline="",
+            ),
+        ]
+        clips = generate_clip_prompts(
+            product_info,
+            cinematic_style="none",
+            character_bibles=bibles,
+        )
+        # 至少有一个分镜包含两个角色的精确描述
+        assert any("小雅: " in clip and "long black hair" in clip for clip in clips)
+        assert any("Amy: " in clip and "short blonde hair" in clip for clip in clips)
+
+    def test_build_product_bible_includes_brand_info(self):
+        """商品圣经应整合 product_info 和 BRAND_CONFIG"""
+        product_info = {"name": "TestCream", "type": "美妆", "selling_point": "保湿"}
+        bible = build_product_bible(product_info)
+        assert bible["name"] == "TestCream"
+        assert bible["category"] == "美妆"
+        assert bible["key_selling_point"] == "保湿"
+        # BRAND_CONFIG 中的字段也应被纳入
+        assert "packaging" in bible
+        assert "primary_color" in bible
+
+    def test_generate_clip_prompts_uses_product_bible(self):
+        """商品圣经应注入分镜 prompt 的商品一致性描述"""
+        product_info = {"name": "TestProduct", "type": "default"}
+        p_bible = ProductBible(
+            name="TestProduct", category="default",
+            packaging="white cylindrical bottle", primary_color="white",
+            shape="slim cylindrical", logo_description="minimalist logo",
+            usage_context="", key_selling_point="",
+        )
+        clips = generate_clip_prompts(
+            product_info,
+            cinematic_style="none",
+            product_bible=p_bible,
+        )
+        # product_consistency 应使用圣经描述
+        assert any("white cylindrical bottle" in clip for clip in clips)
+
+
+class TestMultiCharacterReferenceBinding:
+    """测试多人物按角色 ID 绑定参考图"""
+
+    def test_single_character_returns_zero(self):
+        """单角色时始终返回主角色索引 0"""
+        bibles = [CharacterBible(id="c1", name="小雅", age="25", gender="女", outfit="", ethnicity="", hair_style="", hair_color="", accessories="", facial_features="", expression_baseline="")]
+        result = _get_primary_char_for_clip(1, "小雅在化妆", {"segments": []}, bibles)
+        assert result == 0
+
+    def test_detects_extra_character_by_name(self):
+        """clip_prompt 中出现额外角色名时应返回对应索引"""
+        bibles = [
+            CharacterBible(id="c1", name="小雅", age="25", gender="女", outfit="", ethnicity="", hair_style="", hair_color="", accessories="", facial_features="", expression_baseline=""),
+            CharacterBible(id="c2", name="Amy", age="30", gender="女", outfit="", ethnicity="", hair_style="", hair_color="", accessories="", facial_features="", expression_baseline=""),
+        ]
+        result = _get_primary_char_for_clip(2, "Amy introduces the product", {"segments": []}, bibles)
+        assert result == 1
+
+    def test_detects_from_ad_script_scene_prompt(self):
+        """优先从 ad_script segment 的 scene_prompt 中检测角色名"""
+        bibles = [
+            CharacterBible(id="c1", name="小雅", age="25", gender="女", outfit="", ethnicity="", hair_style="", hair_color="", accessories="", facial_features="", expression_baseline=""),
+            CharacterBible(id="c2", name="Amy", age="30", gender="女", outfit="", ethnicity="", hair_style="", hair_color="", accessories="", facial_features="", expression_baseline=""),
+        ]
+        ad_script = {
+            "segments": [
+                {"narrative": "hook", "scene_prompt": "小雅 looks at her phone"},
+                {"narrative": "showcase", "scene_prompt": "Amy holds the bottle"},
+            ]
+        }
+        result = _get_primary_char_for_clip(2, "some generic prompt", ad_script, bibles)
+        assert result == 1
+
+    def test_fallback_to_primary_when_no_match(self):
+        """检测不到任何角色名时回退主角色"""
+        bibles = [
+            CharacterBible(id="c1", name="小雅", age="25", gender="女", outfit="", ethnicity="", hair_style="", hair_color="", accessories="", facial_features="", expression_baseline=""),
+            CharacterBible(id="c2", name="Amy", age="30", gender="女", outfit="", ethnicity="", hair_style="", hair_color="", accessories="", facial_features="", expression_baseline=""),
+        ]
+        result = _get_primary_char_for_clip(1, "A generic scene with no names", {"segments": []}, bibles)
+        assert result == 0
+
+    def test_empty_bibles_returns_zero(self):
+        """空圣经列表时安全回退 0"""
+        result = _get_primary_char_for_clip(1, "test", {"segments": []}, [])
+        assert result == 0
+
+
+class TestMusicContract:
+    """测试音乐合同结构"""
+
+    def test_build_music_contract_basic(self):
+        """基础产品信息应生成合理的音乐合同"""
+        product_info = {"type": "美妆", "audience": "18-25"}
+        contract = build_music_contract(product_info, cinematic_style="none")
+        assert contract["mood"] == "upbeat"
+        assert contract["genre"] == "pop"
+        assert contract["energy"] == "high"
+        assert contract["recommended_pace"] == "fast"
+        assert contract["bpm_min"] >= 120
+        assert contract["bpm_max"] <= 150
+
+    def test_cinematic_style_overrides_mood(self):
+        """电影风格应覆盖基础 mood 和 genre"""
+        product_info = {"type": "美妆", "audience": "18-25"}
+        contract = build_music_contract(product_info, cinematic_style="hitchcock")
+        assert contract["mood"] == "suspenseful"
+        assert contract["genre"] == "orchestral"
+        assert contract["intro_type"] == "buildup"
+
+    def test_audience_affects_bpm(self):
+        """不同受众年龄应有不同 BPM 范围"""
+        young = build_music_contract({"type": "default", "audience": "18-25"})
+        old = build_music_contract({"type": "default", "audience": "45+"})
+        assert young["bpm_min"] > old["bpm_min"]
+        assert young["bpm_max"] > old["bpm_max"]
+
+    def test_energy_affects_pace(self):
+        """energy 应正确映射到 recommended_pace"""
+        high = build_music_contract({"type": "美妆"})
+        low = build_music_contract({"type": "家居"})
+        assert high["recommended_pace"] == "fast"
+        assert low["recommended_pace"] == "cinematic"
+
+    def test_generate_clip_prompts_injects_rhythm(self):
+        """音乐合同应注入分镜 prompt 的节奏描述"""
+        product_info = {"name": "TestProduct", "type": "default"}
+        contract = build_music_contract(product_info, cinematic_style="hitchcock")
+        clips = generate_clip_prompts(
+            product_info,
+            cinematic_style="none",
+            music_contract=contract,
+        )
+        # 每个 clip 都应包含节奏描述（插入到 prompt 开头）
+        for clip in clips:
+            assert "suspenseful orchestral energy" in clip
+            assert "BPM rhythm" in clip
+
+
+class TestIssueDrivenRepair:
+    """测试失败原因驱动的精准修复策略"""
+
+    def test_no_issues_returns_original(self):
+        """无问题时返回原 prompt"""
+        prompt = "A woman holds a bottle"
+        repaired, tags = _repair_prompt_by_issues(prompt, [])
+        assert repaired == prompt
+        assert tags == []
+
+    def test_detects_logo_issue(self):
+        """检测到 logo 问题时注入品牌清晰度修复"""
+        prompt = "A woman holds a bottle"
+        issues = ["brand logo not visible, text unreadable"]
+        repaired, tags = _repair_prompt_by_issues(prompt, issues)
+        assert "clear brand logo visible" in repaired
+        assert "logo" in tags
+
+    def test_detects_face_issue(self):
+        """检测到面部问题时注入正面约束"""
+        prompt = "A woman uses the product"
+        issues = ["face not detected, character similarity low"]
+        repaired, tags = _repair_prompt_by_issues(prompt, issues)
+        assert "front-facing portrait" in repaired
+        assert "face" in tags
+
+    def test_detects_profile_issue(self):
+        """检测到侧脸问题时注入正面朝向修复"""
+        prompt = "A woman turns around"
+        issues = ["side profile detected"]
+        repaired, tags = _repair_prompt_by_issues(prompt, issues)
+        assert "no profile or back view" in repaired
+        assert "profile" in tags
+
+    def test_detects_product_obstruction(self):
+        """检测到商品遮挡时注入可见性修复"""
+        prompt = "A woman shows the product"
+        issues = ["product hidden by hands, packaging obstructed"]
+        repaired, tags = _repair_prompt_by_issues(prompt, issues)
+        assert "product fully visible" in repaired
+        assert "obstructed" in tags
+
+    def test_multiple_issues_merge_repairs(self):
+        """多个问题时应合并所有修复指令"""
+        prompt = "A woman holds a bottle"
+        issues = ["logo unclear", "product color mismatch"]
+        repaired, tags = _repair_prompt_by_issues(prompt, issues)
+        assert "clear brand logo visible" in repaired
+        assert "exact same product color" in repaired
+        assert len(tags) == 2
+
+    def test_uses_product_bible_for_exact_description(self):
+        """有商品圣经时，用精确描述替换泛化修复"""
+        prompt = "A woman holds a bottle"
+        issues = ["product similarity low"]
+        bible = ProductBible(
+            name="Test", category="default",
+            packaging="white cylindrical bottle with gold cap", primary_color="white",
+            shape="", logo_description="", usage_context="", key_selling_point="",
+        )
+        repaired, tags = _repair_prompt_by_issues(prompt, issues, product_bible=bible)
+        assert "white cylindrical bottle with gold cap" in repaired
+
+    def test_uses_character_bible_for_exact_description(self):
+        """有角色圣经时，用精确描述替换泛化修复"""
+        prompt = "A woman uses the product"
+        issues = ["face not detected"]
+        bible = CharacterBible(
+            id="c1", name="小雅", age="25", gender="女",
+            hair_style="long straight black hair", hair_color="", outfit="", ethnicity="",
+            accessories="", facial_features="", expression_baseline="",
+        )
+        repaired, tags = _repair_prompt_by_issues(prompt, issues, character_bible=bible)
+        assert "long straight black hair" in repaired
+
+
+class TestPostProcessingP0Fixes:
+    """第8轮审查：P0 级后处理修复回归测试"""
+
+    def test_color_range_args_includes_bt709(self):
+        """颜色空间标记必须包含完整 BT.709 triplet + full-range"""
+        from video_merger import _color_range_args
+        args = _color_range_args()
+        assert "-colorspace" in args
+        assert args[args.index("-colorspace") + 1] == "bt709"
+        assert "-color_trc" in args
+        assert args[args.index("-color_trc") + 1] == "bt709"
+        assert "-color_primaries" in args
+        assert args[args.index("-color_primaries") + 1] == "bt709"
+        assert "-color_range" in args
+        assert args[args.index("-color_range") + 1] == "pc"
+
+    def test_subtitle_outline_is_2(self, tmp_path):
+        """字幕描边必须从 5 降到 2，避免过粗影响画面"""
+        import subprocess
+        from unittest.mock import patch
+        from video_merger import add_subtitles_ffmpeg
+
+        video = tmp_path / "test.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=100x100:d=1",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video),
+            ],
+            check=True, capture_output=True,
+        )
+        subtitles = [{"text": "测试", "start": 0, "end": 0.5}]
+        output = tmp_path / "out.mp4"
+
+        captured = []
+        with patch("video_merger.run_ffmpeg") as mock_run:
+            mock_run.side_effect = lambda cmd, **kw: captured.extend(cmd)
+            add_subtitles_ffmpeg(video, subtitles, output, font_size=24)
+
+        cmd_str = " ".join(str(c) for c in captured)
+        assert "Outline=2" in cmd_str, f"字幕描边应为 2，实际命令：{cmd_str}"
+        assert "Outline=5" not in cmd_str, f"不应再出现 Outline=5：{cmd_str}"
+
+    def test_sidechain_ratio_12_and_alimiter(self, tmp_path):
+        """BGM ducking 必须使用 ratio=12 并追加 alimiter 防止爆音"""
+        import subprocess
+        from unittest.mock import patch
+        from one_click_create import _mix_voiceover_with_bgm
+
+        video = tmp_path / "video.mp4"
+        voice = tmp_path / "voice.m4a"
+        output = tmp_path / "out.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=100x100:d=1",
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                "-c:v", "libx264", "-c:a", "aac", "-shortest", str(video),
+            ],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                "-t", "1", "-c:a", "aac", str(voice),
+            ],
+            check=True, capture_output=True,
+        )
+
+        captured = []
+        with patch("one_click_create.run_ffmpeg") as mock_run:
+            mock_run.side_effect = lambda cmd, **kw: captured.extend(cmd)
+            _mix_voiceover_with_bgm(video, voice, output)
+
+        filter_str = None
+        for i, c in enumerate(captured):
+            if c == "-filter_complex":
+                filter_str = captured[i + 1]
+                break
+        assert filter_str is not None, "未找到 -filter_complex"
+        assert "ratio=12" in filter_str, f"sidechain ratio 应为 12：{filter_str}"
+        assert "alimiter" in filter_str, f"应包含 alimiter 限幅器：{filter_str}"
+        assert "ratio=3" not in filter_str, f"不应再使用旧的 ratio=3：{filter_str}"
+
+    def test_atempo_subtitles_sequential_not_original_start(self, tmp_path):
+        """atempo 加速后字幕时间轴必须顺序累加，不能保留原始空隙导致错位"""
+        import subprocess, shutil
+        from unittest.mock import patch
+        from tts_client import generate_full_voiceover
+        import tts_client
+
+        template = tmp_path / "template.m4a"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                "-t", "1", "-c:a", "aac", str(template),
+            ],
+            check=True, capture_output=True,
+        )
+
+        def mock_tts(text, path, voice=None, rate=None):
+            shutil.copy(str(template), str(path))
+
+        def mock_duration(path):
+            # 正常音频 4.0 秒；atempo 后的音频（路径含 fast_）约 3.1 秒
+            if "fast_" in str(path):
+                return 3.1
+            return 4.0
+
+        # 3 句话，每句 4 秒 + 0.15 秒停顿 = 12.3 秒 > 9.5 秒（total_duration=10），触发 atempo
+        script_lines = [
+            {"text": "第一句。第二句。第三句。", "start": 0, "end": 10, "segment": 0}
+        ]
+        out_path = tmp_path / "voiceover.m4a"
+
+        with patch.object(tts_client, "generate_tts_audio", side_effect=mock_tts), \
+             patch.object(tts_client, "_get_audio_duration", side_effect=mock_duration):
+            _, subtitles = generate_full_voiceover(
+                script_lines, out_path, total_duration=10.0, pause_between_sentences=0.15
+            )
+
+        assert len(subtitles) == 3, f"应有 3 句字幕，实际 {len(subtitles)}"
+        # 关键断言：修复前 bug 会导致第二段 start 保留原始值≈4.15，
+        # 修复后应紧密跟随第一段结束（≈3.1）
+        assert subtitles[1]["start"] < 4.0, (
+            f"atempo 后第二段 start={subtitles[1]['start']}, "
+            "应紧密跟随第一段而非保留原始空隙"
+        )
+        assert subtitles[2]["start"] < 7.0, (
+            f"atempo 后第三段 start={subtitles[2]['start']}, "
+            "应顺序累加而非累积错位"
+        )
+        # 确保字幕之间没有超过 0.5 秒的不自然空隙
+        for i in range(1, len(subtitles)):
+            gap = subtitles[i]["start"] - subtitles[i - 1]["end"]
+            assert gap < 0.5, f"字幕 {i} 与 {i-1} 之间空隙过大：{gap:.2f}s"
+
+
+class TestWorkflowOrchestratorInterfaceContracts:
+    """回归测试：工作流编排器必须使用当前模块接口，避免真实流程后段才失败"""
+
+    def test_audio_generation_uses_current_bgm_and_voiceover_interfaces(self):
+        src = Path("workflow_orchestrator.py").read_text(encoding="utf-8")
+        block = src[src.index("    def _step_audio_generation"):src.index("    def _step_post_processing")]
+
+        assert "generate_voiceover_script(\n            product_info" in block
+        assert "_, voiceover_subtitles = generate_full_voiceover(" in block
+        assert "align_subtitles_to_voiceover(subtitles, voiceover_subtitles)" in block
+        assert "product_type=product_info.get" in block
+        assert "product_category=" not in block
+        assert "rhythm_curve=rhythm_curve" not in block
+        assert "bgm_audio = Path(bgm_info) if bgm_info else None" in block
+
+    def test_post_processing_uses_current_merger_and_beat_interfaces(self):
+        src = Path("workflow_orchestrator.py").read_text(encoding="utf-8")
+        block = src[src.index("    def _step_post_processing"):src.index("    def _step_brand_ending")]
+
+        assert "envelope_key_times=beat_timings" in block
+        assert "beat_timings=" not in block
+        assert "align_subtitles_to_beats(subtitles, bgm_audio)" in block
+        assert "align_subtitles_to_beats(subtitles, beat_timings)" not in block
 
 
 if __name__ == "__main__":

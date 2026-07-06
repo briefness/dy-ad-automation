@@ -3,7 +3,21 @@
 
 为视频 Prompt 生成提供结构化的电影级镜头元素，
 包括景别、运镜、角度、光影、构图、景深、胶片质感等。
+
+参考行业最佳实践：
+- Runway ML: Cinematic prompts
+- Pika: Motion controls
+- Deforum: Video styling
+- Stable Video Diffusion: Temporal consistency
+
+核心特点：
+1. 动态节奏曲线映射到视觉强度
+2. BPM驱动的运镜速度控制
+3. 情绪强度到光影对比度映射
+4. 导演风格与叙事功能深度融合
 """
+
+from typing import List, Dict, Any, Optional
 
 # ============================================================
 # 景别 Shot Size
@@ -456,6 +470,524 @@ DEEP_CINEMATIC_STYLES = {
         "mood": "dark humor, genre pastiche, pop culture bravado, stylized violence",
     },
 }
+
+# ============================================================
+# 节奏到视觉元素映射（Rhythm-to-Visual Mapping）
+# ============================================================
+# 将节奏曲线和情绪强度映射到具体的视觉元素参数
+
+# BPM 到运镜速度映射
+BPM_SPEED_MAP = {
+    (0, 70): "extremely slow",
+    (70, 85): "very slow",
+    (85, 100): "slow",
+    (100, 115): "moderate",
+    (115, 130): "fast",
+    (130, 150): "very fast",
+    (150, 200): "extremely fast",
+}
+
+
+def get_camera_speed_by_bpm(bpm: int) -> str:
+    """根据 BPM 获取运镜速度描述"""
+    for (min_bpm, max_bpm), speed in BPM_SPEED_MAP.items():
+        if min_bpm <= bpm < max_bpm:
+            return speed
+    return "moderate"
+
+
+# 情绪强度到光影对比度映射
+EMOTION_CONTRAST_MAP = {
+    "low": "soft gentle contrast, subtle shadows",
+    "moderate": "natural contrast, balanced shadows",
+    "high": "strong contrast, dramatic shadows",
+    "extreme": "extreme contrast, deep shadows, high contrast lighting",
+}
+
+
+def get_contrast_by_emotion(emotion_level: str) -> str:
+    """根据情绪强度获取对比度描述"""
+    return EMOTION_CONTRAST_MAP.get(emotion_level.lower(), "natural contrast")
+
+
+# 节奏强度到景深映射
+RHYTHM_DEPTH_MAP = {
+    "slow": "deep depth of field, everything in sharp focus",
+    "moderate": "medium depth of field, soft background blur",
+    "fast": "shallow depth of field, creamy bokeh, subject isolated",
+}
+
+
+def get_depth_by_rhythm(rhythm_pattern: str) -> str:
+    """根据节奏模式获取景深描述"""
+    return RHYTHM_DEPTH_MAP.get(rhythm_pattern.lower(), "medium depth of field")
+
+
+# 情绪强度到色彩饱和度映射
+EMOTION_SATURATION_MAP = {
+    "low": "desaturated colors, muted tones, subtle palette",
+    "moderate": "natural saturation, balanced colors",
+    "high": "vibrant saturated colors, rich hues",
+    "extreme": "hyper saturated colors, intense vivid hues, dramatic color contrast",
+}
+
+
+def get_saturation_by_emotion(emotion_level: str) -> str:
+    """根据情绪强度获取色彩饱和度描述"""
+    return EMOTION_SATURATION_MAP.get(emotion_level.lower(), "natural saturation")
+
+
+# 运镜类型与速度组合
+CAMERA_MOVEMENT_SPEED_MAP = {
+    "push_in": {
+        "slow": "slow subtle push-in, gentle forward movement",
+        "moderate": "steady push-in, deliberate camera movement",
+        "fast": "quick push-in, dynamic forward movement",
+    },
+    "pull_out": {
+        "slow": "slow pull-out, gentle backward movement",
+        "moderate": "steady pull-out, gradual reveal",
+        "fast": "quick pull-out, sudden reveal",
+    },
+    "pan_left": {
+        "slow": "slow pan to the left, gentle horizontal movement",
+        "moderate": "steady pan left, smooth horizontal movement",
+        "fast": "quick pan left, dynamic horizontal movement",
+    },
+    "pan_right": {
+        "slow": "slow pan to the right, gentle horizontal movement",
+        "moderate": "steady pan right, smooth horizontal movement",
+        "fast": "quick pan right, dynamic horizontal movement",
+    },
+    "tilt_up": {
+        "slow": "slow tilt upward, gentle vertical movement",
+        "moderate": "steady tilt up, smooth vertical movement",
+        "fast": "quick tilt up, dynamic vertical movement",
+    },
+    "tilt_down": {
+        "slow": "slow tilt downward, gentle vertical movement",
+        "moderate": "steady tilt down, smooth vertical movement",
+        "fast": "quick tilt down, dynamic vertical movement",
+    },
+    "orbit_left": {
+        "slow": "slow orbit around subject from left, gentle circular movement",
+        "moderate": "steady orbit around subject, smooth circular movement",
+        "fast": "quick orbit around subject, dynamic circular movement",
+    },
+    "orbit_right": {
+        "slow": "slow orbit around subject from right, gentle circular movement",
+        "moderate": "steady orbit around subject, smooth circular movement",
+        "fast": "quick orbit around subject, dynamic circular movement",
+    },
+    "tracking": {
+        "slow": "slow tracking shot, following subject gently",
+        "moderate": "steady tracking shot, smoothly following subject",
+        "fast": "quick tracking shot, dynamically following subject",
+    },
+    "zoom_in": {
+        "slow": "slow zoom in, gradual magnification",
+        "moderate": "steady zoom in, controlled magnification",
+        "fast": "quick zoom in, dramatic magnification",
+    },
+    "zoom_out": {
+        "slow": "slow zoom out, gradual wide view",
+        "moderate": "steady zoom out, controlled wide view",
+        "fast": "quick zoom out, dramatic wide view",
+    },
+}
+
+
+def get_camera_movement_with_speed(movement_key: str, speed: str) -> str:
+    """获取带速度描述的运镜指令"""
+    speed_map = CAMERA_MOVEMENT_SPEED_MAP.get(movement_key)
+    if speed_map:
+        return speed_map.get(speed, speed_map.get("moderate", CAMERA_MOVEMENTS.get(movement_key, "")))
+    return CAMERA_MOVEMENTS.get(movement_key, "")
+
+
+# ============================================================
+# 视觉强度计算器（Visual Intensity Calculator）
+# ============================================================
+
+
+def calculate_visual_intensity(
+    emotion_level: str,
+    bpm: int,
+    narrative_position: int,
+    total_segments: int = 5,
+) -> float:
+    """
+    计算视觉强度值（0-10），综合考虑情绪、节奏和叙事位置。
+    
+    Args:
+        emotion_level: 情绪强度 (low/moderate/high/extreme)
+        bpm: 节拍数
+        narrative_position: 叙事位置索引（从0开始）
+        total_segments: 总片段数
+    
+    Returns:
+        视觉强度值（0-10）
+    """
+    emotion_factor = {
+        "low": 2,
+        "moderate": 5,
+        "high": 8,
+        "extreme": 10,
+    }.get(emotion_level.lower(), 5)
+    
+    bpm_factor = min(10, max(0, (bpm - 60) / 10))
+    
+    narrative_factor = 0
+    if total_segments > 0:
+        position_ratio = narrative_position / (total_segments - 1) if total_segments > 1 else 0.5
+        narrative_factor = 6 + 4 * abs(position_ratio - 0.5) * 2
+    
+    raw_intensity = (emotion_factor * 0.4) + (bpm_factor * 0.3) + (narrative_factor * 0.3)
+    
+    return max(0, min(10, raw_intensity))
+
+
+def intensity_to_visual_params(intensity: float) -> Dict[str, str]:
+    """
+    将视觉强度值转换为具体的视觉参数。
+    
+    Args:
+        intensity: 视觉强度值（0-10）
+    
+    Returns:
+        视觉参数字典
+    """
+    if intensity >= 8:
+        return {
+            "contrast": "extreme",
+            "saturation": "high",
+            "motion_speed": "fast",
+            "dof": "shallow",
+            "lighting_intensity": "high",
+        }
+    elif intensity >= 6:
+        return {
+            "contrast": "high",
+            "saturation": "moderate",
+            "motion_speed": "moderate",
+            "dof": "shallow",
+            "lighting_intensity": "medium",
+        }
+    elif intensity >= 4:
+        return {
+            "contrast": "moderate",
+            "saturation": "moderate",
+            "motion_speed": "moderate",
+            "dof": "medium",
+            "lighting_intensity": "medium",
+        }
+    elif intensity >= 2:
+        return {
+            "contrast": "low",
+            "saturation": "low",
+            "motion_speed": "slow",
+            "dof": "medium",
+            "lighting_intensity": "low",
+        }
+    else:
+        return {
+            "contrast": "low",
+            "saturation": "low",
+            "motion_speed": "slow",
+            "dof": "deep",
+            "lighting_intensity": "low",
+        }
+
+
+# ============================================================
+# 节奏驱动的字幕样式映射（Rhythm-Driven Subtitle Styles）
+# ============================================================
+
+SUBTITLE_STYLES = {
+    "minimal": {
+        "name": "极简",
+        "font_size": 50,
+        "font_weight": "normal",
+        "color": "#FFFFFF",
+        "outline_color": "#000000",
+        "outline_width": 2,
+        "position": "bottom",
+        "spacing": 1.0,
+        "shadow": "none",
+        "animation": "none",
+        "description": "简洁无装饰，适合平静场景",
+    },
+    "elegant": {
+        "name": "优雅",
+        "font_size": 55,
+        "font_weight": "bold",
+        "color": "#F5F5F5",
+        "outline_color": "#1a1a1a",
+        "outline_width": 3,
+        "position": "bottom",
+        "spacing": 1.1,
+        "shadow": "soft",
+        "animation": "fade",
+        "description": "柔和优雅，适合中等节奏",
+    },
+    "dynamic": {
+        "name": "动感",
+        "font_size": 65,
+        "font_weight": "bold",
+        "color": "#FFD700",
+        "outline_color": "#000000",
+        "outline_width": 4,
+        "position": "bottom",
+        "spacing": 1.2,
+        "shadow": "glow",
+        "animation": "pop",
+        "description": "活力动感，适合快节奏",
+    },
+    "impact": {
+        "name": "冲击",
+        "font_size": 80,
+        "font_weight": "extra_bold",
+        "color": "#FF4444",
+        "outline_color": "#FFFFFF",
+        "outline_width": 5,
+        "position": "center",
+        "spacing": 1.4,
+        "shadow": "strong",
+        "animation": "zoom",
+        "description": "强烈冲击，适合高潮/CTA",
+    },
+}
+
+BPM_SUBTITLE_MAP = {
+    (0, 75): "minimal",
+    (75, 95): "elegant",
+    (95, 120): "dynamic",
+    (120, 200): "impact",
+}
+
+
+def get_subtitle_style_by_bpm(bpm: int) -> dict:
+    """根据 BPM 获取字幕样式配置"""
+    for (min_bpm, max_bpm), style_key in BPM_SUBTITLE_MAP.items():
+        if min_bpm <= bpm < max_bpm:
+            return SUBTITLE_STYLES.get(style_key, SUBTITLE_STYLES["elegant"])
+    return SUBTITLE_STYLES["elegant"]
+
+
+def get_subtitle_style_by_intensity(intensity: float) -> dict:
+    """根据视觉强度获取字幕样式配置"""
+    if intensity >= 9:
+        return SUBTITLE_STYLES["impact"]
+    elif intensity >= 6:
+        return SUBTITLE_STYLES["dynamic"]
+    elif intensity >= 4:
+        return SUBTITLE_STYLES["elegant"]
+    else:
+        return SUBTITLE_STYLES["minimal"]
+
+
+# ============================================================
+# 节奏驱动的转场强度映射（Rhythm-Driven Transition Intensity）
+# ============================================================
+
+TRANSITION_INTENSITY = {
+    "subtle": {
+        "name": "柔和",
+        "duration_range": (0.15, 0.30),
+        "effects": ["dissolve", "fade"],
+        "easing": "smooth",
+        "description": "几乎无感的过渡，适合连续场景",
+    },
+    "moderate": {
+        "name": "适中",
+        "duration_range": (0.25, 0.45),
+        "effects": ["dissolve", "slide", "zoom"],
+        "easing": "smooth",
+        "description": "自然流畅的过渡，适合常规切换",
+    },
+    "dynamic": {
+        "name": "动感",
+        "duration_range": (0.30, 0.50),
+        "effects": ["zoom", "wipe", "spin"],
+        "easing": "ease_out",
+        "description": "活力过渡，适合节奏变化",
+    },
+    "impact": {
+        "name": "强烈",
+        "duration_range": (0.20, 0.40),
+        "effects": ["flash", "cut", "shock"],
+        "easing": "sharp",
+        "description": "强烈冲击，适合高潮切换",
+    },
+}
+
+BPM_TRANSITION_MAP = {
+    (0, 75): "subtle",
+    (75, 95): "moderate",
+    (95, 120): "dynamic",
+    (120, 200): "impact",
+}
+
+
+def get_transition_intensity_by_bpm(bpm: int) -> dict:
+    """根据 BPM 获取转场强度配置"""
+    for (min_bpm, max_bpm), intensity_key in BPM_TRANSITION_MAP.items():
+        if min_bpm <= bpm < max_bpm:
+            return TRANSITION_INTENSITY.get(intensity_key, TRANSITION_INTENSITY["moderate"])
+    return TRANSITION_INTENSITY["moderate"]
+
+
+def get_transition_intensity_by_emotion_change(change_type: str) -> dict:
+    """根据情绪变化类型获取转场强度配置"""
+    change_map = {
+        "stable": TRANSITION_INTENSITY["subtle"],
+        "increase": TRANSITION_INTENSITY["dynamic"],
+        "decrease": TRANSITION_INTENSITY["moderate"],
+        "dramatic": TRANSITION_INTENSITY["impact"],
+    }
+    return change_map.get(change_type, TRANSITION_INTENSITY["moderate"])
+
+
+def calculate_transition_duration(bpm: int, emotion_change: str = "stable") -> float:
+    """计算转场时长（综合 BPM 和情绪变化）"""
+    intensity = get_transition_intensity_by_bpm(bpm)
+    min_dur, max_dur = intensity["duration_range"]
+    
+    change_factor = {
+        "stable": 1.0,
+        "increase": 0.8,
+        "decrease": 1.2,
+        "dramatic": 0.7,
+    }.get(emotion_change, 1.0)
+    
+    base_duration = (min_dur + max_dur) / 2
+    bpm_factor = max(0.5, min(1.5, 100 / bpm))
+    
+    return round(base_duration * change_factor * bpm_factor, 2)
+
+
+# ============================================================
+# 综合节奏视觉参数生成（Comprehensive Rhythm-to-Visual Generator）
+# ============================================================
+
+
+def generate_rhythm_visual_params(
+    bpm: int,
+    emotion_level: str,
+    narrative_position: int,
+    total_segments: int = 5,
+    emotion_change: str = "stable",
+) -> Dict[str, Any]:
+    """
+    根据节奏参数生成完整的视觉配置。
+    
+    Args:
+        bpm: 节拍数
+        emotion_level: 情绪强度
+        narrative_position: 叙事位置索引
+        total_segments: 总片段数
+        emotion_change: 情绪变化类型（stable/increase/decrease/dramatic）
+    
+    Returns:
+        完整的视觉参数字典
+    """
+    intensity = calculate_visual_intensity(emotion_level, bpm, narrative_position, total_segments)
+    
+    return {
+        "intensity": round(intensity, 2),
+        "camera_speed": get_camera_speed_by_bpm(bpm),
+        "contrast": get_contrast_by_emotion(emotion_level),
+        "saturation": get_saturation_by_emotion(emotion_level),
+        "depth_of_field": get_depth_by_rhythm(get_camera_speed_by_bpm(bpm)),
+        "subtitle_style": get_subtitle_style_by_intensity(intensity),
+        "transition": {
+            **get_transition_intensity_by_bpm(bpm),
+            "duration": calculate_transition_duration(bpm, emotion_change),
+        },
+        "visual_params": intensity_to_visual_params(intensity),
+    }
+
+
+def build_rhythm_cinematic_prompt(
+    bpm: int,
+    emotion_level: str,
+    narrative_position: int,
+    total_segments: int = 5,
+    base_camera_movement: str = "",
+) -> Dict[str, str]:
+    """
+    根据节奏参数生成可直接注入 Prompt 的电影感描述片段。
+
+    相比 generate_rhythm_visual_params 返回结构化数据，
+    本函数返回可直接拼入 prompt 的英文字符串，方便在 prompt 组装时使用。
+
+    Args:
+        bpm: 节拍数
+        emotion_level: 情绪强度 (low/moderate/high/extreme)
+        narrative_position: 叙事位置索引（从0开始）
+        total_segments: 总片段数
+        base_camera_movement: 基础运镜 key（如 push_in），用于叠加速度描述
+
+    Returns:
+        包含可直接拼入 prompt 的字符串字典：
+        {
+            "camera_speed": "slow subtle push-in, gentle forward movement",
+            "lighting_contrast": "strong contrast, dramatic shadows",
+            "color_saturation": "vibrant saturated colors, rich hues",
+            "depth_of_field": "shallow depth of field, creamy bokeh",
+            "rhythm_phrase": "energetic rhythm, dynamic pacing",
+            "combined": "完整组合，可直接拼入 prompt",
+        }
+    """
+    visual_params = generate_rhythm_visual_params(
+        bpm=bpm,
+        emotion_level=emotion_level,
+        narrative_position=narrative_position,
+        total_segments=total_segments,
+    )
+
+    camera_speed = visual_params["camera_speed"]
+    if base_camera_movement and base_camera_movement in CAMERA_MOVEMENT_SPEED_MAP:
+        speed_key = "slow" if "slow" in camera_speed or "gentle" in camera_speed else (
+            "fast" if "quick" in camera_speed or "dynamic" in camera_speed else "moderate"
+        )
+        camera_desc = get_camera_movement_with_speed(base_camera_movement, speed_key)
+        if camera_desc:
+            camera_speed = camera_desc
+
+    rhythm_intensity = visual_params["intensity"]
+    if rhythm_intensity >= 8:
+        rhythm_phrase = "intense dynamic rhythm, high energy pacing, impactful visual momentum"
+    elif rhythm_intensity >= 6:
+        rhythm_phrase = "lively rhythm, energetic pacing, steady visual flow"
+    elif rhythm_intensity >= 4:
+        rhythm_phrase = "moderate rhythm, balanced pacing, smooth visual flow"
+    elif rhythm_intensity >= 2:
+        rhythm_phrase = "gentle rhythm, relaxed pacing, calm visual flow"
+    else:
+        rhythm_phrase = "slow meditative rhythm, peaceful pacing, serene stillness"
+
+    combined_parts = [
+        p for p in [
+            camera_speed,
+            visual_params["contrast"],
+            visual_params["saturation"],
+            visual_params["depth_of_field"],
+        ] if p
+    ]
+
+    return {
+        "camera_speed": camera_speed,
+        "lighting_contrast": visual_params["contrast"],
+        "color_saturation": visual_params["saturation"],
+        "depth_of_field": visual_params["depth_of_field"],
+        "rhythm_phrase": rhythm_phrase,
+        "intensity": visual_params["intensity"],
+        "combined": ", ".join(combined_parts),
+        "subtitle_style": visual_params["subtitle_style"],
+        "transition": visual_params["transition"],
+    }
+
 
 # ============================================================
 # 辅助函数

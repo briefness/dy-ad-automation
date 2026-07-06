@@ -17,6 +17,8 @@
 
 import sys
 import argparse
+import hashlib
+import json
 import yaml
 from pathlib import Path
 from typing import Any, TypedDict
@@ -92,6 +94,20 @@ def _build_task_output_name(task_id: int, task_name: str) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     safe_name = "".join(c for c in task_name if c.isalnum() or c in "-_").strip() or f"task_{task_id}"
     return f"{task_id:03d}_{safe_name}_{timestamp}"
+
+
+def _build_stable_task_output_name(task_id: int, task_name: str, pipeline_kwargs: dict) -> str:
+    """生成稳定批量任务输出名前缀，用于重复运行时命中片段缓存。"""
+    safe_name = "".join(c for c in task_name if c.isalnum() or c in "-_").strip() or f"task_{task_id}"
+    relevant = {
+        key: value
+        for key, value in pipeline_kwargs.items()
+        if key not in {"output_dir"}
+    }
+    digest = hashlib.sha256(
+        json.dumps(relevant, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:12]
+    return f"{task_id:03d}_{safe_name}_{digest}"
 
 
 def load_batch_config(yaml_path: Path) -> dict:
@@ -184,13 +200,18 @@ def create_task_args(task: dict, global_defaults: dict) -> dict:
         "min_clips": _coerce_int(_get_config_value(task, global_defaults, "min_clips", 3), 3),
         "preview": _coerce_bool(_get_config_value(task, global_defaults, "preview", False), False),
         "max_workers": _coerce_int(_get_config_value(task, global_defaults, "max_workers", 4), 4),
-        "best_of": _coerce_int(_get_config_value(task, global_defaults, "best_of", 2), 2),
+        "best_of": _coerce_int(_get_config_value(task, global_defaults, "best_of", 1), 1),
         "quality_frames": _coerce_int(_get_config_value(task, global_defaults, "quality_frames", 12), 12),
         "keep_candidates": _coerce_bool(_get_config_value(task, global_defaults, "keep_candidates", False), False),
         "stabilize": _coerce_bool(_get_config_value(task, global_defaults, "stabilize", True), True),
         "brand_intro_outro": _coerce_bool(_get_config_value(task, global_defaults, "brand_intro_outro", False), False),
         "kling_model": task.get("kling_model", global_defaults.get("kling_model", None)),
         "multi_shot": _coerce_bool(_get_config_value(task, global_defaults, "multi_shot", False), False),
+        "preflight_keyframe": _coerce_bool(_get_config_value(task, global_defaults, "preflight_keyframe", True), True),
+        "image_first": _coerce_bool(_get_config_value(task, global_defaults, "image_first", True), True),
+        "image_first_mode": task.get("image_first_mode", global_defaults.get("image_first_mode", "standard")),
+        "image_first_variants": _coerce_int(_get_config_value(task, global_defaults, "image_first_variants", 2), 2),
+        "resume": _coerce_bool(_get_config_value(task, global_defaults, "resume", True), True),
     }
 
 
@@ -212,11 +233,19 @@ def run_single_task(task_id: int, task_config: dict, global_defaults: dict, base
     print(f"📋 任务 {task_id}/{global_defaults.get('total_tasks', '?')}：{task_name}")
     print(f"{'=' * 60}")
 
-    # 创建任务专用输出名前缀：包含 task_id + 微秒，防止并发同名任务互相覆盖
-    task_output_name = _build_task_output_name(task_id, task_name)
-
     # 解析参数
     pipeline_kwargs = create_task_args(task_config, global_defaults)
+    resume_enabled = bool(pipeline_kwargs.pop("resume", True))
+    configured_output_name = task_config.get("output_name")
+    if configured_output_name:
+        task_output_name = "".join(
+            c for c in str(configured_output_name) if c.isalnum() or c in "-_"
+        ).strip() or _build_stable_task_output_name(task_id, task_name, pipeline_kwargs)
+    elif resume_enabled:
+        task_output_name = _build_stable_task_output_name(task_id, task_name, pipeline_kwargs)
+    else:
+        # 创建任务专用输出名前缀：包含 task_id + 微秒，防止并发同名任务互相覆盖。
+        task_output_name = _build_task_output_name(task_id, task_name)
 
     # 调用核心生成流水线
     try:
@@ -292,7 +321,7 @@ def run_batch(config: dict):
         "image_fidelity": config.get("default_image_fidelity", DEFAULT_IMAGE_FIDELITY),
         "human_fidelity": config.get("default_human_fidelity", DEFAULT_HUMAN_FIDELITY),
         "seed": config.get("default_seed", None),
-        "best_of": config.get("default_best_of", 2),
+        "best_of": config.get("default_best_of", 1),
         "quality_frames": config.get("default_quality_frames", 12),
         "keep_candidates": config.get("default_keep_candidates", False),
         "stabilize": config.get("default_stabilize", True),
@@ -300,6 +329,11 @@ def run_batch(config: dict):
         "brand_intro_outro": config.get("default_brand_intro_outro", False),
         "kling_model": config.get("default_kling_model", None),
         "multi_shot": config.get("default_multi_shot", False),
+        "preflight_keyframe": config.get("default_preflight_keyframe", True),
+        "image_first": config.get("default_image_first", True),
+        "image_first_mode": config.get("default_image_first_mode", "standard"),
+        "image_first_variants": config.get("default_image_first_variants", 2),
+        "resume": config.get("default_resume", True),
         "hook_type": config.get("default_hook_type", "question"),
         "use_voiceover": config.get("default_use_voiceover", False),
         "voiceover_style": config.get("default_voiceover_style", "standard"),

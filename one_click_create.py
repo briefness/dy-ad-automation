@@ -21,6 +21,7 @@
 import sys
 import json
 import time
+import re
 import base64
 import argparse
 import subprocess
@@ -32,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
 from threading import Lock
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, TypedDict, Any
 from urllib.parse import urlparse
 
 from config import (
@@ -138,12 +139,27 @@ from video_merger import (
     color_match_clips,
     run_ffmpeg,
     _get_clip_duration,
+    _has_audio_stream,
     adjust_clip_duration,
     generate_transition_sequence,
 )
 from quality_checker import (
     check_video_quality,
     print_quality_report,
+)
+from quality_gate import (
+    run_quality_gate,
+    print_quality_gate_report,
+)
+from production_quality_guard import (
+    run_production_quality_check,
+    ProductionQualityGuard,
+)
+from ai_enhancement import AIVideoEnhancer
+from image_first_strategy import (
+    ImageFirstMode,
+    run_image_first_strategy,
+    print_image_first_report,
 )
 
 
@@ -214,6 +230,7 @@ def _build_clip_manifest(
     aspect_ratio: str,
     seed: Optional[int],
     negative_prompt: str,
+    candidate_strategy: str = "single",
 ) -> dict:
     """构建片段缓存契约，只有契约一致才能复用旧片段。"""
     ref_values = _ref_image_values(ref_images)
@@ -233,6 +250,8 @@ def _build_clip_manifest(
         "aspect_ratio": aspect_ratio,
         "seed": seed,
         "negative_prompt_sha256": hashlib.sha256(negative_prompt.encode("utf-8")).hexdigest(),
+        "prompt_preview": final_prompt[:300],
+        "candidate_strategy": candidate_strategy,
     }
 
 
@@ -257,18 +276,100 @@ def _write_clip_manifest(video_path: Path, manifest: dict) -> None:
 
 
 PRODUCT_REQUIRED_NARRATIVES = {
+    # 展示/结果/CTA 段：产品必须占主画面
     "showcase", "cta", "demonstration", "product", "result",
     "review", "proof", "demo", "detail", "reason", "effect",
     "highlight", "solution", "good_choice", "product_intro",
     "effect_show", "compare_result", "reason_1", "reason_2",
     "reason_3", "cta_summary", "cta_choose",
+    # 改动3：hook 段也强制注入产品参考图（产品第一次亮相最重要）
+    "hook",
 }
+
+# 动态 fidelity 映射（改动3）：按叙事重要性调整产品参考图约束强度
+_NARRATIVE_FIDELITY_MAP: dict[str, float] = {
+    "showcase": 0.95,
+    "result": 0.95,
+    "cta": 0.95,
+    "hook": 0.90,
+    "turning": 0.85,
+    "default": 0.85,
+}
+
+
+def _get_fidelity_for_narrative(narrative: str, base_fidelity: float) -> float:
+    """按叙事段动态调整 image_fidelity，产品展示段用更高约束。"""
+    mapped = _NARRATIVE_FIDELITY_MAP.get((narrative or "").lower().strip())
+    if mapped is not None:
+        return mapped
+    return base_fidelity
 
 
 def _is_product_required_narrative(narrative: str) -> bool:
     """判断某个叙事段是否必须强约束产品露出。"""
     normalized = (narrative or "").lower().strip()
     return normalized in PRODUCT_REQUIRED_NARRATIVES
+
+
+def _validate_storyboard_quality(storyboard, product_info: dict) -> List[str]:
+    """
+    故事板质量预验证：在生成视频前检查分镜结构是否合理。
+
+    检查项：
+    - 分镜数量是否合理（3-8段）
+    - 是否包含必要的叙事阶段（hook/showcase/cta）
+    - 产品露出段是否充足
+    - 时长分布是否合理
+    - 情绪曲线是否有起伏
+
+    返回问题列表，空列表表示通过。
+    """
+    issues: List[str] = []
+    shots = storyboard.shots if storyboard else []
+    n_shots = len(shots)
+
+    if n_shots < 3:
+        issues.append(f"分镜数量过少（{n_shots}段），建议至少3段以保证叙事完整性")
+    elif n_shots > 10:
+        issues.append(f"分镜数量过多（{n_shots}段），单段时长可能不足，建议控制在8段以内")
+
+    narrative_types = [getattr(s, "emotion", "") or "" for s in shots]
+    shot_emotions = [getattr(s, "emotion", "") or "" for s in shots]
+    scene_names = [getattr(s, "scene", "") or "" for s in shots]
+
+    if storyboard.total_duration < 5:
+        issues.append(f"总时长过短（{storyboard.total_duration:.1f}s），广告信息可能传达不充分")
+    elif storyboard.total_duration > 120:
+        issues.append(f"总时长过长（{storyboard.total_duration:.1f}s），短视频平台建议控制在60s以内")
+
+    product_name = product_info.get("name", "")
+    if product_name:
+        product_shots = [
+            s for s in shots
+            if product_name.lower() in (getattr(s, "description", "") or "").lower()
+            or product_name.lower() in (getattr(s, "key_elements", "") or "")
+        ]
+        if len(product_shots) < max(1, n_shots // 3):
+            issues.append(f"产品露出分镜不足（{len(product_shots)}/{n_shots}段），建议至少1/3段落包含产品")
+
+    unique_scenes = len(set(scene_names))
+    if unique_scenes == 1 and n_shots > 4:
+        issues.append(f"全部{n_shots}段都在同一场景，可能导致视觉单调，建议增加场景变化")
+
+    if shot_emotions and len(set(shot_emotions)) == 1:
+        issues.append("所有分镜情绪单一，缺乏情绪起伏，建议在不同段落使用不同情绪强度")
+
+    durations = [getattr(s, "duration", 0) for s in shots]
+    if durations:
+        max_dur = max(durations)
+        min_dur = min(durations)
+        if max_dur > 0 and min_dur > 0 and max_dur / min_dur > 4:
+            issues.append(
+                f"分镜时长差异过大（最长{max_dur:.1f}s vs 最短{min_dur:.1f}s），"
+                f"建议节奏更均匀"
+            )
+
+    return issues
 
 
 def _score_candidate_video_quality(
@@ -289,6 +390,80 @@ def _score_candidate_video_quality(
     )
     score = float(quality_result.overall_score or 0) if quality_result.passed else 0.0
     return score, list(quality_result.issues or [])
+
+
+# ── 失败原因驱动的精准修复（Issue-Driven Repair）──
+
+_ISSUE_REPAIR_RULES = [
+    # 商品外观
+    ("product", {"product", "similarity", "color", "packaging", "shape", "mismatch"},
+     "exact same product color and shape as reference, consistent packaging"),
+    ("logo", {"logo", "brand", "mark", "text", "unreadable", "unclear"},
+     "clear brand logo visible, readable product text, packaging text sharp"),
+    ("obstructed", {"obstruct", "hidden", "blocked", "cover", "hand", "finger"},
+     "product fully visible, no hands or objects covering packaging"),
+    ("product_dark", {"dark", "dim", "underexposed", "shadow"},
+     "bright even lighting on product, well-lit packaging, no harsh shadows"),
+    # 角色外观
+    ("face", {"face", "detect", "character", "similarity", "person", "drift"},
+     "front-facing portrait, clear face visible, same person from reference"),
+    ("profile", {"profile", "side", "back", "turn", "away", "rear"},
+     "front-facing, face directly to camera, no profile or back view"),
+    ("outfit", {"outfit", "hair", "style", "change", "clothing"},
+     "same hairstyle and outfit as reference, no clothing change"),
+    ("blur", {"blur", "motion", "shaky", "unstable"},
+     "sharp focus, stable pose, no motion blur"),
+    # 通用画质
+    ("contrast", {"contrast", "flat", "washed", "faded"},
+     "rich contrast, vivid colors"),
+    ("noise", {"noise", "grain", "grainy", "artifact"},
+     "clean image, minimal noise"),
+]
+
+
+def _repair_prompt_by_issues(
+    prompt: str,
+    issues: List[str],
+    *,
+    product_bible: Optional["ProductBible"] = None,
+    character_bible: Optional["CharacterBible"] = None,
+) -> Tuple[str, List[str]]:
+    """
+    根据质量检测返回的具体失败原因，生成精准修复后的 prompt 和修复标签列表。
+
+    Args:
+        prompt: 原始 prompt
+        issues: 质量检测返回的问题列表
+        product_bible: 商品圣经（用于提取精确的商品外观描述）
+        character_bible: 角色圣经（用于提取精确的角色外观描述）
+
+    Returns:
+        (repaired_prompt, repair_tags)
+    """
+    if not issues:
+        return prompt, []
+
+    repair_phrases: List[str] = []
+    matched_tags: List[str] = []
+    combined_text = " ".join(issues).lower()
+
+    for tag, keywords, phrase in _ISSUE_REPAIR_RULES:
+        if any(kw in combined_text for kw in keywords):
+            if tag not in matched_tags:
+                matched_tags.append(tag)
+                # 如果有圣经，用圣经中的精确描述替换泛化描述
+                if tag == "product" and product_bible:
+                    phrase = f"exact same {product_bible.get('packaging', 'product')} as reference"
+                elif tag == "face" and character_bible:
+                    phrase = f"same {character_bible.get('hair_style', 'person')} as reference, front-facing, clear face"
+                repair_phrases.append(phrase)
+
+    if not repair_phrases:
+        return prompt, []
+
+    repairs = ", ".join(repair_phrases)
+    repaired = f"{prompt}, {repairs}"
+    return _compact_prompt_for_generation(repaired), matched_tags
 
 
 def _validate_product_image_file(image_path: Path) -> None:
@@ -435,7 +610,9 @@ def _build_video_idempotency_key(
 
 def _bind_reference_tags_to_prompt(prompt: str, ref_images: list, narrative: str = "") -> str:
     """
-    用结构化段落绑定参考图语义，避免靠泛关键词把 tag 插错位置。
+    用结构化段落绑定参考图语义。
+    Omni 接口无 image_fidelity 参数，完全靠 prompt 语义约束一致性，
+    因此绑定描述必须足够强、足够具体。
     """
     if not ref_images:
         return prompt
@@ -444,16 +621,52 @@ def _bind_reference_tags_to_prompt(prompt: str, ref_images: list, narrative: str
         tag = f"<<<image_{i + 1}>>>"
         role = item.get("role", "unknown") if isinstance(item, dict) else "unknown"
         if role == "product":
-            label = "Product reference"
-            focus = "match packaging, shape, color, and logo placement"
+            lines.append(
+                f"PRODUCT REFERENCE (CRITICAL - must match exactly): {tag}. "
+                f"Strictly match packaging shape, all colors, logo design and placement, "
+                f"product proportions, material texture, and every visual detail. "
+                f"Product appearance must be identical in every frame."
+            )
+        elif role == "character_primary":
+            lines.append(
+                f"MAIN CHARACTER REFERENCE (CRITICAL - identity must stay consistent): {tag}. "
+                f"Exact same person throughout. Match facial features, face shape, eye shape and color, "
+                f"nose shape, lip shape, exact hairstyle and hair color, skin tone, "
+                f"body type and proportions, and exact outfit/clothing. "
+                f"Character identity must never change."
+            )
         elif role == "character":
-            label = "Character reference"
-            focus = "match identity, face, hairstyle, outfit, and body proportion"
+            lines.append(
+                f"CHARACTER REFERENCE (CRITICAL): {tag}. "
+                f"Exact same person. Match facial features, hairstyle, outfit, and body proportions. "
+                f"Identity must stay consistent."
+            )
+        elif role == "character_angle":
+            lines.append(
+                f"CHARACTER FULL-BODY REFERENCE (same person as image_2): {tag}. "
+                f"Same character, different angle. Match full body proportions, "
+                f"outfit details, and confirm same identity from different viewpoint."
+            )
+        elif role == "character_secondary":
+            lines.append(
+                f"SECONDARY CHARACTER REFERENCE: {tag}. "
+                f"When this character appears, match their face, outfit, and identity exactly. "
+                f"Different from the main character."
+            )
+        elif role == "approved_keyframe":
+            lines.append(
+                f"APPROVED KEYFRAME REFERENCE (quality preflight passed): {tag}. "
+                f"Use this as the first-frame visual target. Match composition, subject placement, "
+                f"product visibility, character identity, lighting, and color palette while adding natural motion."
+            )
         else:
-            label = "Continuity frame"
-            focus = "match scene layout, camera angle, lighting, and temporal continuity"
-        lines.append(f"{label}: {tag} ({focus}).")
-    reference_block = "Reference image binding:\n" + "\n".join(lines)
+            lines.append(
+                f"PREVIOUS FRAME REFERENCE (continuity): {tag}. "
+                f"Maintain scene layout, camera angle, lighting direction and color, "
+                f"character positions, and temporal continuity with the previous shot. "
+                f"Smooth seamless transition."
+            )
+    reference_block = "\n".join(lines)
     return f"{reference_block}\n\n{prompt}"
 
 
@@ -909,6 +1122,9 @@ def estimate_cost(
     num_characters: int = 1,
     ab_versions: int = 1,
     best_of: int = 1,
+    image_first_segments: int = 0,
+    image_first_variants: int = 0,
+    images_per_character: int = 2,
 ) -> dict:
     """
     估算本次生成的 API 成本（仅供参考）
@@ -917,8 +1133,12 @@ def estimate_cost(
         mode: 生成模式（std/pro/4k）
         duration_per_clip: 单片段时长（秒）
         num_clips: 片段数量
-        num_characters: 角色数量（定妆照数量）
+        num_characters: 角色数量
         ab_versions: A/B 版本数
+        best_of: 每段候选数
+        image_first_segments: 图片先行覆盖的片段数
+        image_first_variants: 图片先行每段候选数
+        images_per_character: 每个角色的定妆照数量（默认 2 张：正面 + 全身）
 
     Returns:
         {
@@ -934,8 +1154,10 @@ def estimate_cost(
 
     best_of = max(1, int(best_of or 1))
 
-    # 每个版本：角色定妆照 + 视频片段
-    image_per_version = num_characters  # 角色定妆照
+    # 每个版本：角色定妆照 + 图片先行候选
+    image_first_count = max(0, int(image_first_segments or 0)) * max(0, int(image_first_variants or 0))
+    character_image_count = max(0, int(num_characters or 0)) * max(1, int(images_per_character or 1))
+    image_per_version = character_image_count + image_first_count
     video_seconds_per_version = duration_per_clip * num_clips * best_of
 
     total_images = image_per_version * ab_versions
@@ -946,12 +1168,14 @@ def estimate_cost(
     total_cost = image_cost + video_cost
 
     breakdown = [
-        f"角色定妆照：{total_images} 张 × {img_price:.2f} 元 = {image_cost:.2f} 元",
+        f"角色定妆照：{character_image_count * ab_versions} 张（{num_characters} 角色 × {images_per_character} 角度/人）× {img_price:.2f} 元 = {character_image_count * ab_versions * img_price:.2f} 元",
         f"视频片段：{total_video_seconds:.0f} 秒 × {vid_price:.2f} 元/秒 = {video_cost:.2f} 元",
     ]
 
     if best_of > 1:
         breakdown.append(f"best-of 候选：每段 {best_of} 个候选（视频成本已按倍数计入）")
+    if image_first_count > 0:
+        breakdown.append(f"图片先行预检：{image_first_count * ab_versions} 张候选图（用于视频前低成本择优）")
     if ab_versions > 1:
         breakdown.append(f"A/B 版本：{ab_versions} 个版本")
 
@@ -961,6 +1185,287 @@ def estimate_cost(
         "estimated_cost": round(total_cost, 2),
         "breakdown": breakdown,
     }
+
+
+def _estimate_image_first_segment_count(num_clips: int, mode: str, enabled: bool = True) -> int:
+    """估算图片先行会覆盖的关键片段数，用于成本提示。"""
+    if not enabled or num_clips <= 0:
+        return 0
+    mode = (mode or "standard").lower()
+    if mode == "minimal":
+        return 1
+    if mode == "full":
+        return num_clips
+    return min(num_clips, 2)
+
+
+def _get_cost_budget_limit() -> float:
+    """读取单次生成预算上限。"""
+    try:
+        from config import QUALITY_GATE_CONFIG
+        return float(QUALITY_GATE_CONFIG.get("cost_control", {}).get("max_budget", 100.0))
+    except Exception:
+        return 100.0
+
+
+def _auto_downgrade_enabled() -> bool:
+    """读取是否允许超预算时自动降级。"""
+    try:
+        from config import QUALITY_GATE_CONFIG
+        return bool(QUALITY_GATE_CONFIG.get("cost_control", {}).get("auto_downgrade", True))
+    except Exception:
+        return True
+
+
+def apply_low_cost_generation_policy(
+    args: argparse.Namespace,
+    *,
+    num_clips: int,
+    num_characters: int = 1,
+    ab_versions: int = 1,
+    budget_limit: Optional[float] = None,
+) -> List[str]:
+    """
+    在进入真实生成前应用低成本策略。
+
+    策略顺序按画质影响从小到大排列：
+    1. best-of 降为 1，避免候选倍增；
+    2. 4k -> pro -> std；
+    3. 片段时长降到 5s，再最低降到 3s。
+    """
+    budget = _get_cost_budget_limit() if budget_limit is None else float(budget_limit)
+    if budget <= 0 or not _auto_downgrade_enabled() or getattr(args, "preview", False):
+        return []
+
+    changes: List[str] = []
+
+    def _current_cost() -> float:
+        info = estimate_cost(
+            mode=getattr(args, "mode", DEFAULT_MODE),
+            duration_per_clip=getattr(args, "duration", DEFAULT_VIDEO_DURATION),
+            num_clips=num_clips,
+            num_characters=num_characters,
+            ab_versions=ab_versions,
+            best_of=getattr(args, "best_of", 1),
+        )
+        return float(info["estimated_cost"])
+
+    if _current_cost() <= budget:
+        return changes
+
+    if getattr(args, "best_of", 1) > 1:
+        old = args.best_of
+        args.best_of = 1
+        changes.append(f"best_of {old} -> 1")
+        if _current_cost() <= budget:
+            return changes
+
+    mode_downgrade = {"4k": "pro", "pro": "std", "standard": "std"}
+    while getattr(args, "mode", DEFAULT_MODE) in mode_downgrade and _current_cost() > budget:
+        old = args.mode
+        args.mode = mode_downgrade[old]
+        changes.append(f"mode {old} -> {args.mode}")
+
+    if _current_cost() <= budget:
+        return changes
+
+    if getattr(args, "duration", DEFAULT_VIDEO_DURATION) > 5:
+        old = args.duration
+        args.duration = 5
+        changes.append(f"duration {old}s -> 5s")
+
+    if _current_cost() <= budget:
+        return changes
+
+    if getattr(args, "duration", DEFAULT_VIDEO_DURATION) > 3:
+        old = args.duration
+        args.duration = 3
+        changes.append(f"duration {old}s -> 3s")
+
+    return changes
+
+
+def _run_pre_generation_smart_decision(
+    quality_gate_result: Any,
+    product_info: dict,
+    *,
+    style: str,
+    budget: Optional[float] = None,
+) -> Optional[Any]:
+    """
+    将 one_click 主流程接入智能决策引擎。
+
+    智能决策只依赖质量门结果，不触发视频生成；它用于在昂贵视频 API
+    调用前判断是否应阻断、降级或采用渐进式生成。
+    """
+    try:
+        from smart_decision_engine import run_smart_decision, print_smart_decision_report
+    except Exception as e:
+        print(f"⚠️  智能决策引擎不可用，跳过工作流决策：{e}")
+        return None
+
+    try:
+        decision = run_smart_decision(
+            quality_gate_result=quality_gate_result,
+            product_category=product_info.get("type", "default"),
+            style_preference=style,
+            budget=_get_cost_budget_limit() if budget is None else budget,
+        )
+        print_smart_decision_report(decision)
+        if not decision.can_proceed:
+            raise RuntimeError(
+                f"智能决策阻止生成：预测成功率 {decision.estimated_success_rate:.1%}，"
+                f"策略 {decision.recommended_strategy}"
+            )
+        return decision
+    except RuntimeError:
+        raise
+    except Exception as e:
+        print(f"⚠️  智能决策执行失败，继续使用质量门结果：{e}")
+        return None
+
+
+def _result_quality_score(quality_result: Any) -> float:
+    """兼容不同质量报告对象的总分字段。"""
+    if not quality_result:
+        return 0.0
+    if hasattr(quality_result, "overall_score"):
+        return float(getattr(quality_result, "overall_score") or 0.0)
+    if hasattr(quality_result, "total_score"):
+        return float(getattr(quality_result, "total_score") or 0.0)
+    if isinstance(quality_result, dict):
+        return float(quality_result.get("overall_score") or quality_result.get("total_score") or 0.0)
+    return 0.0
+
+
+def _result_issues(quality_result: Any) -> List[str]:
+    """兼容不同质量报告对象的问题字段。"""
+    if not quality_result:
+        return []
+    if hasattr(quality_result, "issues"):
+        return list(getattr(quality_result, "issues") or [])
+    if isinstance(quality_result, dict):
+        return list(quality_result.get("issues") or [])
+    return []
+
+
+def _record_production_workflow_completion(
+    *,
+    output_name: str,
+    final_path: Path,
+    quality_result: Any,
+    product_info: dict,
+    ad_script: dict,
+    generation_params: dict,
+    character_assets: List[dict],
+    product_image_path: Optional[Path],
+    character_bibles: List[dict],
+    product_bible: Optional[dict],
+    decision_result: Optional[Any] = None,
+    asset_library: Optional[Any] = None,
+    feedback_loop: Optional[Any] = None,
+    experiment_tracker: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    one_click 主流程的工作流闭环：资产注册、反馈收集、实验追踪。
+
+    这些步骤不触发视频重生成；失败时返回 warning，不影响已通过质量门的成片。
+    """
+    summary: Dict[str, Any] = {
+        "registered_assets": [],
+        "feedback_collected": False,
+        "experiment_tracked": False,
+        "warnings": [],
+    }
+
+    video_id = f"video_{output_name}"
+    quality_score = _result_quality_score(quality_result)
+    quality_issues = _result_issues(quality_result)
+    rating = 5 if quality_score >= 90 else 4 if quality_score >= 80 else 3 if quality_score >= 60 else 2
+
+    try:
+        if asset_library is None:
+            from asset_library import AssetLibrary
+            asset_library = AssetLibrary()
+
+        for i, char in enumerate(character_assets or []):
+            image_path = Path(char.get("image_path")) if char.get("image_path") else None
+            if not image_path or not image_path.exists():
+                continue
+            bible = character_bibles[i] if i < len(character_bibles) else {}
+            asset_id = asset_library.add_character(
+                image_path=image_path,
+                name=bible.get("name") or char.get("name") or f"Character {i + 1}",
+                bible=bible,
+                tags=[product_info.get("type", "default"), "character", output_name],
+            )
+            if quality_score:
+                asset_library.update_quality_score(asset_id, quality_score)
+            summary["registered_assets"].append({"type": "character", "id": asset_id})
+
+        if product_image_path and product_image_path.exists():
+            asset_id = asset_library.add_product(
+                image_path=product_image_path,
+                name=product_info.get("name", "product"),
+                bible=product_bible or {},
+                tags=[product_info.get("type", "default"), "product", output_name],
+            )
+            if quality_score:
+                asset_library.update_quality_score(asset_id, quality_score)
+            summary["registered_assets"].append({"type": "product", "id": asset_id})
+    except Exception as e:
+        summary["warnings"].append(f"资产注册失败：{e}")
+
+    try:
+        if feedback_loop is None:
+            from feedback_loop import FeedbackLoop
+            feedback_loop = FeedbackLoop()
+
+        summary["feedback_collected"] = bool(feedback_loop.collect_feedback(
+            video_id=video_id,
+            generation_params={
+                **generation_params,
+                "product_name": product_info.get("name", ""),
+                "product_type": product_info.get("type", ""),
+                "num_segments": len(ad_script.get("segments", [])) if isinstance(ad_script, dict) else 0,
+            },
+            rating=rating,
+            issues=quality_issues,
+            auto_quality_score=quality_score,
+            auto_issues=quality_issues,
+        ))
+    except Exception as e:
+        summary["warnings"].append(f"反馈收集失败：{e}")
+
+    try:
+        if experiment_tracker is None:
+            from experiment_tracker import ExperimentTracker
+            experiment_tracker = ExperimentTracker()
+
+        experiment_id = f"exp_{output_name}"
+        strategy = getattr(decision_result, "recommended_strategy", None) or generation_params.get("strategy", "standard")
+        estimated_success_rate = getattr(decision_result, "estimated_success_rate", None)
+        experiment_tracker.start_experiment(
+            experiment_id=experiment_id,
+            hypothesis=f"{product_info.get('type', 'default')} 视频生成质量闭环验证",
+            params={
+                **generation_params,
+                "strategy": strategy,
+                "estimated_success_rate": estimated_success_rate,
+                "final_path": str(final_path),
+            },
+            video_id=video_id,
+        )
+        summary["experiment_tracked"] = bool(experiment_tracker.complete_experiment(
+            experiment_id=experiment_id,
+            rating=rating,
+            quality_score=quality_score,
+        ))
+        summary["experiment_id"] = experiment_id
+    except Exception as e:
+        summary["warnings"].append(f"实验追踪失败：{e}")
+
+    return summary
 
 
 def print_cost_estimate(cost_info: dict):
@@ -1068,46 +1573,655 @@ def calc_duration_for_target(target_duration: int) -> tuple:
     return num_segs, round(per_clip, 1), f"自定义 {target_duration}s（5段）"
 
 
-def generate_character_prompt(product_info: dict) -> str:
-    """生成角色定妆照 Prompt（主角色）"""
-    preset = get_preset(product_info.get("type", "default"))
-    age = product_info.get("age", "25")
-    gender = product_info.get("gender", "女")
-    style = product_info.get("style", preset["style"])
-    outfit = product_info.get("outfit", "casual everyday clothes")
-    brand = BRAND_CONFIG.get("name", "brand")
+# ============================================================
+# 角色圣经 / 商品圣经（Character Bible / Product Bible）
+# ============================================================
+# 将零散的产品信息和角色描述统一整理为标准化资产文档，
+# 从根源解决人物/商品一致性、prompt 拼接错误、多角色模糊指代问题。
 
-    prompt = (
-        f"Character reference portrait for {product_info.get('name', 'product')} advertisement, "
-        f"{age}-year-old {gender}, {style} style, "
-        f"wearing {outfit}, "
-        f"{preset['scene']}, "
-        f"{preset['lighting']}, "
-        f"half-body composition, high detail, clear facial features, "
-        f"front-facing, neutral expression, 9:16 vertical, "
-        f"{brand} brand aesthetic, {BRAND_CONFIG.get('primary_color', 'consistent brand colors')}"
-    )
-    return prompt
+class CharacterBible(TypedDict):
+    """角色圣经：标准化的角色外观资产描述"""
+    id: str           # 角色唯一标识，如 "char_01"
+    name: str         # 角色名称，用于 prompt 中精确指代
+    age: str
+    gender: str
+    ethnicity: str    # 肤色/族群，如 "Asian", "Caucasian"
+    hair_style: str   # 发型，如 "long straight black hair"
+    hair_color: str   # 发色
+    outfit: str       # 服装描述
+    accessories: str  # 配饰，如 "gold hoop earrings, silver watch"
+    facial_features: str  # 标志性面部特征，如 "high cheekbones, small nose"
+    expression_baseline: str  # 表情基调，如 "warm smile", "neutral confident"
 
 
-def generate_character_prompt_for_role(product_info: dict, description: str = "") -> str:
+class ProductBible(TypedDict):
+    """商品圣经：标准化的商品外观资产描述"""
+    name: str
+    category: str
+    packaging: str        # 包装描述，如 "white cylindrical bottle with gold cap"
+    primary_color: str
+    secondary_color: str
+    shape: str            # 形状/瓶身，如 "slim cylindrical", "round jar"
+    logo_description: str
+    usage_context: str    # 使用场景，如 " skincare routine, bathroom counter"
+    key_selling_point: str
+
+
+def _normalize_character_list(characters: Any) -> List[dict]:
+    """标准化角色列表，过滤无效项，保证后续成本估算和生成流程一致。"""
+    if not isinstance(characters, list):
+        return []
+
+    normalized: List[dict] = []
+    for idx, item in enumerate(characters, 1):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or f"Character {chr(64 + idx)}").strip()
+        description = str(item.get("description") or "").strip()
+        role = str(item.get("role") or "").strip()
+        character = {
+            "id": str(item.get("id") or f"char_{idx:02d}").strip(),
+            "name": name,
+            "role": role,
+            "role_type": str(item.get("role_type") or "core").strip(),
+            "reference_required": bool(item.get("reference_required", True)),
+            "description": description,
+            "age": str(item.get("age") or "").strip(),
+            "gender": str(item.get("gender") or "").strip(),
+            "outfit": str(item.get("outfit") or "").strip(),
+            "hair_style": str(item.get("hair_style") or "").strip(),
+            "hair_color": str(item.get("hair_color") or "").strip(),
+            "ethnicity": str(item.get("ethnicity") or "").strip(),
+            "accessories": str(item.get("accessories") or "").strip(),
+            "facial_features": str(item.get("facial_features") or "").strip(),
+            "expression_baseline": str(item.get("expression_baseline") or "neutral confident").strip(),
+        }
+        if item.get("image_path"):
+            character["image_path"] = item["image_path"]
+        if character["description"] or character["age"] or character["gender"] or character["outfit"]:
+            normalized.append(character)
+
+    return normalized[:6]
+
+
+def _product_context_text(product_info: dict, ad_script: Optional[dict] = None) -> str:
+    parts = [
+        str(product_info.get(key, ""))
+        for key in (
+            "name", "type", "selling_point", "audience", "style",
+            "scene_description", "extra_requirements",
+        )
+    ]
+    if ad_script:
+        story_world = ad_script.get("story_world") or {}
+        if isinstance(story_world, dict):
+            parts.extend(str(story_world.get(key, "")) for key in ("character", "location", "emotion_arc"))
+        for seg in ad_script.get("segments", []) or []:
+            if isinstance(seg, dict):
+                parts.extend(str(seg.get(key, "")) for key in ("scene_prompt", "subtitle", "voiceover"))
+    return " ".join(parts).lower()
+
+
+def _role(
+    *,
+    role_id: str,
+    name: str,
+    role: str,
+    description: str,
+    age: str = "",
+    gender: str = "",
+    outfit: str = "",
+    role_type: str = "core",
+    reference_required: bool = True,
+    expression_baseline: str = "neutral confident",
+) -> dict:
+    return {
+        "id": role_id,
+        "name": name,
+        "role": role,
+        "role_type": role_type,
+        "reference_required": reference_required,
+        "description": description,
+        "age": age,
+        "gender": gender,
+        "outfit": outfit,
+        "expression_baseline": expression_baseline,
+    }
+
+
+def build_cast_plan(product_info: dict, ad_script: Optional[dict] = None) -> dict:
     """
-    生成指定角色的定妆照 Prompt
+    构建故事角色计划。
+
+    - core_characters: 需要跨镜头保持一致并生成参考图的核心角色/主体。
+    - supporting_characters: 可以出现在故事中，但不单独生成参考图的配角。
+    - ambient_entities: 路人、宠物、车辆、环境人群等场景实体，只进入 prompt 约束。
+    """
+    explicit_core = _normalize_character_list(product_info.get("characters"))
+    explicit_supporting = _normalize_character_list(product_info.get("supporting_characters"))
+    explicit_ambient = product_info.get("ambient_entities")
+    ambient_entities = [
+        str(item).strip()
+        for item in explicit_ambient
+        if isinstance(explicit_ambient, list) and str(item).strip()
+    ] if isinstance(explicit_ambient, list) else []
+
+    if explicit_core:
+        core = [
+            c for c in explicit_core
+            if c.get("reference_required", True) and c.get("role_type") not in {"supporting", "background", "ambient"}
+        ]
+        supporting = explicit_supporting + [
+            c for c in explicit_core
+            if not c.get("reference_required", True) or c.get("role_type") in {"supporting", "background", "ambient"}
+        ]
+        return {
+            "core_characters": core[:4],
+            "supporting_characters": supporting[:6],
+            "ambient_entities": ambient_entities[:8],
+            "rationale": "explicit characters from product_info",
+        }
+
+    text = _product_context_text(product_info, ad_script)
+    core: List[dict] = []
+    supporting: List[dict] = list(explicit_supporting)
+    rationale = "single protagonist default"
+
+    pet_markers = ("宠物", "猫", "狗", "犬", "猫粮", "狗粮", "pet", "cat", "dog")
+    family_markers = (
+        "家财", "家庭", "家人", "全屋", "房屋", "房产", "保险", "财险",
+        "孩子", "父母", "亲子", "母婴", "home", "family", "insurance",
+        "house", "property", "parent", "child",
+    )
+    # Q-Final 新增：更多产品类型的多角色配置
+    beauty_markers = ("美妆", "护肤", "口红", "面膜", "粉底", "beauty", "skincare", "makeup", "cosmetic", "lipstick")
+    fitness_markers = ("健身", "运动", "瑜伽", "跑步", "减肥", "塑形", "fitness", "gym", "workout", "yoga", "sports")
+    food_markers = ("美食", "零食", "饮料", "咖啡", "奶茶", "火锅", "餐厅", "food", "snack", "beverage", "coffee", "drink")
+    tech_markers = ("数码", "科技", "手机", "耳机", "电脑", "智能", "tech", "digital", "phone", "earphone", "laptop", "smart")
+    fashion_markers = ("时尚", "服装", "穿搭", "鞋子", "包包", "配饰", "fashion", "clothing", "outfit", "shoes", "bag", "accessories")
+    service_markers = ("客服", "理赔", "顾问", "医生", "老师", "教练", "advisor", "agent", "doctor", "teacher", "coach")
+    social_markers = ("社交", "聚会", "派对", "约会", "分享", "social", "party", "gathering", "date", "share")
+    crowd_markers = ("商场", "街头", "地铁", "办公室", "人群", "路人", "crowd", "street", "office", "mall")
+
+    if any(marker in text for marker in pet_markers):
+        core = [
+            _role(
+                role_id="char_01",
+                name="Owner",
+                role="pet owner and product user",
+                description="30-year-old Chinese adult, relaxed everyday outfit, caring expression with pet",
+                age="30",
+                gender="person",
+                outfit="relaxed everyday outfit",
+            ),
+            _role(
+                role_id="char_02",
+                name="Pet",
+                role="animal protagonist",
+                role_type="animal",
+                description="healthy expressive household pet, clean fur, friendly natural movement",
+                gender="animal",
+                expression_baseline="friendly alert expression",
+            ),
+        ]
+        rationale = "pet product needs animal subject consistency"
+    elif any(marker in text for marker in family_markers):
+        core = [
+            _role(
+                role_id="char_01",
+                name="Mother",
+                role="homeowner decision maker",
+                description="35-year-old Chinese woman, calm and reliable, smart casual blouse, warm protective expression",
+                age="35",
+                gender="female",
+                outfit="smart casual blouse",
+                expression_baseline="calm protective smile",
+            ),
+            _role(
+                role_id="char_02",
+                name="Father",
+                role="spouse and family co-decision maker",
+                description="38-year-old Chinese man, neat short black hair, casual knit polo, steady and trustworthy expression",
+                age="38",
+                gender="male",
+                outfit="casual knit polo",
+                expression_baseline="steady trustworthy expression",
+            ),
+            _role(
+                role_id="char_03",
+                name="Child",
+                role="family child, emotional core stake",
+                description="8-year-old Chinese child, simple clean casual clothes, natural happy expression, innocent and lively",
+                age="8",
+                gender="child",
+                outfit="simple clean casual clothes",
+                expression_baseline="natural happy expression",
+            ),
+        ]
+        is_insurance = any(m in text for m in ("保险", "财险", "insurance", "理赔", "顾问"))
+        if is_insurance:
+            core.append(_role(
+                role_id="char_04",
+                name="Insurance Advisor",
+                role="professional insurance consultant",
+                description="32-year-old Chinese professional, well-fitted business attire, friendly and reassuring smile, trustworthy demeanor",
+                age="32",
+                gender="person",
+                outfit="well-fitted business attire",
+                expression_baseline="friendly reassuring smile",
+            ))
+        rationale = "family product: both parents + child as core (child is emotional anchor for insurance/home products)"
+    elif any(marker in text for marker in beauty_markers):
+        # Q-Final 新增：美妆护肤类 → 主角 + 闺蜜（分享/种草场景）
+        core = [
+            _role(
+                role_id="char_01",
+                name="Main User",
+                role="primary beauty product user",
+                description="28-year-old Chinese woman, natural glowing skin, casual chic outfit, warm friendly expression, applying skincare product",
+                age="28",
+                gender="female",
+                outfit="casual chic outfit",
+                expression_baseline="warm friendly smile",
+            ),
+            _role(
+                role_id="char_02",
+                name="Best Friend",
+                role="friend and sharing partner",
+                description="26-year-old Chinese woman, fresh natural look, stylish casual outfit, curious excited expression, trying product together",
+                age="26",
+                gender="female",
+                outfit="stylish casual outfit",
+                expression_baseline="curious excited expression",
+            ),
+        ]
+        rationale = "beauty product: user + best friend for sharing/种草场景 (two-person interaction feels more authentic)"
+    elif any(marker in text for marker in fitness_markers):
+        # Q-Final 新增：运动健身类 → 主角 + 教练（指导场景）
+        core = [
+            _role(
+                role_id="char_01",
+                name="Main User",
+                role="fitness enthusiast and product user",
+                description="27-year-old Chinese adult, athletic build, active sportswear, determined energetic expression, working out with product",
+                age="27",
+                gender="person",
+                outfit="premium sportswear",
+                expression_baseline="determined energetic expression",
+            ),
+            _role(
+                role_id="char_02",
+                name="Fitness Coach",
+                role="professional trainer and guide",
+                description="30-year-old Chinese adult, fit athletic body, professional fitness attire, encouraging confident expression, guiding form",
+                age="30",
+                gender="person",
+                outfit="professional fitness attire",
+                expression_baseline="encouraging confident smile",
+            ),
+        ]
+        rationale = "fitness product: user + coach for guidance/demo场景 (expert endorsement + proper form demonstration)"
+    elif any(marker in text for marker in food_markers) and not any(marker in text for marker in family_markers):
+        # Q-Final 新增：美食饮料类 → 主角 + 朋友（分享场景）
+        core = [
+            _role(
+                role_id="char_01",
+                name="Main User",
+                role="food lover and product user",
+                description="26-year-old Chinese adult, casual trendy outfit, happy delighted expression, enjoying food/drink product",
+                age="26",
+                gender="person",
+                outfit="casual trendy outfit",
+                expression_baseline="happy delighted expression",
+            ),
+            _role(
+                role_id="char_02",
+                name="Friend",
+                role="companion and sharing partner",
+                description="25-year-old Chinese adult, relaxed casual wear, cheerful smiling expression, sharing food/drink experience together",
+                age="25",
+                gender="person",
+                outfit="relaxed casual wear",
+                expression_baseline="cheerful smiling expression",
+            ),
+        ]
+        rationale = "food/beverage product: user + friend for sharing场景 (social dining feels more natural and appetizing)"
+    elif any(marker in text for marker in tech_markers):
+        # Q-Final 新增：数码科技类 → 主角 + 朋友（展示/推荐场景）
+        core = [
+            _role(
+                role_id="char_01",
+                name="Main User",
+                role="tech enthusiast and product user",
+                description="25-year-old Chinese adult, smart casual style, excited impressed expression, demonstrating tech product",
+                age="25",
+                gender="person",
+                outfit="smart casual style",
+                expression_baseline="excited impressed expression",
+            ),
+            _role(
+                role_id="char_02",
+                name="Friend",
+                role="curious observer and reaction person",
+                description="24-year-old Chinese adult, modern casual outfit, interested surprised expression, reacting to product demo",
+                age="24",
+                gender="person",
+                outfit="modern casual outfit",
+                expression_baseline="interested surprised expression",
+            ),
+        ]
+        rationale = "tech product: user + friend for demo/reaction场景 (second person reaction makes product more convincing)"
+    elif any(marker in text for marker in fashion_markers):
+        # Q-Final 新增：时尚穿搭类 → 主角 + 闺蜜（搭配/评价场景）
+        core = [
+            _role(
+                role_id="char_01",
+                name="Main User",
+                role="fashion lover and product user",
+                description="27-year-old Chinese woman, stylish fashionable outfit, confident happy expression, modeling fashion item",
+                age="27",
+                gender="female",
+                outfit="stylish fashionable outfit",
+                expression_baseline="confident happy expression",
+            ),
+            _role(
+                role_id="char_02",
+                name="Best Friend",
+                role="stylist companion and honest opinion",
+                description="26-year-old Chinese woman, trendy chic style, admiring approving expression, giving fashion advice",
+                age="26",
+                gender="female",
+                outfit="trendy chic style",
+                expression_baseline="admiring approving expression",
+            ),
+        ]
+        rationale = "fashion product: user + best friend for styling/feedback场景 (second person validation drives desire)"
+    elif any(marker in text for marker in social_markers):
+        # Q-Final 新增：社交聚会类 → 主角 + 2个朋友（多人互动场景）
+        core = [
+            _role(
+                role_id="char_01",
+                name="Main User",
+                role="host and product user",
+                description="28-year-old Chinese adult, warm welcoming smile, casual party outfit, socializing with product",
+                age="28",
+                gender="person",
+                outfit="casual party outfit",
+                expression_baseline="warm welcoming smile",
+            ),
+            _role(
+                role_id="char_02",
+                name="Friend A",
+                role="party guest and engaged participant",
+                description="27-year-old Chinese adult, lively cheerful expression, festive casual wear, interacting with product",
+                age="27",
+                gender="person",
+                outfit="festive casual wear",
+                expression_baseline="lively cheerful expression",
+            ),
+            _role(
+                role_id="char_03",
+                name="Friend B",
+                role="party guest and happy participant",
+                description="26-year-old Chinese adult, joyful laughing expression, stylish casual outfit, enjoying the moment",
+                age="26",
+                gender="person",
+                outfit="stylish casual outfit",
+                expression_baseline="joyful laughing expression",
+            ),
+        ]
+        rationale = "social product: host + 2 friends for group场景 (multiple people create social proof and FOMO)"
+    else:
+        core = [_role(
+            role_id="char_01",
+            name="Main User",
+            role="primary product user",
+            description=(
+                f"{product_info.get('age', '25')}-year-old {product_info.get('gender', 'person')} "
+                f"wearing {product_info.get('outfit', 'casual everyday clothes')}"
+            ),
+            age=str(product_info.get("age", "25")),
+            gender=str(product_info.get("gender", "person")),
+            outfit=str(product_info.get("outfit", "casual everyday clothes")),
+        )]
+
+    if any(marker in text for marker in service_markers):
+        supporting.append(_role(
+            role_id="support_02",
+            name="Service Specialist",
+            role="professional support role",
+            role_type="supporting",
+            reference_required=False,
+            description="professional service specialist, neat business casual outfit, reassuring expression",
+            age="30",
+            gender="person",
+            outfit="neat business casual outfit",
+        ))
+    if any(marker in text for marker in crowd_markers):
+        # Q-Final 强化：路人描述更具体自然，避免 AI 感
+        # 明确说明：背景人物、自然动作、不看镜头、穿着日常服装
+        ambient_entities.append(
+            "a few natural background people in casual everyday clothes, "
+            "doing normal everyday activities, not looking at camera, "
+            "slightly out of focus in background, adds depth and realism to scene"
+        )
+    if any(marker in text for marker in pet_markers) and not any(c.get("name") == "Pet" for c in core):
+        ambient_entities.append("household pet in the background")
+
+    return {
+        "core_characters": core[:4],
+        "supporting_characters": supporting[:6],
+        "ambient_entities": ambient_entities[:8],
+        "rationale": rationale,
+    }
+
+
+def _format_cast_plan_for_prompt(cast_plan: dict) -> str:
+    parts: List[str] = []
+    core = cast_plan.get("core_characters") or []
+    supporting = cast_plan.get("supporting_characters") or []
+    ambient = cast_plan.get("ambient_entities") or []
+    if core:
+        parts.append("Core cast: " + "; ".join(
+            f"{c.get('name')}: {c.get('description') or c.get('role')}" for c in core
+        ))
+    if supporting:
+        parts.append("Supporting cast: " + "; ".join(
+            f"{c.get('name')}: {c.get('description') or c.get('role')}" for c in supporting
+        ))
+    if ambient:
+        parts.append("Ambient entities: " + "; ".join(str(item) for item in ambient))
+    return " | ".join(parts)
+
+
+def infer_characters_from_product(product_info: dict) -> List[dict]:
+    """
+    兼容旧调用方：只返回需要生成定妆照的核心角色。
+    """
+    return build_cast_plan(product_info).get("core_characters", [])
+
+
+def _parse_description_to_bible(description: str, base: dict) -> CharacterBible:
+    """从用户提供的描述字符串中提取结构化字段，回退到 base 默认值。"""
+    desc = (description or "").lower()
+    # 简单启发式提取（不引入 NLP 依赖）
+    age_match = re.search(r"(\d+)[\s-]*year[\s-]*old", desc)
+    age = str(age_match.group(1)) if age_match else base.get("age", "25")
+
+    gender = base.get("gender", "person")
+    if "woman" in desc or "female" in desc or "girl" in desc:
+        gender = "female"
+    elif "man" in desc or "male" in desc or "boy" in desc:
+        gender = "male"
+
+    ethnicity = ""
+    for eth in ("asian", "caucasian", "african", "latina", "latino", "european", "indian"):
+        if eth in desc:
+            ethnicity = eth.capitalize()
+            break
+
+    hair_style = ""
+    hair_color = ""
+    hair_match = re.search(r"(long|short|medium|curly|straight|wavy)\s+([a-z]+)\s+hair", desc)
+    if hair_match:
+        hair_style = f"{hair_match.group(1)} {hair_match.group(2)} hair"
+        hair_color = hair_match.group(2)
+    elif "hair" in desc:
+        hair_style = description[desc.find("hair") - 20:desc.find("hair") + 4].strip()
+
+    return CharacterBible(
+        id=base.get("id", "char_01"),
+        name=base.get("name", "Character A"),
+        age=age,
+        gender=gender,
+        ethnicity=ethnicity,
+        hair_style=hair_style,
+        hair_color=hair_color,
+        outfit=base.get("outfit", "casual everyday clothes"),
+        accessories=base.get("accessories", ""),
+        facial_features=base.get("facial_features", ""),
+        expression_baseline=base.get("expression_baseline", "neutral confident"),
+    )
+
+
+def build_character_bibles(product_info: dict, characters: Optional[list] = None) -> List[CharacterBible]:
+    """
+    从 product_info 和 characters 构建标准化角色圣经列表。
 
     Args:
-        product_info: 产品信息字典
-        description: 角色外貌描述（如 "25-year-old Asian woman, long black hair"）
+        product_info: 产品信息字典（含 age, gender, outfit 等）
+        characters: 角色列表，每个元素为 dict，可包含 name, description, age, gender, outfit 等
 
     Returns:
-        Prompt 字符串
+        List[CharacterBible]
     """
+    bibles: List[CharacterBible] = []
+    base_info = {
+        "age": product_info.get("age", "25"),
+        "gender": product_info.get("gender", "person"),
+        "outfit": product_info.get("outfit", "casual everyday clothes"),
+    }
+
+    if not characters:
+        # 单角色：从 product_info 构建默认主角色
+        bible = CharacterBible(
+            id="char_01",
+            name="Character A",
+            age=base_info["age"],
+            gender=base_info["gender"],
+            ethnicity="",
+            hair_style="",
+            hair_color="",
+            outfit=base_info["outfit"],
+            accessories="",
+            facial_features="",
+            expression_baseline="neutral confident",
+        )
+        bibles.append(bible)
+        return bibles
+
+    for idx, char in enumerate(characters, 1):
+        char_id = char.get("id") or f"char_{idx:02d}"
+        char_name = char.get("name") or f"Character {chr(64 + idx)}"
+        description = char.get("description", "")
+
+        if description:
+            bible = _parse_description_to_bible(description, {
+                **base_info,
+                "id": char_id,
+                "name": char_name,
+                "outfit": char.get("outfit", base_info["outfit"]),
+                "accessories": char.get("accessories", ""),
+                "facial_features": char.get("facial_features", ""),
+                "expression_baseline": char.get("expression_baseline", "neutral confident"),
+            })
+        else:
+            bible = CharacterBible(
+                id=char_id,
+                name=char_name,
+                age=char.get("age", base_info["age"]),
+                gender=char.get("gender", base_info["gender"]),
+                ethnicity=char.get("ethnicity", ""),
+                hair_style=char.get("hair_style", ""),
+                hair_color=char.get("hair_color", ""),
+                outfit=char.get("outfit", base_info["outfit"]),
+                accessories=char.get("accessories", ""),
+                facial_features=char.get("facial_features", ""),
+                expression_baseline=char.get("expression_baseline", "neutral confident"),
+            )
+        bibles.append(bible)
+
+    return bibles
+
+
+def build_product_bible(product_info: dict) -> ProductBible:
+    """从 product_info 和 BRAND_CONFIG 构建标准化商品圣经。"""
+    name = product_info.get("name", "product")
+    ptype = product_info.get("type", "default")
+    preset = get_preset(ptype)
+    return ProductBible(
+        name=name,
+        category=ptype,
+        packaging=BRAND_CONFIG.get("packaging_description", "consistent product packaging"),
+        primary_color=BRAND_CONFIG.get("primary_color", "consistent brand colors"),
+        secondary_color=BRAND_CONFIG.get("secondary_color", ""),
+        shape=product_info.get("shape", ""),
+        logo_description=BRAND_CONFIG.get("logo_description", "brand logo appears subtly"),
+        usage_context=preset.get("scene", "natural setting"),
+        key_selling_point=product_info.get("selling_point", "amazing feature"),
+    )
+
+
+def character_bible_to_prompt(bible: CharacterBible) -> str:
+    """将角色圣经转换为标准化、信息密度高的外观描述字符串。"""
+    parts: List[str] = []
+    if bible.get("age") and bible.get("gender"):
+        parts.append(f"{bible['age']}-year-old {bible['gender']}")
+    elif bible.get("gender"):
+        parts.append(bible["gender"])
+    if bible.get("ethnicity"):
+        parts.append(bible["ethnicity"])
+    if bible.get("hair_style"):
+        parts.append(bible["hair_style"])
+    if bible.get("facial_features"):
+        parts.append(bible["facial_features"])
+    if bible.get("outfit"):
+        parts.append(f"wearing {bible['outfit']}")
+    if bible.get("accessories"):
+        parts.append(bible["accessories"])
+    if bible.get("expression_baseline"):
+        parts.append(bible["expression_baseline"])
+    return ", ".join(parts) if parts else "same person from reference image"
+
+
+def product_bible_to_prompt(bible: ProductBible) -> str:
+    """将商品圣经转换为标准化的商品外观描述字符串。"""
+    parts: List[str] = [bible.get("name", "product")]
+    if bible.get("packaging"):
+        parts.append(bible["packaging"])
+    if bible.get("shape"):
+        parts.append(bible["shape"])
+    if bible.get("primary_color"):
+        parts.append(bible["primary_color"])
+    if bible.get("logo_description"):
+        parts.append(bible["logo_description"])
+    return ", ".join(parts)
+
+
+def generate_character_prompt(product_info: dict, bible: Optional[CharacterBible] = None) -> str:
+    """生成角色定妆照 Prompt（主角色）。优先使用圣经，回退到零散字段。"""
     preset = get_preset(product_info.get("type", "default"))
     brand = BRAND_CONFIG.get("name", "brand")
     name = product_info.get("name", "product")
 
-    # 如果没有提供描述，使用主角色默认
-    if not description:
-        return generate_character_prompt(product_info)
+    if bible:
+        description = character_bible_to_prompt(bible)
+    else:
+        age = product_info.get("age", "25")
+        gender = product_info.get("gender", "女")
+        style = product_info.get("style", preset["style"])
+        outfit = product_info.get("outfit", "casual everyday clothes")
+        description = f"{age}-year-old {gender}, {style} style, wearing {outfit}"
 
     prompt = (
         f"Character reference portrait for {name} advertisement, "
@@ -1119,6 +2233,522 @@ def generate_character_prompt_for_role(product_info: dict, description: str = ""
         f"{brand} brand aesthetic, {BRAND_CONFIG.get('primary_color', 'consistent brand colors')}"
     )
     return prompt
+
+
+def generate_character_prompt_for_role(
+    product_info: dict, description: str = "", bible: Optional[CharacterBible] = None
+) -> str:
+    """
+    生成指定角色的定妆照 Prompt。优先使用圣经，回退到 description 或 product_info。
+
+    Args:
+        product_info: 产品信息字典
+        description: 角色外貌描述（旧版兼容）
+        bible: 角色圣经（推荐，优先使用）
+
+    Returns:
+        Prompt 字符串
+    """
+    preset = get_preset(product_info.get("type", "default"))
+    brand = BRAND_CONFIG.get("name", "brand")
+    name = product_info.get("name", "product")
+
+    if bible:
+        desc = character_bible_to_prompt(bible)
+    elif description:
+        desc = description
+    else:
+        return generate_character_prompt(product_info)
+
+    prompt = (
+        f"close-up portrait, bust shot, face and upper body filling 70% of frame, perfectly centered, "
+        f"pure white seamless background, absolutely no objects no scenery, "
+        f"soft even studio lighting, no harsh shadows, "
+        f"{desc}, "
+        f"front-facing, neutral natural expression, "
+        f"high detail, crystal clear facial features, tack sharp focus on eyes, "
+        f"9:16 vertical, character reference sheet quality"
+    )
+    return prompt
+
+
+def generate_character_angle_prompt_for_role(
+    product_info: dict, bible: Optional[CharacterBible] = None, angle: str = "full_body"
+) -> str:
+    """
+    生成角色的多角度参考图 Prompt（全身/3/4侧面），用于提升视频中角色的3D一致性。
+    性价比策略：多花0.05元生图，换视频角色一致性大幅提升。
+
+    Args:
+        product_info: 产品信息字典
+        bible: 角色圣经
+        angle: 角度类型 - "full_body"(全身正面) / "three_quarter"(3/4侧面) / "profile"(正侧面)
+
+    Returns:
+        Prompt 字符串
+    """
+    preset = get_preset(product_info.get("type", "default"))
+    brand = BRAND_CONFIG.get("name", "brand")
+    name = product_info.get("name", "product")
+
+    desc = character_bible_to_prompt(bible) if bible else "person"
+
+    angle_desc = {
+        "full_body": "full-body shot, standing straight pose, showing entire body from head to feet, natural relaxed posture, body filling 70% of frame height, centered",
+        "three_quarter": "three-quarter view, 45 degree angle, body slightly turned, showing both front and side profile, full body, centered composition",
+        "profile": "side profile view, facing left, full body silhouette, clear outline of face and body, centered",
+    }
+
+    composition = angle_desc.get(angle, angle_desc["full_body"])
+
+    prompt = (
+        f"full body portrait, {composition}, perfectly centered, "
+        f"pure white seamless background, absolutely no objects no scenery, "
+        f"soft even studio lighting, no harsh shadows, "
+        f"{desc}, "
+        f"same person as reference, identical face and outfit and hair, "
+        f"high detail, sharp focus, 9:16 vertical, "
+        f"character reference sheet quality"
+    )
+    return prompt
+
+
+# ── 参考图 Prompt 经验学习系统 ──
+# 核心理念：从每次生成中学习，沉淀最优 prompt 模板，越用越准，第一次就生成高质量
+_REF_EXPERIENCE_FILENAME = "ref_prompt_experience.json"
+_REF_EXPERIENCE_TOP_N = 5  # 每个场景保留 TOP N 最优 prompt
+
+
+def _ref_experience_key(product_info: dict, char_desc: str, angle: str) -> str:
+    """生成经验库的 key：产品类型 + 角色性别 + 角度。"""
+    ptype = product_info.get("type", "general") or "general"
+
+    # 简单从描述里提取性别
+    desc_lower = (char_desc or "").lower()
+    if any(w in desc_lower for w in ["female", "woman", "girl", "lady", "mother", "mom", "daughter", "female", "女", "妈妈", "女儿", "女孩", "女士"]):
+        gender = "female"
+    elif any(w in desc_lower for w in ["male", "man", "boy", "guy", "father", "dad", "son", "male", "男", "爸爸", "儿子", "男孩", "男士"]):
+        gender = "male"
+    else:
+        gender = "neutral"
+
+    # 年龄段（注意：排除 year-old 中的 old）
+    _desc_clean = desc_lower.replace("year-old", "").replace("years old", "")
+    if any(w in _desc_clean for w in ["child", "kid", "baby", "toddler", "孩子", "小孩", "儿童", "婴儿"]):
+        age_group = "child"
+    elif any(w in _desc_clean for w in ["old", "senior", "elderly", "60", "70", "55", "老", "老年", "长辈", "爷爷", "奶奶"]):
+        age_group = "senior"
+    else:
+        age_group = "adult"
+
+    return f"{ptype}_{gender}_{age_group}_{angle}"
+
+
+def _load_ref_experience(output_dir: Path) -> dict:
+    """加载参考图 prompt 经验库。"""
+    exp_path = output_dir / _REF_EXPERIENCE_FILENAME
+    if not exp_path.exists():
+        return {}
+    try:
+        import json
+        with open(exp_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_ref_experience(experience: dict, output_dir: Path) -> None:
+    """保存经验库。"""
+    try:
+        import json
+        exp_path = output_dir / _REF_EXPERIENCE_FILENAME
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with open(exp_path, "w", encoding="utf-8") as f:
+            json.dump(experience, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _learn_from_ref_generation(
+    output_dir: Path,
+    product_info: dict,
+    char_desc: str,
+    angle: str,
+    prompt: str,
+    quality_score: float,
+    passed: bool,
+) -> None:
+    """
+    从一次参考图生成中学习，存入经验库。
+
+    每个场景保留 TOP N 个质量分最高的 prompt。
+    """
+    if quality_score <= 0:
+        return
+
+    exp = _load_ref_experience(output_dir)
+    key = _ref_experience_key(product_info, char_desc, angle)
+
+    if key not in exp:
+        exp[key] = []
+
+    # 检查是否已有相同/高度相似的 prompt（避免重复）
+    for entry in exp[key]:
+        if entry["prompt"][:50] == prompt[:50]:  # 前50字相同就算相似
+            if quality_score > entry["score"]:
+                entry["score"] = quality_score
+                entry["passed"] = passed
+                entry["prompt"] = prompt
+            _save_ref_experience(exp, output_dir)
+            return
+
+    # 加入新记录
+    exp[key].append({
+        "prompt": prompt,
+        "score": round(quality_score, 3),
+        "passed": passed,
+    })
+
+    # 按质量分降序排序，保留 TOP N
+    exp[key].sort(key=lambda x: x["score"], reverse=True)
+    exp[key] = exp[key][:_REF_EXPERIENCE_TOP_N]
+
+    _save_ref_experience(exp, output_dir)
+
+
+def _get_best_ref_prompt(
+    output_dir: Path,
+    product_info: dict,
+    char_desc: str,
+    angle: str,
+    default_prompt: str,
+    min_score: float = 0.6,
+) -> str:
+    """
+    从经验库中获取同类场景下质量最高的 prompt。
+
+    如果没有历史经验或历史最高分低于 min_score，返回默认 prompt。
+    """
+    exp = _load_ref_experience(output_dir)
+    key = _ref_experience_key(product_info, char_desc, angle)
+
+    if key not in exp or not exp[key]:
+        return default_prompt
+
+    best = exp[key][0]
+    if best["score"] >= min_score:
+        print(f"🧠 经验库命中：使用 {key} 场景下历史最优 prompt（质量分 {best['score']:.2f}）")
+        return best["prompt"]
+
+    return default_prompt
+
+
+def _optimize_ref_prompt_from_quality(
+    prompt: str,
+    quality_result: "ReferenceImageCheckResult",
+    angle: str = "front",
+) -> str:
+    """
+    根据参考图质量检查结果，针对性优化 prompt，用于重生成。
+
+    Args:
+        prompt: 原始 prompt
+        quality_result: 质量检查结果
+        angle: 角度（front/full_body 等）
+
+    Returns:
+        优化后的 prompt
+    """
+    import re
+
+    optimized = prompt
+
+    # 1. 主体占比过小 → 放大主体
+    if quality_result.subject_size_ratio and quality_result.subject_size_ratio < 0.2:
+        if angle == "front":
+            optimized = re.sub(
+                r'face and upper body filling \d+% of frame',
+                'extreme close-up, face and shoulders filling 85% of frame, tightly cropped',
+                optimized,
+                flags=re.IGNORECASE,
+            )
+        elif angle == "full_body":
+            optimized = re.sub(
+                r'body filling \d+% of frame height',
+                'body filling 90% of frame height, head to toe tightly framed',
+                optimized,
+                flags=re.IGNORECASE,
+            )
+        optimized = 'huge subject, massive close-up, ' + optimized
+
+    # 2. 背景过于复杂 → 强化纯色背景
+    if quality_result.background_complexity and quality_result.background_complexity > 0.6:
+        optimized = re.sub(
+            r'pure white seamless background, absolutely no objects no scenery',
+            'solid pure white background, completely blank empty, nothing in background, total void',
+            optimized,
+            flags=re.IGNORECASE,
+        )
+        optimized += ', no background elements whatsoever, flat white only'
+
+    # 3. 主体偏移 → 强化居中
+    if quality_result.subject_centered is False:
+        optimized += ', perfectly centered composition, subject dead center'
+
+    # 4. 水印/文字 → 加 negative 描述
+    if quality_result.has_watermark:
+        optimized += ', no watermark, no text, no logo, clean image'
+
+    # 5. 人脸不清晰 → 强化面部细节
+    if hasattr(quality_result, 'face_score') and quality_result.face_score and quality_result.face_score < 0.7:
+        optimized += ', ultra sharp facial features, crystal clear face, hyperdetailed skin texture, tack sharp focus on eyes'
+
+    return optimized
+
+
+def _check_ref_image_quality(image_path: Path, image_type: str = "character"):
+    """快速检查参考图质量，返回质量检查结果。"""
+    try:
+        from quality_gate import check_reference_image
+        return check_reference_image(image_path, image_type)
+    except Exception:
+        return None
+
+
+def _generate_multi_angle_character_refs(
+    client: "KlingClient",
+    product_info: dict,
+    char_name: str,
+    char_desc: str,
+    char_bible: Optional[dict],
+    char_ref_dir: Path,
+    output_name: str,
+    user_image_path: Optional[Path] = None,
+    angles: Optional[List[str]] = None,
+) -> dict:
+    """
+    生成单个角色的多角度参考图（正面 + 全身/3/4侧面）。
+    性价比策略：多花0.05-0.1元生图，大幅提升视频中角色3D一致性，减少视频重抽。
+
+    Args:
+        client: KlingClient 实例
+        product_info: 产品信息
+        char_name: 角色名
+        char_desc: 角色描述（兼容旧版）
+        char_bible: 角色圣经（优先）
+        char_ref_dir: 角色参考图目录
+        output_name: 输出文件名前缀
+        user_image_path: 用户上传的角色图（如果有则跳过生成正面图）
+        angles: 要生成的角度列表，默认 ["front", "full_body"]
+
+    Returns:
+        角色参考图字典：{"name": str, "image_path": Path, "img_b64": str, "images": [Path,...], "img_b64_list": [str,...]}
+    """
+    if angles is None:
+        angles = ["front", "full_body"]
+
+    safe_name = char_name.replace(" ", "_")
+    images = []
+    b64_list = []
+
+    # 正面图（用户上传或生成）
+    if user_image_path and user_image_path.exists():
+        front_path = user_image_path
+        images.append(front_path)
+        b64_list.append(base64.b64encode(front_path.read_bytes()).decode("utf-8"))
+        print(f"✅ 角色 {char_name} 正面参考图（用户提供）：{front_path.name}")
+    else:
+        front_prompt = generate_character_prompt_for_role(product_info, char_desc, bible=char_bible)
+
+        # 🧠 经验学习：先查经验库，有历史最优就直接用
+        output_root = char_ref_dir.parent.parent if char_ref_dir else OUTPUT_DIR
+        _desc = char_desc or (char_bible.get("description", "") if char_bible else "")
+        front_prompt = _get_best_ref_prompt(
+            output_dir=output_root,
+            product_info=product_info,
+            char_desc=_desc,
+            angle="front",
+            default_prompt=front_prompt,
+        )
+
+        cached_front = char_ref_dir / f"{output_name}_{safe_name}_front.png"
+        front_manifest = _build_character_manifest(
+            product_info=product_info,
+            character={"name": char_name, "description": char_desc},
+            prompt=front_prompt,
+        )
+        if (
+            cached_front.exists()
+            and cached_front.stat().st_size > 1024
+            and _manifest_matches(cached_front, front_manifest)
+        ):
+            front_path = cached_front
+            print(f"✅ 角色 {char_name} 正面参考图缓存命中：{front_path.name}")
+        else:
+            front_path = None
+            best_path = None
+            best_score = -1.0
+            best_prompt = ""
+            max_generate = 3
+            last_error = None
+            current_prompt = front_prompt
+            current_save_path = cached_front
+
+            for attempt in range(1, max_generate + 1):
+                try:
+                    gen_path = client.generate_character_ref(
+                        prompt=current_prompt,
+                        save_path=current_save_path,
+                    )
+                    # 质量自检
+                    quality = _check_ref_image_quality(gen_path, "character")
+                    score = 0.0
+                    if quality:
+                        subj = min(quality.subject_size_ratio or 0, 0.8) / 0.8 * 0.4
+                        bg = max(0, 1.0 - (quality.background_complexity or 0.7)) / 0.7 * 0.3
+                        face = (quality.face_score if hasattr(quality, 'face_score') and quality.face_score else 0) * 0.3
+                        score = subj + bg + face
+
+                        # 🧠 经验学习：每次生成都存入经验库
+                        _learn_from_ref_generation(
+                            output_dir=output_root,
+                            product_info=product_info,
+                            char_desc=char_desc or (char_bible.get("description", "") if char_bible else ""),
+                            angle="front",
+                            prompt=current_prompt,
+                            quality_score=score,
+                            passed=quality.passed,
+                        )
+
+                        if score > best_score:
+                            best_score = score
+                            best_path = gen_path
+                            best_prompt = current_prompt
+
+                        if quality.passed:
+                            front_path = gen_path
+                            _write_clip_manifest(front_path, front_manifest)
+                            print(f"✅ 角色 {char_name} 正面参考图已生成（第{attempt}次，质量达标）：{front_path.name}")
+                            break
+                        elif attempt < max_generate:
+                            optimized = _optimize_ref_prompt_from_quality(current_prompt, quality, "front")
+                            if optimized != current_prompt:
+                                print(f"🔧 角色 {char_name} 正面图质量不达标，优化 prompt 后第 {attempt + 1} 次生成...")
+                                current_prompt = optimized
+                                current_save_path = char_ref_dir / f"{output_name}_{safe_name}_front_v{attempt + 1}.png"
+                                continue
+                    else:
+                        # 质量检查失败，直接用这张
+                        front_path = gen_path
+                        _write_clip_manifest(front_path, front_manifest)
+                        print(f"✅ 角色 {char_name} 正面参考图已生成：{front_path.name}")
+                        break
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_generate:
+                        wait = 5 * attempt
+                        print(f"⚠️  角色 {char_name} 正面图第 {attempt} 次失败：{e}，{wait}s 后重试")
+                        time.sleep(wait)
+
+            if front_path is None and best_path is not None:
+                # 没达到完全合格，但有最佳版本，用最佳版本继续
+                front_path = best_path
+                _write_clip_manifest(front_path, front_manifest)
+                print(f"⚠️  角色 {char_name} 正面参考图未完全达标，使用最佳版本（质量分 {best_score:.2f}）：{front_path.name}")
+
+            if front_path is None:
+                raise RuntimeError(f"角色 {char_name} 正面参考图生成失败：{last_error}")
+        images.append(front_path)
+        b64_list.append(base64.b64encode(front_path.read_bytes()).decode("utf-8"))
+
+    # 额外角度图（全身、侧面等）
+    for angle in angles:
+        if angle == "front":
+            continue
+        angle_prompt = generate_character_angle_prompt_for_role(product_info, bible=char_bible, angle=angle)
+        cached_angle = char_ref_dir / f"{output_name}_{safe_name}_{angle}.png"
+        angle_manifest = _build_character_manifest(
+            product_info=product_info,
+            character={"name": char_name, "description": char_desc},
+            prompt=angle_prompt,
+        )
+        if (
+            cached_angle.exists()
+            and cached_angle.stat().st_size > 1024
+            and _manifest_matches(cached_angle, angle_manifest)
+        ):
+            angle_path = cached_angle
+            print(f"✅ 角色 {char_name} {angle} 参考图缓存命中：{angle_path.name}")
+        else:
+            angle_path = None
+            best_path = None
+            best_score = -1.0
+            max_generate = 2
+            last_error = None
+            current_prompt = angle_prompt
+            current_save_path = cached_angle
+
+            for attempt in range(1, max_generate + 1):
+                try:
+                    gen_path = client.generate_character_ref(
+                        prompt=current_prompt,
+                        save_path=current_save_path,
+                    )
+                    # 质量自检
+                    quality = _check_ref_image_quality(gen_path, "character")
+                    score = 0.0
+                    if quality:
+                        subj = min(quality.subject_size_ratio or 0, 0.8) / 0.8 * 0.4
+                        bg = max(0, 1.0 - (quality.background_complexity or 0.7)) / 0.7 * 0.3
+                        face = (quality.face_score if hasattr(quality, 'face_score') and quality.face_score else 0) * 0.3
+                        score = subj + bg + face
+
+                        if score > best_score:
+                            best_score = score
+                            best_path = gen_path
+
+                        if quality.passed:
+                            angle_path = gen_path
+                            _write_clip_manifest(angle_path, angle_manifest)
+                            print(f"✅ 角色 {char_name} {angle} 参考图已生成（第{attempt}次，质量达标）：{angle_path.name}")
+                            break
+                        elif attempt < max_generate:
+                            optimized = _optimize_ref_prompt_from_quality(current_prompt, quality, angle)
+                            if optimized != current_prompt:
+                                print(f"🔧 角色 {char_name} {angle} 图质量不达标，优化 prompt 后第 {attempt + 1} 次生成...")
+                                current_prompt = optimized
+                                current_save_path = char_ref_dir / f"{output_name}_{safe_name}_{angle}_v{attempt + 1}.png"
+                                continue
+                    else:
+                        angle_path = gen_path
+                        _write_clip_manifest(angle_path, angle_manifest)
+                        print(f"✅ 角色 {char_name} {angle} 参考图已生成：{angle_path.name}")
+                        break
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_generate:
+                        wait = 3 * attempt
+                        print(f"⚠️  角色 {char_name} {angle} 图第 {attempt} 次失败：{e}，{wait}s 后重试")
+                        time.sleep(wait)
+
+            if angle_path is None and best_path is not None:
+                angle_path = best_path
+                _write_clip_manifest(angle_path, angle_manifest)
+                print(f"⚠️  角色 {char_name} {angle} 参考图未完全达标，使用最佳版本（质量分 {best_score:.2f}）：{angle_path.name}")
+
+            if angle_path is None:
+                print(f"⚠️  角色 {char_name} {angle} 参考图生成失败，跳过（不影响主流程）：{last_error}")
+                continue
+        images.append(angle_path)
+        b64_list.append(base64.b64encode(angle_path.read_bytes()).decode("utf-8"))
+
+    return {
+        "name": char_name,
+        "image_path": images[0],
+        "img_b64": b64_list[0],
+        "images": images,
+        "img_b64_list": b64_list,
+    }
 
 
 def _mix_voiceover_with_bgm(
@@ -1175,16 +2805,18 @@ def _mix_voiceover_with_bgm(
         run_ffmpeg(cmd, timeout=120)
         return output
 
-    # #16 修复：sidechain ducking
+    # P0 修复：真正的 sidechain ducking
     # [0:a] = 视频原音轨（BGM），[1:a] = 口播音频
-    # sidechaincompress: 人声触发时 BGM 压低约 8dB（ratio=3, threshold≈-26dBFS）
-    # attack=10ms 响应快，release=300ms 释放更平滑自然
+    # sidechaincompress: 人声触发时 BGM 强力压低（ratio=12, threshold≈-26dBFS）
+    # attack=5ms 快速响应，release=250ms 平滑恢复，knee=2 软拐点更自然
+    # amix 后追加 alimiter 防止 BGM+口播叠加爆音
     filter_complex = (
         f"[0:a]volume={bgm_ducking_volume}[bgm_pre];"
         f"[1:a]volume=1.0[voice];"
         f"[bgm_pre][voice]sidechaincompress="
-        f"threshold=0.05:ratio=3:attack=10:release=300:makeup=1[bgm_duck];"  # #3 修复：ratio 3，避免人声一出 BGM 就断
-        f"[bgm_duck][voice]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
+        f"threshold=0.05:ratio=12:attack=5:release=250:knee=2:makeup=1[bgm_duck];"
+        f"[bgm_duck][voice]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[amixed];"
+        f"[amixed]alimiter=level_in=1:level_out=1:limit=-1dB:attack=5:release=10[aout]"
     )
 
 
@@ -1204,6 +2836,537 @@ def _mix_voiceover_with_bgm(
 
     run_ffmpeg(cmd, timeout=120)
     return output
+
+
+def build_story_driven_prompts(
+    ad_script: dict,
+    product_info: dict,
+    cinematic_style: str,
+    char_refs: list,
+    hook_type: str = "pain_point",
+    character_bibles: Optional[List[CharacterBible]] = None,
+    product_bible: Optional[ProductBible] = None,
+    music_contract: Optional[dict] = None,
+    rhythm_curve: Optional[Any] = None,
+) -> list:
+    """故事驱动的视频 Prompt 组装（改动2核心）
+
+    以 ad_script 的故事世界为主干，按以下结构组装每段 prompt：
+      [场景锚定] → [主角状态] → [叙事意图] → [电影风格元素] → [节奏驱动视觉参数] → [技术参数]
+
+    相比旧的"模板 + scene_detail 末尾追加"方案，把故事信息前置，
+    利用扩散模型"前重后轻"的注意力机制保证场景连续性和产品一致性。
+
+    Args:
+        ad_script: generate_ad_script 返回的脚本字典
+        product_info: 产品信息字典
+        cinematic_style: 导演风格 key（如 spielberg/hitchcock）
+        char_refs: 角色参考图列表（仅用于提取角色描述）
+        hook_type: 钩子类型
+        character_bibles: 角色圣经列表（优先使用）
+        product_bible: 商品圣经（优先使用）
+        music_contract: 音乐合同（在场景锚定层注入节奏描述）
+        rhythm_curve: RhythmCurve 对象（节奏分析结果，用于注入节奏驱动的视觉参数）
+
+    Returns:
+        按段落顺序的 prompt 字符串列表
+    """
+    segments = ad_script.get("segments", [])
+    story_world = ad_script.get("story_world") or {}
+    product_name = product_bible["name"] if product_bible else product_info.get("name", "product")
+    cast_plan = story_world.get("cast_plan") if isinstance(story_world, dict) else None
+    if not isinstance(cast_plan, dict):
+        cast_plan = product_info.get("cast_plan") if isinstance(product_info.get("cast_plan"), dict) else {}
+
+    # 提取故事世界核心描述
+    location = story_world.get("location", "indoor scene, natural lighting")
+    character_desc = story_world.get("character", "")
+    if not character_desc:
+        if cast_plan:
+            character_desc = _format_cast_plan_for_prompt(cast_plan)
+        elif character_bibles:
+            if len(character_bibles) == 1:
+                character_desc = character_bible_to_prompt(character_bibles[0])
+            else:
+                character_desc = ", ".join(
+                    f"{b['name']}: {character_bible_to_prompt(b)}" for b in character_bibles
+                )
+        else:
+            # 从 product_info 构建
+            gender = product_info.get("gender", "person")
+            age = product_info.get("age", "25")
+            outfit = product_info.get("outfit", "casual clothes")
+            character_desc = f"{age}-year-old {gender} wearing {outfit}"
+
+    # 视觉承接词模板（非首段使用）
+    # Q-Final 强化：加入光影一致性 + 空间连续性 + 角色动作连贯性描述
+    # 扩散模型对开头注意力最强，把最强约束放在最前面
+    _continuity_openers = [
+        f"CONTINUITY: Same {location.split(',')[0]}, same lighting direction and color temperature, same camera perspective, seamless cut from previous shot, character action continues smoothly",
+        f"CONTINUITY: Same scene, identical room setup and prop positions, same key light and shadow direction, camera moves smoothly within same space",
+        f"CONTINUITY: Same {location.split(',')[0]}, same time of day and mood, consistent color palette, close-up cut within same environment, same character continues action",
+        f"CONTINUITY: Same {location.split(',')[0]}, same lighting setup and atmosphere, matching shot composition, camera reframes on same character, action continues uninterrupted",
+    ]
+
+    prompts = []
+    for i, seg in enumerate(segments):
+        narrative = seg.get("narrative", "hook")
+        scene_prompt_raw = seg.get("scene_prompt", "")
+        product_visibility = seg.get("product_visibility", "absent")
+
+        # ── 1. 场景锚定层（前置，扩散模型注意力最强区域）
+        if i == 0:
+            # 首段：直接声明故事世界
+            scene_anchor = f"SCENE: {location}"
+        else:
+            # 非首段：用连续性承接词锚定同一场景
+            opener = _continuity_openers[min(i - 1, len(_continuity_openers) - 1)]
+            scene_anchor = f"{opener}, {location}"
+
+        # ── 音乐合同节奏注入（利用扩散模型前重后轻注意力）──
+        if music_contract:
+            rhythm_tag = (
+                f"{music_contract['mood']} {music_contract['genre']} energy, "
+                f"{music_contract['bpm_min']}-{music_contract['bpm_max']} BPM rhythm"
+            )
+            scene_anchor = f"{rhythm_tag}, {scene_anchor}"
+
+        # ── 2. 主角状态层（角色圣经特征 + 场景动作）
+        char_action = ""
+        raw_char_state = seg.get("scene_prompt", "")
+        if "CHARACTER:" in raw_char_state:
+            try:
+                char_action = _extract_scene_prompt_field(raw_char_state, "CHARACTER")
+            except Exception:
+                char_action = ""
+        # 角色一致性强化：把角色圣经的核心特征拼在动作前面
+        # （Omni 无 image_fidelity，必须靠文字双重强化一致性）
+        if character_bibles and len(character_bibles) > 0:
+            main_bible = character_bibles[0]
+            base_char_desc = character_bible_to_prompt(main_bible)
+            if char_action:
+                char_state = f"{base_char_desc}, {char_action}"
+            else:
+                char_state = base_char_desc
+            # 多角色：补充次角色描述（如果有）
+            if len(character_bibles) > 1:
+                secondary_parts = []
+                for j in range(1, min(len(character_bibles), 5)):
+                    sec_bible = character_bibles[j]
+                    sec_name = sec_bible.get("name", f"character {j+1}")
+                    sec_desc = character_bible_to_prompt(sec_bible)
+                    secondary_parts.append(f"{sec_name}: {sec_desc}")
+                if secondary_parts:
+                    char_state = char_state + ". Other characters in scene: " + "; ".join(secondary_parts)
+        else:
+            char_state = char_action if char_action else character_desc
+
+        camera_from_script = _extract_scene_prompt_field(scene_prompt_raw, "CAMERA")
+        product_from_script = _extract_scene_prompt_field(scene_prompt_raw, "PRODUCT")
+        location_from_script = _extract_scene_prompt_field(scene_prompt_raw, "LOCATION")
+        if location_from_script and i == 0:
+            scene_anchor = f"SCENE: {location_from_script}"
+
+        # ── 3. 产品在场层（产品圣经特征 + 在场状态）
+        if product_bible:
+            base_product_desc = product_bible_to_prompt(product_bible)
+        else:
+            base_product_desc = product_name
+
+        if product_from_script:
+            product_layer = f"{base_product_desc}, {product_from_script}"
+        elif product_visibility == "prominent":
+            product_layer = f"{base_product_desc}, clearly visible and prominent in frame, centered product hero shot, packaging unobstructed, product details sharp"
+        elif product_visibility == "subtle":
+            product_layer = f"{base_product_desc}, visible in background or partial view"
+        else:
+            product_layer = ""  # absent 时不强制插入产品词
+        ambient_entities = cast_plan.get("ambient_entities", []) if cast_plan else []
+        ambient_layer = ""
+        if ambient_entities:
+            ambient_layer = "background only, not main subject: " + ", ".join(
+                str(item) for item in ambient_entities[:3]
+            )
+
+        # ── 4. 电影风格层（运镜+光影+构图+景深）
+        camera_layer = ""
+        if cinematic_style and cinematic_style != DEFAULT_CINEMATIC_STYLE:
+            elements = build_cinematic_prompt_elements(cinematic_style, narrative)
+            style_info = DEEP_CINEMATIC_STYLES.get(cinematic_style, {})
+            style_name = style_info.get("name_en", "")
+            camera_parts = []
+            if style_name:
+                camera_parts.append(f"{style_name}-style")
+            if elements.get("shot_size"):
+                camera_parts.append(elements["shot_size"])
+            if elements.get("camera_movement"):
+                camera_parts.append(elements["camera_movement"])
+            if elements.get("lighting"):
+                camera_parts.append(elements["lighting"])
+            if elements.get("color_grade"):
+                camera_parts.append(elements["color_grade"])
+            if elements.get("dof"):
+                camera_parts.append(elements["dof"])
+            if camera_parts:
+                camera_layer = ", ".join(camera_parts)
+        else:
+            # 无风格时使用段落默认镜头配置 + Q-Final 轻量级电影感增强
+            # 不加特定导演风格，但加入基础电影质感：浅景深、轻微胶片颗粒、电影级调色
+            from cinematic_language import build_cinematic_prompt_elements as _build
+            elements = _build("", narrative)
+            camera_parts = [
+                v for k, v in elements.items()
+                if k in ("shot_size", "camera_movement", "lighting") and v
+            ]
+            # Q-Final：基础电影质感（不挑风格，通用提升）
+            # 浅景深+柔和散景 = 电影感第一要素
+            camera_parts.append("shallow depth of field, soft bokeh")
+            # 轻微胶片颗粒 = 数字感克星
+            camera_parts.append("subtle film grain texture")
+            # 电影级调色 = 色彩质感提升
+            camera_parts.append("cinematic color grading, natural contrast")
+            if camera_parts:
+                camera_layer = ", ".join(camera_parts)
+        if camera_from_script:
+            camera_layer = f"{camera_from_script}, {camera_layer}" if camera_layer else camera_from_script
+
+        # ── 4b. 节奏驱动视觉参数层（BPM + 情绪强度 → 运镜速度/对比度/饱和度/景深）
+        rhythm_layer = ""
+        if rhythm_curve and i < len(rhythm_curve.segments):
+            try:
+                from cinematic_language import build_rhythm_cinematic_prompt
+                seg_rhythm = rhythm_curve.segments[i]
+                rhythm_visual = build_rhythm_cinematic_prompt(
+                    bpm=seg_rhythm.bpm,
+                    emotion_level=seg_rhythm.emotion_level.value,
+                    narrative_position=i,
+                    total_segments=len(segments),
+                )
+                rhythm_parts = []
+                if rhythm_visual.get("rhythm_phrase"):
+                    rhythm_parts.append(rhythm_visual["rhythm_phrase"])
+                if rhythm_visual.get("lighting_contrast"):
+                    rhythm_parts.append(rhythm_visual["lighting_contrast"])
+                if rhythm_visual.get("color_saturation"):
+                    rhythm_parts.append(rhythm_visual["color_saturation"])
+                if rhythm_parts:
+                    rhythm_layer = ", ".join(rhythm_parts)
+            except Exception:
+                pass
+
+        # ── 5. 组装最终 prompt（前重后轻顺序）
+        parts = [scene_anchor]
+        if char_state and char_state != location:
+            parts.append(char_state)
+        if product_layer:
+            parts.append(product_layer)
+        if ambient_layer:
+            parts.append(ambient_layer)
+        if camera_layer:
+            parts.append(camera_layer)
+        if rhythm_layer:
+            parts.append(rhythm_layer)
+        parts.append("9:16 vertical, high quality, cinematic")
+
+        raw_prompt = ", ".join(p.strip().rstrip(",") for p in parts if p.strip())
+        # 去重
+        raw_prompt = _deduplicate_phrases(raw_prompt)
+        prompts.append(raw_prompt)
+
+    return prompts
+
+
+def _extract_scene_prompt_field(scene_prompt: str, field_name: str) -> str:
+    """从 LLM 场景描述中提取 LOCATION / CHARACTER / CAMERA / PRODUCT 字段。"""
+    if not scene_prompt or not field_name:
+        return ""
+    marker = f"{field_name.upper()}:"
+    upper = scene_prompt.upper()
+    start = upper.find(marker)
+    if start < 0:
+        return ""
+    raw = scene_prompt[start + len(marker):]
+    next_positions = [
+        raw.upper().find(f"{name}:")
+        for name in ("LOCATION", "CHARACTER", "CAMERA", "PRODUCT")
+        if name != field_name.upper()
+    ]
+    next_positions = [p for p in next_positions if p >= 0]
+    end = min(next_positions) if next_positions else len(raw)
+    return raw[:end].strip(" |,;")
+
+
+def _compact_prompt_for_generation(prompt: str, *, max_chars: int = 680) -> str:
+    """最终调用 Kling 前压缩 Prompt，避免低价值泛词挤掉商品/动作信息。"""
+    if len(prompt) <= max_chars:
+        return prompt
+    parts = [p.strip() for p in prompt.split(",") if p.strip()]
+    if not parts:
+        return prompt[:max_chars]
+    low_value = {
+        "high quality",
+        "cinematic",
+        "realistic",
+        "ultra realistic",
+        "professional",
+        "beautiful",
+    }
+    kept: List[str] = []
+    for part in parts:
+        normalized = part.lower()
+        if normalized in low_value and len(", ".join(kept + [part])) > max_chars * 0.75:
+            continue
+        candidate = ", ".join(kept + [part])
+        if len(candidate) <= max_chars:
+            kept.append(part)
+    compacted = ", ".join(kept) if kept else prompt[:max_chars]
+    return compacted[:max_chars].rstrip(" ,")
+
+
+# ============================================================
+# 首帧低成本预检（Keyframe Preflight）
+# ============================================================
+
+# 视频 Prompt 中的运镜词汇，在图片生成中无意义且可能干扰构图
+_CAMERA_MOVEMENT_TERMS = {
+    "dolly zoom", "push in", "pull back", "pull out", "slow push", "slow pull",
+    "orbit", "orbiting", "pan", "panning", "track", "tracking", "tilt",
+    "crane up", "crane down", "zoom in", "zoom out", "static shot",
+    "steady cam", "steadycam", "handheld", "gimbal", "drone shot",
+    "Hitchcock dolly zoom", "Kubrick one-point perspective",
+}
+
+
+def _sanitize_prompt_for_image_generation(prompt: str) -> str:
+    """把视频 Prompt 清洗为适合图片生成的静态 Prompt，去掉运镜词汇保留内容描述。"""
+    parts = [p.strip() for p in prompt.split(",") if p.strip()]
+    cleaned: List[str] = []
+    for part in parts:
+        lowered = part.lower()
+        # 去掉显式运镜短语（整段匹配）
+        if any(term in lowered for term in _CAMERA_MOVEMENT_TERMS):
+            continue
+        # 去掉 <<<image_N>>> 标签（图片生成不需要文本绑定标签）
+        if "<<<image_" in part:
+            continue
+        cleaned.append(part)
+    return ", ".join(cleaned) if cleaned else prompt
+
+
+def _preflight_keyframe_check(
+    *,
+    client,
+    prompt: str,
+    ref_images: list,
+    narrative: str,
+    product_image_path: Optional[Path],
+    main_char_path: Optional[Path],
+    save_path: Path,
+    aspect_ratio: str = "9:16",
+    image_fidelity: float = DEFAULT_IMAGE_FIDELITY,
+) -> Tuple[bool, List[str], Optional[Path]]:
+    """
+    首帧低成本预检：在付费视频生成前，用图片生成做干跑验证角色/商品一致性。
+
+    Returns:
+        (passed, issues, keyframe_path)
+        passed: 是否通过预检
+        issues: 未通过时的具体原因列表
+        keyframe_path: 生成的首帧图片路径（通过时），失败时 None
+    """
+    issues: List[str] = []
+
+    # 没有参考图时，首帧预检无法验证一致性，直接跳过
+    has_product_ref = product_image_path and product_image_path.exists()
+    has_char_ref = main_char_path and main_char_path.exists()
+    if not has_product_ref and not has_char_ref:
+        return True, [], None
+
+    # 选择最关键的参考图传入图片生成
+    # 优先按 narrative 决定：product-required 先验商品，其余先验角色
+    ref_image_b64: Optional[str] = None
+    ref_type: Optional[str] = None
+    product_required = _is_product_required_narrative(narrative)
+    if product_required and has_product_ref:
+        ref_image_b64 = base64.b64encode(product_image_path.read_bytes()).decode("utf-8")
+        ref_type = "subject"
+    elif has_char_ref:
+        ref_image_b64 = base64.b64encode(main_char_path.read_bytes()).decode("utf-8")
+        ref_type = "face"
+    elif has_product_ref:
+        ref_image_b64 = base64.b64encode(product_image_path.read_bytes()).decode("utf-8")
+        ref_type = "subject"
+
+    # 清洗 Prompt 为静态图片版本
+    image_prompt = _sanitize_prompt_for_image_generation(prompt)
+    if not image_prompt:
+        image_prompt = prompt
+
+    try:
+        result = client.generate_image(
+            prompt=image_prompt,
+            negative_prompt=NEGATIVE_PROMPT,
+            reference_image=ref_image_b64,
+            image_reference=ref_type,
+            image_fidelity=image_fidelity,
+            aspect_ratio=aspect_ratio,
+            resolution="1k",  # 首帧预检用 1k 足够，进一步降低成本
+            n=1,
+            wait=True,
+            timeout=90,
+        )
+        images = result.get("data", {}).get("task_result", {}).get("images", [])
+        if not images:
+            issues.append("首帧预检图片生成结果为空")
+            return False, issues, None
+        image_url = images[0].get("url")
+        if not image_url:
+            issues.append("首帧预检未获取图片 URL")
+            return False, issues, None
+
+        img_response = client.session.get(image_url, timeout=30)
+        img_response.raise_for_status()
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        save_path.write_bytes(img_response.content)
+
+        # 验证下载的是合法图片
+        try:
+            from PIL import Image as _PILImage
+            import io as _io
+            _PILImage.open(_io.BytesIO(img_response.content)).verify()
+        except Exception as verify_err:
+            issues.append(f"首帧预检下载内容不是有效图片：{verify_err}")
+            return False, issues, None
+    except Exception as e:
+        issues.append(f"首帧预检图片生成失败：{e}")
+        return False, issues, None
+
+    # ── 轻量质检：与参考图比对 ──
+    from quality_checker import _product_similarity, _character_similarity
+
+    warnings: List[str] = []
+
+    if product_required and has_product_ref:
+        sim = _product_similarity(product_image_path, [save_path])
+        if sim < 0.45:
+            issues.append(f"商品首帧一致性不足（相似度 {sim:.2f} < 0.45），参考图约束可能未生效")
+        elif sim < 0.60:
+            warnings.append(f"商品首帧一致性较弱（相似度 {sim:.2f}），建议检查参考图质量")
+
+    if has_char_ref and (not product_required or narrative in {"hook", "turning", "result", "review"}):
+        sim = _character_similarity(main_char_path, [save_path])
+        if sim < 0.40:
+            issues.append(f"角色首帧一致性不足（相似度 {sim:.2f} < 0.40），参考图约束可能未生效")
+        elif sim < 0.55:
+            warnings.append(f"角色首帧一致性较弱（相似度 {sim:.2f}），建议检查参考图质量")
+
+    if issues:
+        return False, issues + warnings, save_path
+    return True, warnings, save_path
+
+
+def _preflight_generation_contract(
+    *,
+    product_info: dict,
+    ad_script: dict,
+    clip_prompts: List[str],
+    product_image_path: Optional[Path],
+    char_refs: list,
+    strict_mode: bool,
+) -> List[str]:
+    """生成前合同预检：把低成本可发现的问题拦在付费视频生成前。"""
+    issues: List[str] = []
+    warnings: List[str] = []
+    product_name = str(product_info.get("name", "") or "").strip()
+    segments = ad_script.get("segments", []) if isinstance(ad_script, dict) else []
+
+    if not clip_prompts:
+        issues.append("没有可生成的分镜 Prompt")
+
+    if product_name:
+        required_indices = []
+        for i, seg in enumerate(segments[:len(clip_prompts)], 1):
+            narrative = str(seg.get("narrative") or seg.get("type") or "").lower().strip()
+            visibility = str(seg.get("product_visibility") or "").lower().strip()
+            if _is_product_required_narrative(narrative) or visibility in {"prominent", "subtle"}:
+                required_indices.append(i)
+        for i in required_indices:
+            prompt = clip_prompts[i - 1] if i - 1 < len(clip_prompts) else ""
+            if product_name.lower() not in prompt.lower():
+                issues.append(f"分镜 {i} 需要产品露出，但 Prompt 未包含产品名：{product_name}")
+    else:
+        issues.append("缺少产品名，无法稳定约束商品一致性")
+
+    if any(
+        _is_product_required_narrative(str((seg.get("narrative") or seg.get("type") or "")).lower())
+        for seg in segments[:len(clip_prompts)]
+    ) and not product_image_path:
+        warnings.append("存在产品强制露出分镜，但未提供商品参考图，商品一致性只能依赖文字 Prompt")
+
+    if not char_refs:
+        warnings.append("没有角色参考图，人物一致性只能依赖文字 Prompt")
+
+    for i, prompt in enumerate(clip_prompts, 1):
+        if len(prompt) > 900:
+            warnings.append(f"分镜 {i} Prompt 过长（{len(prompt)} 字符），将压缩后再调用 Kling")
+        if prompt.count("<<<image_") > MAX_REF_IMAGES:
+            issues.append(f"分镜 {i} 引用了超过 {MAX_REF_IMAGES} 张参考图")
+
+    if issues and strict_mode:
+        raise RuntimeError("生成前合同预检未通过：" + "；".join(issues))
+
+    for msg in issues:
+        print(f"❌ 生成前合同问题：{msg}")
+    for msg in warnings:
+        print(f"⚠️ 生成前合同提示：{msg}")
+    if not issues:
+        print("✅ 生成前合同预检通过：分镜、产品、角色约束可进入视频生成")
+    return issues + warnings
+
+
+def _reference_strategy_for_narrative(
+    narrative: str,
+    *,
+    product_available: bool,
+    character_available: bool,
+    continuity_available: bool,
+    multi_character: bool = False,
+    multi_angle_char: bool = False,
+) -> List[str]:
+    """
+    按叙事任务选择最优参考图组合（性价比策略：用满5张换视频一次成功）。
+
+    组合逻辑（MAX_REF_IMAGES=5）：
+    - 人物驱动场景(hook/turning/result)：主角正面+全身(2) + 次角色(1) + 连续帧(1) + 产品(1,如有)
+    - 产品驱动场景(showcase/cta/demo)：产品(1) + 主角正面+全身(2) + 连续帧(1) + 场景锚点(1)
+    """
+    normalized = (narrative or "").lower().strip()
+    product_required = _is_product_required_narrative(normalized)
+    roles: List[str] = []
+
+    if product_required and product_available:
+        roles.append("product")
+        if character_available:
+            roles.append("character_primary")
+            if multi_angle_char:
+                roles.append("character_angle")
+        if continuity_available:
+            roles.append("continuity")
+        if multi_character and character_available:
+            roles.append("character_secondary")
+    else:
+        if character_available:
+            roles.append("character_primary")
+            if multi_angle_char:
+                roles.append("character_angle")
+            if multi_character:
+                roles.append("character_secondary")
+        if continuity_available:
+            roles.append("continuity")
+        if product_available and normalized in {"turning", "solution", "result"}:
+            roles.append("product")
+
+    return roles[:MAX_REF_IMAGES]
 
 
 def apply_cinematic_style(base_prompt: str, style_key: str, clip_type: str, narrative: str = "hook") -> str:
@@ -1513,22 +3676,177 @@ def _deduplicate_phrases(text: str) -> str:
     return ", ".join(result)
 
 
+def _prompt_quality_gate(
+    prompt: str,
+    narrative: str,
+    product_name: str,
+    segment_index: int,
+    max_chars: int = 550,
+) -> str:
+    """Prompt 质量前置门禁（改动5）
+
+    在 prompt 发送给可灵 API 之前执行三道检查：
+    1. 去除重复短语（复用 _deduplicate_phrases）
+    2. 长度超限时截断（保留前 max_chars 个字符，在逗号边界截断）
+    3. showcase/result 段必须包含产品名，否则在开头补充
+
+    Args:
+        prompt: 原始 prompt
+        narrative: 叙事段名称（hook/showcase/result 等）
+        product_name: 产品名称
+        segment_index: 片段序号（用于日志）
+        max_chars: prompt 最大字符数（默认 550）
+
+    Returns:
+        处理后的 prompt
+    """
+    # 1. 去重
+    cleaned = _deduplicate_phrases(prompt)
+
+    # 2. 长度截断（在逗号边界截断，避免截断在词中间）
+    if len(cleaned) > max_chars:
+        truncated = cleaned[:max_chars]
+        # 找最后一个逗号边界
+        last_comma = truncated.rfind(",")
+        if last_comma > max_chars // 2:
+            truncated = truncated[:last_comma]
+        cleaned = truncated.strip().rstrip(",")
+        print(f"  ⚠️  [P-Gate] 片段 {segment_index} prompt 超长，已截断至 {len(cleaned)} 字符")
+
+    # 3. 必要词检查：展示/结果段必须含产品名
+    _product_mandatory = {"showcase", "result", "cta"}
+    if (
+        narrative in _product_mandatory
+        and product_name
+        and product_name.lower() not in cleaned.lower()
+    ):
+        cleaned = f"{product_name}, {cleaned}"
+        print(f"  📌 [P-Gate] 片段 {segment_index}({narrative}) 已补充产品名 '{product_name}' 至 prompt 开头")
+
+    print(f"  🔍 [P-Gate] 片段 {segment_index}({narrative}) prompt（{len(cleaned)}字）: {cleaned[:120]}{'...' if len(cleaned) > 120 else ''}")
+    return cleaned
+
+
+# 改动4 ────────────────────────────────────────────────────────────────────────
+# 转场类型映射：按导演风格选择最匹配的转场
+_STYLE_TRANSITION_MAP: dict[str, str] = {
+    "hitchcock": "dissolve",       # 叠化——心理悬疑感
+    "kubrick": "cut",              # 硬切——仪式感精准
+    "spielberg": "push",           # 推进——情感建立
+    "wong-kar-wai": "dissolve",    # 叠化——梦幻时间感
+    "anderson": "whip_pan",        # 甩镜——韦斯·安德森标志
+    "nolan": "cut",                # 硬切——张力
+    "scorsese": "cut",             # 硬切——街头叙事节奏
+    "denis-villeneuve": "dissolve",# 叠化——诗意缓慢
+    "koreeda": "dissolve",         # 叠化——日常诗意
+    "tarantino": "cut",            # 硬切——类型拼贴
+}
+
+# 音效包映射：按产品类型匹配对应音效风格
+_PRODUCT_SFX_MAP: dict[str, str] = {
+    # 英文 key（通用/外部输入兼容）
+    "food": "refreshing",
+    "beverage": "refreshing",
+    "beauty": "soft",
+    "skincare": "soft",
+    "tech": "tech",
+    "electronics": "tech",
+    "fitness": "energetic",
+    "fashion": "soft",
+    "home": "neutral",
+    "default": "neutral",
+    # 中文 key（覆盖 config.py PRODUCT_PRESETS 所有 key）
+    "食品": "refreshing",
+    "饮料": "refreshing",
+    "美妆": "soft",
+    "小红书美妆": "soft",
+    "个护": "soft",
+    "数码": "tech",
+    "科技": "tech",
+    "健身": "energetic",
+    "服装": "soft",
+    "服饰": "soft",
+    "家居": "neutral",
+    "房产": "neutral",
+    "医疗": "soft",
+    "教育": "neutral",
+}
+
+
+def auto_match_av_style(product_info: dict, cinematic_style: str) -> dict:
+    """主题自动匹配 AV 风格（改动4）
+
+    根据导演风格和产品类型，自动推断最适合的：
+    - BGM 关键词（从 DEEP_CINEMATIC_STYLES 读取，比固定列表更精准）
+    - 转场类型（按风格映射）
+    - 音效包（按产品类型映射）
+
+    Args:
+        product_info: 产品信息字典
+        cinematic_style: 导演风格 key
+
+    Returns:
+        {
+            "bgm_keywords": [...],
+            "transition_type": "dissolve|cut|push|whip_pan",
+            "sfx_pack": "refreshing|soft|tech|energetic|neutral",
+            "mood": "..."
+        }
+    """
+    product_type = (product_info.get("type") or "default").lower()
+
+    # BGM 关键词：优先从导演风格库读取
+    style_data = DEEP_CINEMATIC_STYLES.get(cinematic_style, {})
+    bgm_keywords = style_data.get("bgm_keywords", [])
+    mood = style_data.get("mood", "")
+
+    # 若无风格或无 bgm_keywords，按产品类型兜底
+    if not bgm_keywords:
+        _type_bgm_fallback = {
+            "food": ["refreshing", "upbeat", "cheerful"],
+            "beverage": ["refreshing", "energetic"],
+            "beauty": ["soft", "elegant", "feminine"],
+            "skincare": ["calm", "natural", "gentle"],
+            "tech": ["electronic", "modern", "dynamic"],
+            "fitness": ["energetic", "motivational", "powerful"],
+            "default": ["cinematic", "upbeat"],
+        }
+        bgm_keywords = _type_bgm_fallback.get(product_type, _type_bgm_fallback["default"])
+
+    transition_type = _STYLE_TRANSITION_MAP.get(cinematic_style, "dissolve")
+    sfx_pack = _PRODUCT_SFX_MAP.get(product_type, _PRODUCT_SFX_MAP["default"])
+
+    return {
+        "bgm_keywords": bgm_keywords,
+        "transition_type": transition_type,
+        "sfx_pack": sfx_pack,
+        "mood": mood,
+    }
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def generate_clip_prompts(
     product_info: dict,
     cinematic_style: str = DEFAULT_CINEMATIC_STYLE,
     clip_structure: Optional[list] = None,
     characters: Optional[list] = None,
     hook_type: str = DEFAULT_HOOK_TYPE,
+    character_bibles: Optional[List[CharacterBible]] = None,
+    product_bible: Optional[ProductBible] = None,
+    music_contract: Optional[dict] = None,
 ) -> list:
     """
-    生成分镜片段的 Prompts
+    生成分镜片段的 Prompts。支持角色圣经、商品圣经和音乐合同注入。
 
     Args:
         product_info: 产品信息字典
         cinematic_style: 电影风格键值
         clip_structure: 分镜结构配置列表（可选，默认使用 config.CLIP_STRUCTURE）
-        characters: 角色名称列表（用于 prompt 中固定指代角色）
+        characters: 角色名称列表（旧版兼容）
         hook_type: 钩子类型（用于替换第一个分镜的 prompt）
+        character_bibles: 角色圣经列表（优先使用，解决多角色模糊描述）
+        product_bible: 商品圣经（优先使用，统一商品外观描述）
+        music_contract: 音乐合同（在 prompt 中注入节奏描述，让画面与音乐对齐）
 
     Returns:
         prompt 字符串列表
@@ -1554,16 +3872,29 @@ def generate_clip_prompts(
         brand=brand, primary_color=primary_color
     )
 
-    # 多角色描述注入
-    char_names = characters if characters else ["Character A"]
-    if len(char_names) == 1:
-        character_descriptions = f"{character}, {character_consistency}"
+    # ── 角色描述：优先使用圣经，解决多角色模糊指代问题 ──
+    if character_bibles:
+        if len(character_bibles) == 1:
+            character_descriptions = f"{character_bible_to_prompt(character_bibles[0])}, {character_consistency}"
+        else:
+            char_desc_parts = []
+            for bible in character_bibles:
+                char_desc_parts.append(f"{bible['name']}: {character_bible_to_prompt(bible)}")
+            character_descriptions = ", ".join(char_desc_parts) + f", {character_consistency}"
     else:
-        # 多角色：为每个角色生成固定描述
-        char_desc_parts = []
-        for i, cname in enumerate(char_names, 1):
-            char_desc_parts.append(f"{cname}: consistent appearance, same person from reference image")
-        character_descriptions = ", ".join(char_desc_parts) + f", {character_consistency}"
+        # 回退到旧版逻辑
+        char_names = characters if characters else ["Character A"]
+        if len(char_names) == 1:
+            character_descriptions = f"{character}, {character_consistency}"
+        else:
+            char_desc_parts = []
+            for i, cname in enumerate(char_names, 1):
+                char_desc_parts.append(f"{cname}: consistent appearance, same person from reference image")
+            character_descriptions = ", ".join(char_desc_parts) + f", {character_consistency}"
+
+    # ── 商品描述：优先使用圣经 ──
+    if product_bible:
+        product_consistency = product_bible_to_prompt(product_bible)
 
     # 占位符替换上下文
     fmt_context = {
@@ -1599,7 +3930,6 @@ def generate_clip_prompts(
             "camera": hook_camera,
         }
 
-
     clips = []
     for clip_def in structure:
         base_prompt = clip_def["base_prompt"].format(**fmt_context)
@@ -1613,6 +3943,16 @@ def generate_clip_prompts(
             "static": "static",
         }.get(camera_type, "push")
         final_prompt = apply_cinematic_style(base_prompt, cinematic_style, clip_type, narrative)
+
+        # ── 音乐合同节奏注入：让画面运动与音乐 BPM/情绪对齐 ──
+        if music_contract:
+            rhythm_tag = (
+                f"{music_contract['mood']} {music_contract['genre']} energy, "
+                f"{music_contract['bpm_min']}-{music_contract['bpm_max']} BPM rhythm"
+            )
+            # 插入到 prompt 开头，利用扩散模型前重后轻的注意力机制
+            final_prompt = f"{rhythm_tag}, {final_prompt}"
+
         clips.append(final_prompt)
 
     return clips
@@ -1744,12 +4084,13 @@ def parse_args():
     parser.add_argument(
         "--output-name",
         default=None,
-        help="指定输出名前缀；配合 --resume 可复用已生成片段",
+        help="指定输出名前缀；默认会复用同名生成资产",
     )
     parser.add_argument(
         "--resume",
-        action="store_true",
-        help="断点续跑：使用稳定输出名并复用已生成的角色图/片段候选",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="断点续跑：使用稳定输出名并复用已生成的角色图/片段候选（默认开启，可用 --no-resume 关闭）",
     )
     parser.add_argument(
         "--list-styles",
@@ -1888,8 +4229,8 @@ def parse_args():
     parser.add_argument(
         "--best-of",
         type=int,
-        default=2,
-        help="每个分镜生成候选数量（best-of），自动择优（默认 2）",
+        default=1,
+        help="每个分镜最多生成候选数量（自适应 best-of），默认 1；只有首条不达标才补候选",
     )
     parser.add_argument(
         "--quality-frames",
@@ -1942,6 +4283,30 @@ def parse_args():
         help="启用可灵多镜头模式（intelligence 分镜），提升场景连贯性",
     )
     parser.add_argument(
+        "--preflight-keyframe",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="首帧预检：视频生成前先用低成本图片生成验证参考图一致性（默认开启，可用 --no-preflight-keyframe 关闭）",
+    )
+    parser.add_argument(
+        "--image-first",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="图片先行：关键片段先多生图择优，再进入视频生成（默认开启，可用 --no-image-first 关闭）",
+    )
+    parser.add_argument(
+        "--image-first-mode",
+        choices=["minimal", "standard", "full"],
+        default="standard",
+        help="图片先行范围：minimal 只验最关键段，standard 验关键段，full 验所有段（默认 standard）",
+    )
+    parser.add_argument(
+        "--image-first-variants",
+        type=int,
+        default=2,
+        help="图片先行每个关键片段生成的候选图数量（默认 2）",
+    )
+    parser.add_argument(
         "--manual",
         action="store_true",
         help="手动模式：逐字段填写产品信息（默认为主题模式，输入一句话自动展开）",
@@ -1973,7 +4338,7 @@ def save_template(product_info: dict, args: argparse.Namespace, output_path: Pat
             "preview": getattr(args, "preview", False),
             "parallel": not getattr(args, "serial", False),
             "min_clips": getattr(args, "min_clips", 3),
-            "best_of": getattr(args, "best_of", 2),
+            "best_of": getattr(args, "best_of", 1),
             "quality_frames": getattr(args, "quality_frames", 12),
             "keep_candidates": getattr(args, "keep_candidates", False),
             "max_workers": getattr(args, "max_workers", 4),
@@ -1981,11 +4346,15 @@ def save_template(product_info: dict, args: argparse.Namespace, output_path: Pat
             "brand_intro_outro": getattr(args, "brand_intro_outro", False),
             "kling_model": getattr(args, "kling_model", None),
             "multi_shot": getattr(args, "multi_shot", False),
+            "preflight_keyframe": getattr(args, "preflight_keyframe", True),
+            "image_first": getattr(args, "image_first", True),
+            "image_first_mode": getattr(args, "image_first_mode", "standard"),
+            "image_first_variants": getattr(args, "image_first_variants", 2),
             "strict_mode": getattr(args, "strict", True),
             "force": getattr(args, "force", False),
             "no_llm": getattr(args, "no_llm", False),
             "output_name": getattr(args, "output_name", None),
-            "resume": getattr(args, "resume", False),
+            "resume": getattr(args, "resume", True),
         },
         "created_at": datetime.now().isoformat(),
     }
@@ -2024,7 +4393,7 @@ def load_template(template_path: Path) -> tuple:
     args_dict.setdefault("preview", False)
     args_dict.setdefault("parallel", True)
     args_dict.setdefault("min_clips", 3)
-    args_dict.setdefault("best_of", 2)
+    args_dict.setdefault("best_of", 1)
     args_dict.setdefault("quality_frames", 12)
     args_dict.setdefault("keep_candidates", False)
     args_dict.setdefault("max_workers", 4)
@@ -2032,13 +4401,143 @@ def load_template(template_path: Path) -> tuple:
     args_dict.setdefault("brand_intro_outro", False)
     args_dict.setdefault("kling_model", None)
     args_dict.setdefault("multi_shot", False)
+    args_dict.setdefault("preflight_keyframe", True)
+    args_dict.setdefault("image_first", True)
+    args_dict.setdefault("image_first_mode", "standard")
+    args_dict.setdefault("image_first_variants", 2)
     args_dict.setdefault("strict_mode", True)
     args_dict.setdefault("force", False)
     args_dict.setdefault("no_llm", False)
     args_dict.setdefault("output_name", None)
-    args_dict.setdefault("resume", False)
+    args_dict.setdefault("resume", True)
 
     return product_info, args_dict
+
+
+class MusicContract(TypedDict):
+    """音乐合同：脚本阶段确定的音乐策略约束"""
+    bpm_min: int
+    bpm_max: int
+    mood: str        # upbeat, emotional, suspenseful, dreamy, cool, warm, calm
+    genre: str       # electronic, orchestral, pop, lofi, jazz, acoustic
+    energy: str      # high, medium, low
+    recommended_pace: str  # fast, moderate, cinematic
+    intro_type: str  # immediate, buildup, fade_in
+
+
+def build_music_contract(product_info: dict, cinematic_style: str = "none") -> MusicContract:
+    """
+    从产品类型、受众和电影风格构建音乐合同。
+    在脚本阶段就确定音乐策略，让分镜、口播、BGM 三方对齐。
+    """
+    ptype = product_info.get("type", "default")
+    audience = product_info.get("audience", "18-35")
+
+    # ── 基础映射：产品类型 → mood / genre / energy ──
+    _PRODUCT_MUSIC_MAP = {
+        "美妆": {"mood": "upbeat", "genre": "pop", "energy": "high"},
+        "科技": {"mood": "cool", "genre": "electronic", "energy": "medium"},
+        "食品": {"mood": "warm", "genre": "acoustic", "energy": "medium"},
+        "家居": {"mood": "calm", "genre": "lofi", "energy": "low"},
+        "服装": {"mood": "upbeat", "genre": "pop", "energy": "high"},
+        "医疗": {"mood": "calm", "genre": "acoustic", "energy": "low"},
+        "教育": {"mood": "warm", "genre": "acoustic", "energy": "medium"},
+        "房产": {"mood": "grand", "genre": "orchestral", "energy": "medium"},
+    }
+    base = _PRODUCT_MUSIC_MAP.get(ptype, {"mood": "upbeat", "genre": "pop", "energy": "medium"})
+
+    # ── 电影风格叠加 ──
+    _STYLE_MOOD_OVERRIDE = {
+        "hitchcock": {"mood": "suspenseful", "genre": "orchestral", "intro_type": "buildup"},
+        "kubrick": {"mood": "cold", "genre": "orchestral", "intro_type": "fade_in"},
+        "spielberg": {"mood": "emotional", "genre": "orchestral", "intro_type": "buildup"},
+        "miyazaki": {"mood": "dreamy", "genre": "lofi", "intro_type": "fade_in"},
+        "wongkarwai": {"mood": "moody", "genre": "jazz", "intro_type": "fade_in"},
+        "zhangyimou": {"mood": "grand", "genre": "orchestral", "intro_type": "buildup"},
+    }
+    style_override = _STYLE_MOOD_OVERRIDE.get(cinematic_style, {})
+
+    mood = style_override.get("mood", base["mood"])
+    genre = style_override.get("genre", base["genre"])
+    energy = base["energy"]
+    intro_type = style_override.get("intro_type", "immediate")
+
+    # ── 受众年龄 → BPM 范围 ──
+    _AUDIENCE_BPM = {
+        "18-25": (120, 140),
+        "25-35": (100, 120),
+        "35-45": (90, 110),
+        "45+": (80, 100),
+    }
+    bpm_min, bpm_max = _AUDIENCE_BPM.get(audience, (100, 120))
+
+    # energy 影响 pace 和 BPM
+    _ENERGY_PACE = {"high": "fast", "medium": "moderate", "low": "cinematic"}
+    recommended_pace = _ENERGY_PACE.get(energy, "moderate")
+
+    # energy 高时 BPM 上调一档
+    if energy == "high":
+        bpm_min = min(140, bpm_min + 10)
+        bpm_max = min(150, bpm_max + 10)
+    elif energy == "low":
+        bpm_min = max(60, bpm_min - 10)
+        bpm_max = max(80, bpm_max - 10)
+
+    return MusicContract(
+        bpm_min=bpm_min,
+        bpm_max=bpm_max,
+        mood=mood,
+        genre=genre,
+        energy=energy,
+        recommended_pace=recommended_pace,
+        intro_type=intro_type,
+    )
+
+
+def _get_primary_char_for_clip(
+    idx: int, clip_prompt: str, ad_script: dict, character_bibles: list
+) -> int:
+    """
+    按分镜内容检测出场角色，返回 char_refs 中对应角色的索引。
+
+    启发式策略（按优先级）：
+    1. 检查 ad_script segment 的 scene_prompt 中是否出现角色名
+    2. 检查 clip_prompt 中是否出现角色名
+    3. 默认回退主角色（索引 0）
+    """
+    if not character_bibles or len(character_bibles) <= 1:
+        return 0
+
+    seg_i = idx - 1
+    seg_text = ""
+    try:
+        segs = ad_script.get("segments", []) if isinstance(ad_script, dict) else []
+        if 0 <= seg_i < len(segs):
+            seg = segs[seg_i]
+            seg_text = " ".join([
+                seg.get("scene_prompt", ""),
+                seg.get("dialogue", ""),
+                seg.get("caption", ""),
+            ])
+    except Exception:
+        pass
+
+    # 合并检测文本（不区分大小写）
+    haystack = (seg_text + " " + (clip_prompt or "")).lower()
+
+    # 优先匹配非主角色（索引 > 0），如果匹配到则使用该角色
+    for i in range(1, len(character_bibles)):
+        name = character_bibles[i].get("name", "").lower().strip()
+        if name and name in haystack:
+            return i
+
+    # 检查主角色是否被明确提到（如果主角名不在，但其他角色在，上面已返回）
+    primary_name = character_bibles[0].get("name", "").lower().strip()
+    if primary_name and primary_name in haystack:
+        return 0
+
+    # 默认回退主角色
+    return 0
 
 
 def run_generation_pipeline(
@@ -2067,7 +4566,7 @@ def run_generation_pipeline(
     rhythm_style: str = "moderate",
     parallel: bool = True,
     min_clips: int = 3,
-    best_of: int = 2,
+    best_of: int = 1,
     quality_frames: int = 12,
     keep_candidates: bool = False,
     preview: bool = False,
@@ -2076,6 +4575,10 @@ def run_generation_pipeline(
     brand_intro_outro: bool = False,
     kling_model: Optional[str] = None,
     multi_shot: bool = False,
+    preflight_keyframe: bool = True,
+    image_first: bool = True,
+    image_first_mode: str = "standard",
+    image_first_variants: int = 2,
 ) -> dict:
     """
     核心生成流水线（无交互逻辑）
@@ -2141,116 +4644,87 @@ def run_generation_pipeline(
         mode = "std"
     effective_kling_model = kling_model or KLING_VIDEO_MODEL
 
-    # ============================================================
-    # 第一步：生成所有角色定妆照
-    # ============================================================
-    char_refs = []  # List[dict]: {"name": str, "image_path": Path, "img_b64": str}
-
-    # 主角色（从 product_info 提取）
-    main_character = {
-        "name": "Character A",
-        "description": f"{product_info.get('gender', 'person')} ({product_info.get('age', '25')})",
-        "image_path": None,
-    }
-    if characters:
-        main_character = characters[0]
-
-    # 生成主角色定妆照（带重试，失败则抛出——主角色是一致性的基础）
-    char_prompt = generate_character_prompt_for_role(
-        product_info, main_character.get("description", "")
+    cast_plan = build_cast_plan({**product_info, "characters": characters} if characters else product_info)
+    core_characters = cast_plan.get("core_characters", [])
+    product_info["cast_plan"] = cast_plan
+    product_info["characters"] = core_characters
+    product_info["supporting_characters"] = cast_plan.get("supporting_characters", [])
+    product_info["ambient_entities"] = cast_plan.get("ambient_entities", [])
+    print(
+        f"🎭 角色计划：核心 {len(core_characters)}，"
+        f"配角 {len(product_info['supporting_characters'])}，"
+        f"环境实体 {len(product_info['ambient_entities'])}"
     )
-    print(f"主角色定妆照 Prompt: {char_prompt[:100]}...")
+    print(f"    推断依据：{cast_plan.get('rationale', 'n/a')}")
 
-    main_char_path = None
-    if main_character.get("image_path"):
-        main_char_path = Path(main_character["image_path"])
-    else:
-        cached_char_path = char_ref_dir / f"{output_name}_charA_ref.png"
-        char_manifest = _build_character_manifest(
-            product_info=product_info,
-            character=main_character,
-            prompt=char_prompt,
-        )
-        if (
-            cached_char_path.exists()
-            and cached_char_path.stat().st_size > 1024
-            and _manifest_matches(cached_char_path, char_manifest)
-        ):
-            main_char_path = cached_char_path
-            print(f"✅ 主角色定妆照 manifest 缓存命中：{main_char_path.name}")
-        else:
-            max_retries = 3
-            last_error = None
-            for attempt in range(1, max_retries + 1):
-                try:
-                    main_char_path = client.generate_character_ref(
-                        prompt=char_prompt,
-                        save_path=cached_char_path,
-                    )
-                    _write_clip_manifest(main_char_path, char_manifest)
-                    print(f"✅ 主角色定妆照已生成：{main_char_path.name}")
-                    break
-                except Exception as e:
-                    last_error = e
-                    if attempt < max_retries:
-                        wait = 5 * attempt
-                        print(f"⚠️  主角色定妆照第 {attempt} 次尝试失败：{e}")
-                        print(f"   等待 {wait} 秒后重试...")
-                        time.sleep(wait)
-                    else:
-                        print(f"❌ 主角色定妆照生成失败（已重试 {max_retries} 次）：{e}")
-                        raise RuntimeError(f"主角色定妆照生成失败：{e}") from last_error
+    # ============================================================
+    # 第一步：生成所有角色定妆照（多角度，提升视频一致性）
+    # ============================================================
+    char_refs = []  # List[dict]: {"name": str, "image_path": Path, "img_b64": str, "images": [Path, ...], "img_b64_list": [str, ...]}
 
-    if main_char_path and main_char_path.exists():
-        char_refs.append({
-            "name": main_character.get("name", "Character A"),
-            "image_path": main_char_path,
-            "img_b64": base64.b64encode(main_char_path.read_bytes()).decode("utf-8"),
-        })
+    # ── 构建角色圣经和商品圣经（标准化资产描述）──
+    character_bibles = build_character_bibles(product_info, core_characters)
+    product_bible = build_product_bible(product_info)
+    print(f"📖 角色圣经：{len(character_bibles)} 个角色")
+    for bible in character_bibles:
+        print(f"    [{bible['id']}] {bible['name']}: {character_bible_to_prompt(bible)[:60]}...")
+    print(f"📦 商品圣经：{product_bible_to_prompt(product_bible)[:60]}...")
 
-    # 生成额外角色定妆照
-    if characters and len(characters) > 1:
-        for idx, char in enumerate(characters[1:], 2):
-            char_name = char.get("name", f"Character {chr(64 + idx)}")
+    # 生成所有角色多角度定妆照（性价比策略：多花几毛钱买一致性）
+    # 每个核心角色：正面 + 全身（2张）
+    # 虽然每个分镜最多只能绑定 2 个角色的参考图（API 限制），
+    # 但不同分镜出场的角色不同，所有核心角色都需要有参考图备用
+    # Q-Final 修复：用 core_characters（动态分析结果）而非 characters（用户原始传入）
+    # 之前的 bug：用户没传 characters 时，characters=None，导致只生成 1 个默认角色
+    _gen_chars = core_characters if core_characters else []
+    if _gen_chars and len(_gen_chars) > 0:
+        for idx, char in enumerate(_gen_chars):
+            char_name = char.get("name", f"Character {chr(65 + idx)}")
             char_desc = char.get("description", "")
-            char_img_path = char.get("image_path")
+            char_img_path = Path(char["image_path"]) if char.get("image_path") else None
+            char_bible = character_bibles[idx] if idx < len(character_bibles) else None
 
-            char_prompt = generate_character_prompt_for_role(product_info, char_desc)
-            print(f"角色 {char_name} 定妆照 Prompt: {char_prompt[:100]}...")
+            try:
+                char_ref = _generate_multi_angle_character_refs(
+                    client=client,
+                    product_info=product_info,
+                    char_name=char_name,
+                    char_desc=char_desc,
+                    char_bible=char_bible,
+                    char_ref_dir=char_ref_dir,
+                    output_name=output_name,
+                    user_image_path=char_img_path,
+                    angles=["front", "full_body"],
+                )
+                char_refs.append(char_ref)
+            except Exception as e:
+                if idx == 0:
+                    raise
+                print(f"⚠️  角色 {char_name} 参考图生成失败，跳过：{e}")
+    else:
+        # 兼容旧版：没有任何角色时生成一个默认主角色
+        default_char = {
+            "name": "Character A",
+            "description": f"{product_info.get('gender', 'person')} ({product_info.get('age', '25')})",
+        }
+        main_bible = character_bibles[0] if character_bibles else None
+        try:
+            char_ref = _generate_multi_angle_character_refs(
+                client=client,
+                product_info=product_info,
+                char_name=default_char["name"],
+                char_desc=default_char["description"],
+                char_bible=main_bible,
+                char_ref_dir=char_ref_dir,
+                output_name=output_name,
+                angles=["front", "full_body"],
+            )
+            char_refs.append(char_ref)
+        except Exception as e:
+            raise RuntimeError(f"默认角色参考图生成失败：{e}") from e
 
-            char_path = None
-            if char_img_path:
-                char_path = Path(char_img_path)
-            else:
-                max_retries = 3
-                last_error = None
-                for attempt in range(1, max_retries + 1):
-                    try:
-                        char_path = client.generate_character_ref(
-                            prompt=char_prompt,
-                            save_path=char_ref_dir / f"{output_name}_{char_name.replace(' ', '_')}_ref.png",
-                        )
-                        print(f"✅ 角色 {char_name} 定妆照已生成：{char_path.name}")
-                        break
-                    except Exception as e:
-                        last_error = e
-                        if attempt < max_retries:
-                            wait = 5 * attempt
-                            print(f"⚠️  角色 {char_name} 定妆照第 {attempt} 次尝试失败：{e}")
-                            print(f"   等待 {wait} 秒后重试...")
-                            time.sleep(wait)
-                        else:
-                            print(f"❌ 角色 {char_name} 定妆照生成失败（已重试 {max_retries} 次）：{e}")
-                            # 额外角色失败不终止，继续用主角色
-
-            if char_path and char_path.exists():
-                char_refs.append({
-                    "name": char_name,
-                    "image_path": char_path,
-                    "img_b64": base64.b64encode(char_path.read_bytes()).decode("utf-8"),
-                })
-
-    print(f"\n✅ 共加载 {len(char_refs)} 个角色参考图")
+    total_char_images = sum(len(c.get("images", [c["image_path"]])) for c in char_refs)
+    print(f"\n✅ 共加载 {len(char_refs)} 个角色，{total_char_images} 张参考图")
 
     # 读取商品参考图（如果提供）
     product_img_b64 = None
@@ -2274,12 +4748,23 @@ def run_generation_pipeline(
     # 第二步：生成广告脚本 + 分镜片段
     # ============================================================
 
+    # ── 音乐合同：脚本阶段确定音乐策略，让分镜、口播、BGM 三方对齐 ──
+    music_contract = build_music_contract(product_info, cinematic_style=style)
+    print(f"🎵 音乐合同：{music_contract['mood']} {music_contract['genre']}")
+    print(f"    BPM：{music_contract['bpm_min']}-{music_contract['bpm_max']}，energy：{music_contract['energy']}")
+    print(f"    推荐 pace：{music_contract['recommended_pace']}，intro：{music_contract['intro_type']}")
+
     # ── 节奏模板初始化 ──
     # 根据目标总时长 + 节奏风格选择最合适的节奏模板
     # 若 target_duration 未指定，用 duration × 5（默认5段）估算总时长
     _est_total = target_duration if target_duration is not None else duration * 5
+    # 若用户未显式指定 rhythm_style（默认 moderate），用音乐合同的推荐 pace
+    _effective_rhythm_style = rhythm_style
+    if rhythm_style == "moderate" and music_contract["recommended_pace"] != "moderate":
+        _effective_rhythm_style = music_contract["recommended_pace"]
+        print(f"    节奏风格由 moderate 自动调整为 {_effective_rhythm_style}（音乐合同推荐）")
     rhythm_template = get_rhythm_template(
-        _est_total, style=rhythm_style, product_type=product_info.get("type", "default")
+        _est_total, style=_effective_rhythm_style, product_type=product_info.get("type", "default")
     )
     _rhythm_name = rhythm_template["name"]
     _rhythm_transition = rhythm_template["transition_duration"]
@@ -2328,12 +4813,36 @@ def run_generation_pipeline(
     _num_segs = len(rhythm_template["segments"])
     if preview:
         _num_segs = 1  # 预览模式只生成 1 段
+    cast_prompt = _format_cast_plan_for_prompt(cast_plan)
+    if cast_prompt:
+        existing_extra = product_info.get("extra_requirements", "")
+        product_info["extra_requirements"] = (
+            f"{existing_extra}\n"
+            f"CAST PLAN: {cast_prompt}\n"
+            "Use only the core and supporting cast above. "
+            "Do not invent additional named characters. "
+            "Ambient entities may appear only as background detail."
+        ).strip()
     ad_script = generate_ad_script(
         product_info,
         style=script_style,
         hook_type=hook_type,
         num_segments=_num_segs,
     )
+    # 将音乐合同注入 story_world，供 build_story_driven_prompts 使用
+    if isinstance(ad_script, dict):
+        _sw = ad_script.setdefault("story_world", {})
+        if isinstance(_sw, dict):
+            _sw["cast_plan"] = cast_plan
+            if cast_prompt:
+                _sw["character"] = cast_prompt
+            _sw["music"] = {
+                "mood": music_contract["mood"],
+                "genre": music_contract["genre"],
+                "energy": music_contract["energy"],
+                "bpm_range": f"{music_contract['bpm_min']}-{music_contract['bpm_max']}",
+                "intro_type": music_contract["intro_type"],
+            }
     print(f"📝 广告脚本风格：{SCRIPT_STYLES.get(script_style, {}).get('name', script_style)}")
     print(f"    视频标题：{ad_script['title']}")
     print(f"    话题标签：{' '.join(ad_script['hashtags'])}")
@@ -2362,39 +4871,177 @@ def run_generation_pipeline(
     else:
         print("✅ 广告合规检测通过")
 
+    # ── 节奏曲线分析：基于脚本段落情绪 + 音乐合同 BPM 生成逐段节奏参数 ──
+    rhythm_curve = None
+    try:
+        from rhythm_controller import RhythmController
+        _rc = RhythmController()
+        _segments_for_rhythm = ad_script.get("segments", []) if isinstance(ad_script, dict) else []
+        if _segments_for_rhythm:
+            rhythm_curve = _rc.analyze_script_rhythm(
+                segments=_segments_for_rhythm,
+                product_category=product_info.get("type", "default"),
+            )
+            print(f"🎼 节奏曲线分析完成：整体 BPM {rhythm_curve.overall_bpm}，共 {len(rhythm_curve.segments)} 段")
+            for _rs in rhythm_curve.segments[:6]:
+                print(f"    [{_rs.segment_index + 1}] {_rs.narrative_type:<12s}  BPM:{_rs.bpm:>3d}  强度:{_rs.emotion_level.value:<9s}  {_rs.duration:.1f}s")
+    except Exception as _rhythm_err:
+        print(f"⚠️  节奏曲线分析跳过：{_rhythm_err}")
+
+    # ── 故事板预可视化验证：生成分镜结构并校验质量 ──
+    storyboard = None
+    try:
+        from storyboard_generator import StoryboardGenerator
+        _sb_gen = StoryboardGenerator()
+        _sb_segments = ad_script.get("segments", []) if isinstance(ad_script, dict) else []
+        if _sb_segments:
+            _char_roles_for_sb = []
+            if character_bibles:
+                from character_analyzer import CharacterRole, CharacterType
+                for i, cb in enumerate(character_bibles):
+                    _ctype = CharacterType.PROTAGONIST if i == 0 else CharacterType.SUPPORTING
+                    _char_roles_for_sb.append(CharacterRole(
+                        role_id=cb.get("id", f"char_{i+1:02d}"),
+                        name=cb.get("name", f"角色{i+1}"),
+                        character_type=_ctype,
+                        description=cb.get("outfit", "") or cb.get("appearance", ""),
+                        gender=cb.get("gender", "person"),
+                        age_range=cb.get("age", "adult"),
+                        relationship_to_protagonist="self" if i == 0 else "supporting",
+                        appearance_requirements=cb.get("appearance", "") or character_bible_to_prompt(cb),
+                        consistency_level=0.9 if i == 0 else 0.7,
+                    ))
+            _prod_bible_for_sb = product_bible if product_bible else {}
+            storyboard = _sb_gen.generate_from_script(
+                ad_script=ad_script,
+                character_roles=_char_roles_for_sb if _char_roles_for_sb else None,
+                product_bible=_prod_bible_for_sb,
+                style=style if style != DEFAULT_CINEMATIC_STYLE else "cinematic",
+                character_bibles=character_bibles,
+            )
+            if storyboard and storyboard.shots:
+                _sb_issues = _validate_storyboard_quality(storyboard, product_info)
+                if _sb_issues:
+                    print(f"📋 故事板质量预警（{len(_sb_issues)} 项）：")
+                    for _sbi in _sb_issues[:5]:
+                        print(f"    ⚠️  {_sbi}")
+                else:
+                    print(f"📋 故事板预验证通过：{len(storyboard.shots)} 个分镜，总时长 {storyboard.total_duration:.1f}s")
+    except Exception as _sb_err:
+        print(f"⚠️  故事板预验证跳过：{_sb_err}")
+
     # 从脚本生成分镜 Prompts
-    # 修复：使用 generate_clip_prompts() 而非 script_to_clip_prompts()
-    # generate_clip_prompts 通过 apply_cinematic_style() 将 --style 参数（如 hitchcock/kubrick）
-    # 注入到每个 prompt 的运镜描述，script_to_clip_prompts 只用写死的通用 scene_prompt
-    # 两套系统合并：以电影风格 prompt 为主，追加 ad_script 中的产品场景描述作为补充
-    styled_prompts = generate_clip_prompts(
-        product_info,
-        cinematic_style=style,
-        characters=[c["name"] for c in char_refs] if char_refs else None,
-        hook_type=hook_type,
+    # 改动2：优先使用故事驱动 prompt 组装（build_story_driven_prompts）
+    # 当 LLM 生成了 story_world 时，以故事世界为主干、电影风格为修饰层组装 prompt，
+    # 保证5段场景锚定在同一时空，产品可见度精准控制。
+    # 回退条件：模板模式生成（ad_script.generated_by != "llm"）时使用旧逻辑。
+    _use_story_driven = (
+        isinstance(ad_script, dict)
+        and ad_script.get("generated_by") == "llm"
+        and bool(ad_script.get("story_world"))
     )
 
-    # 将 ad_script 的 scene_prompt 中的产品细节追加到对应片段（取最短列表长度）
-    script_scenes = [seg.get("scene_prompt", "") for seg in ad_script.get("segments", [])]
-    clip_prompts = []
-    for i, styled in enumerate(styled_prompts):
-        scene_detail = script_scenes[i] if i < len(script_scenes) else ""
-        if scene_detail:
-            # 去掉 scene_prompt 末尾的宽高比描述（styled_prompt 已包含）
-            scene_detail = scene_detail.replace(", 9:16 vertical", "").replace("9:16 vertical", "").strip().rstrip(",")
-            clip_prompts.append(f"{styled}, {scene_detail}")
-        else:
-            clip_prompts.append(styled)
+    if _use_story_driven:
+        clip_prompts = build_story_driven_prompts(
+            ad_script=ad_script,
+            product_info=product_info,
+            cinematic_style=style,
+            char_refs=char_refs,
+            hook_type=hook_type,
+            character_bibles=character_bibles,
+            product_bible=product_bible,
+            music_contract=music_contract,
+            rhythm_curve=rhythm_curve,
+        )
+        # 长度对齐：若 LLM 段数与节奏模板段数不一致，截断或补充
+        _num_expected = len(rhythm_template["segments"])
+        if len(clip_prompts) < _num_expected:
+            # 补充：复用最后一段
+            while len(clip_prompts) < _num_expected:
+                clip_prompts.append(clip_prompts[-1] if clip_prompts else "product display, natural lighting, 9:16 vertical, high quality, cinematic")
+        elif len(clip_prompts) > _num_expected:
+            clip_prompts = clip_prompts[:_num_expected]
+        print(f"📖 故事驱动 Prompt 已生成（{len(clip_prompts)} 段，基于 story_world: {ad_script['story_world'].get('location', '')[:40]}...）")
+    else:
+        # 旧逻辑回退（模板模式）
+        styled_prompts = generate_clip_prompts(
+            product_info,
+            cinematic_style=style,
+            characters=[c["name"] for c in char_refs] if char_refs else None,
+            hook_type=hook_type,
+            character_bibles=character_bibles,
+            product_bible=product_bible,
+            music_contract=music_contract,
+        )
+        script_scenes = [seg.get("scene_prompt", "") for seg in ad_script.get("segments", [])]
+        clip_prompts = []
+        for i, styled in enumerate(styled_prompts):
+            scene_detail = script_scenes[i] if i < len(script_scenes) else ""
+            if scene_detail:
+                scene_detail = scene_detail.replace(", 9:16 vertical", "").replace("9:16 vertical", "").strip().rstrip(",")
+                clip_prompts.append(f"{styled}, {scene_detail}")
+            else:
+                clip_prompts.append(styled)
 
     if style != DEFAULT_CINEMATIC_STYLE:
         style_name = CINEMATIC_STYLES.get(style, {}).get("name", style)
         print(f"🎬 电影风格注入：{style_name}（影响 {len(clip_prompts)} 个片段的运镜与光影）")
+
+    # ── 故事板验证驱动的 Prompt 增强（把预警转化为实际改进）──
+    if storyboard and storyboard.shots:
+        _sb_issues = _validate_storyboard_quality(storyboard, product_info)
+        if _sb_issues:
+            _enhanced_count = 0
+            _product_name = product_info.get("name", "")
+            for i in range(min(len(clip_prompts), len(ad_script.get("segments", [])))):
+                seg = ad_script["segments"][i]
+                narrative = str(seg.get("narrative", "")).lower()
+                _original = clip_prompts[i]
+
+                # 产品露出不足 → showcase/demo/cta 段加强产品描述
+                _low_product = any("产品露出" in iss and "不足" in iss for iss in _sb_issues)
+                if _low_product and _is_product_required_narrative(narrative):
+                    if _product_name and _product_name.lower() not in _original.lower():
+                        clip_prompts[i] = _original.rstrip(" ,") + f", {_product_name} clearly visible, product hero shot"
+                        _enhanced_count += 1
+                    elif "clearly visible" not in _original:
+                        clip_prompts[i] = _original.rstrip(" ,") + ", product clearly visible and prominent"
+                        _enhanced_count += 1
+
+                # 场景单一 → 增加镜头运动和角度多样性
+                _mono_scene = any("同一场景" in iss and "视觉单调" in iss for iss in _sb_issues)
+                if _mono_scene and i > 0:
+                    if "camera movement" not in _original.lower() and "slow push" not in _original.lower():
+                        _varied_moves = ["slow camera pan", "subtle camera movement", "gentle camera drift"]
+                        clip_prompts[i] = _original.rstrip(" ,") + f", {_varied_moves[i % len(_varied_moves)]}"
+                        _enhanced_count += 1
+
+                # 情绪单一 → 加强节奏和光影变化
+                _flat_emotion = any("情绪单一" in iss for iss in _sb_issues)
+                if _flat_emotion and i > 0 and i < len(clip_prompts) - 1:
+                    if "contrast" not in _original.lower():
+                        _contrast_variation = ["dynamic lighting contrast", "subtle contrast shift", "soft contrast variation"]
+                        clip_prompts[i] = _original.rstrip(" ,") + f", {_contrast_variation[i % len(_contrast_variation)]}"
+                        _enhanced_count += 1
+
+            if _enhanced_count > 0:
+                print(f"📋 故事板改进已应用：针对 {len(_sb_issues)} 项预警增强了 {_enhanced_count} 个片段的 Prompt")
+
 
     # ── 预览模式：只保留第 1 段 ──
     if preview:
         clip_prompts = clip_prompts[:1]
         print(f"\n⚡ 预览模式：仅生成第 1 段（std 模式，快速试错）")
         print(f"   确认效果 OK 后，去掉 --preview 重新生成完整 pro 版本")
+
+    _preflight_generation_contract(
+        product_info=product_info,
+        ad_script=ad_script,
+        clip_prompts=clip_prompts,
+        product_image_path=product_image_path,
+        char_refs=char_refs,
+        strict_mode=strict_mode and not preview,
+    )
 
     # ── 成本预估 ──
     _cost_info = estimate_cost(
@@ -2403,8 +5050,95 @@ def run_generation_pipeline(
         num_clips=len(clip_prompts),
         num_characters=len(char_refs) if char_refs else 1,
         best_of=best_of,
+        image_first_segments=_estimate_image_first_segment_count(
+            len(clip_prompts),
+            image_first_mode,
+            enabled=image_first and preflight_keyframe and strict_mode and not preview,
+        ),
+        image_first_variants=max(1, int(image_first_variants or 1)),
     )
     print_cost_estimate(_cost_info)
+
+    # ── 质量前置控制（Quality Gate）──
+    # 在生成视频前进行全面预检，消除质量隐患，避免成本浪费
+    char_image_paths = [Path(c["image_path"]) for c in char_refs if c.get("image_path")] if char_refs else []
+
+    quality_gate_result = run_quality_gate(
+        ad_script=ad_script,
+        product_image_path=product_image_path,
+        character_image_paths=char_image_paths,
+        prompts=clip_prompts,
+        character_bible=character_bibles[0] if character_bibles else None,
+        product_bible=product_bible,
+        scene_continuity_config=SCENE_CONTINUITY_CONFIG,
+        num_clips=len(clip_prompts),
+        duration_per_clip=duration,
+        mode=mode,
+    )
+
+    print_quality_gate_report(quality_gate_result)
+
+    # ── 自动应用 Prompt 优化 ──
+    # 质量门检测出的 prompt 问题，能自动修的直接修，修完替换原始 prompt
+    if quality_gate_result.optimized_prompts and len(quality_gate_result.optimized_prompts) == len(clip_prompts):
+        _optimized_count = 0
+        for i in range(len(clip_prompts)):
+            if quality_gate_result.optimized_prompts[i] != clip_prompts[i]:
+                clip_prompts[i] = quality_gate_result.optimized_prompts[i]
+                _optimized_count += 1
+        if _optimized_count > 0:
+            print(f"🔧 已自动优化 {_optimized_count} 个片段的 Prompt（语义冲突/重复/缺词等）")
+
+    if not quality_gate_result.passed:
+        from config import QUALITY_GATE_CONFIG
+        failure_behavior = QUALITY_GATE_CONFIG.get("failure_behavior", {})
+        if failure_behavior.get("block_on_failure", True):
+            if strict_mode:
+                raise RuntimeError(
+                    "质量前置检查未通过，已阻止生成，避免进入高成本视频抽卡。\n"
+                    "💡 请根据上方质量报告修复问题后重试。"
+                )
+            if failure_behavior.get("allow_override", True):
+                confirm = input("⚠️  质量前置检查未通过，是否继续生成？(y/n) [n]：").strip().lower()
+                if confirm != "y":
+                    print("已取消生成")
+                    raise RuntimeError("质量前置检查未通过，已取消生成")
+            else:
+                raise RuntimeError("质量前置检查未通过，已阻止生成")
+
+    main_char_path = Path(char_refs[0]["image_path"]) if char_refs and char_refs[0].get("image_path") else None
+    approved_keyframes: Dict[int, Path] = {}
+
+    if image_first and preflight_keyframe and strict_mode:
+        try:
+            image_first_mode_enum = ImageFirstMode((image_first_mode or "standard").lower())
+        except ValueError:
+            image_first_mode_enum = ImageFirstMode.STANDARD
+        image_first_save_dir = clips_dir / f"{output_name}_image_first"
+        image_first_result = run_image_first_strategy(
+            client=client,
+            ad_script=ad_script,
+            clip_prompts=clip_prompts,
+            product_reference_path=product_image_path,
+            character_reference_path=main_char_path,
+            save_dir=image_first_save_dir,
+            mode=image_first_mode_enum,
+            n_variants=max(1, int(image_first_variants or 1)),
+            aspect_ratio=aspect_ratio,
+            image_fidelity=image_fidelity,
+            strict_mode=True,
+        )
+        print_image_first_report(image_first_result)
+        if not image_first_result.can_proceed_to_video:
+            raise RuntimeError("图片先行验证未通过，已阻止进入高成本视频生成")
+        approved_keyframes = dict(image_first_result.best_keyframes)
+
+    workflow_decision_result = _run_pre_generation_smart_decision(
+        quality_gate_result,
+        product_info,
+        style=style,
+        budget=_cost_info.get("estimated_cost", _get_cost_budget_limit()),
+    )
 
     clip_paths = []
     scene_anchor_frames = []  # 全局场景锚点（从第 1 段提取，所有后续段都参考）
@@ -2412,6 +5146,11 @@ def run_generation_pipeline(
 
     # 节奏模板：转场时长从模板取（统一管理，不再分散计算）
     scene_cfg["transition_duration"] = _rhythm_transition
+
+    # 改动4：将主题匹配的转场类型写入 scene_cfg，供后续合成步骤使用
+    _av_style = auto_match_av_style(product_info, style)
+    scene_cfg["transition_type"] = _av_style["transition_type"]
+    print(f"🎬 AV 风格匹配：转场={_av_style['transition_type']}，音效包={_av_style['sfx_pack']}， BGM关键词={_av_style['bgm_keywords']}")
 
     total_clips = len(clip_prompts)
     generation_start = time.time()
@@ -2432,67 +5171,103 @@ def run_generation_pipeline(
             return "cta"
         return "showcase"
 
-    def _build_ref_images(idx: int, prev_clip_path: Optional[Path] = None, prev_last_frame_b64: Optional[str] = None) -> list:
-        """构建参考图列表（三层连续性保障，最多 3 张避免过载）
-
-        策略：角色 + 产品（必选） + 场景锚点或前帧尾（二选一，串行用前帧尾更精准）
-        并行模式下 prev_clip_path=None 但 prev_last_frame_b64 可传入第 1 段尾帧。
-        """
+    def _build_ref_images(
+        idx: int,
+        clip_prompt: str = "",
+        prev_clip_path: Optional[Path] = None,
+        prev_last_frame_b64: Optional[str] = None,
+    ) -> list:
+        """按叙事任务选择最优参考图组合（性价比策略：用满5张换视频一次成功）。"""
         narrative = _get_narrative_for_idx(idx).lower().strip()
-        product_first = _is_product_required_narrative(narrative)
 
-        ref_images = []
-        primary_char = char_refs[0] if char_refs else None
+        # ── 多角色：按分镜内容检测出场角色，只传该角色的参考图 ──
+        primary_char_idx = _get_primary_char_for_clip(
+            idx, clip_prompt, ad_script, character_bibles
+        )
+        primary_char = char_refs[primary_char_idx] if char_refs and primary_char_idx < len(char_refs) else (char_refs[0] if char_refs else None)
 
-        if product_first:
-            if product_img_b64:
-                ref_images.append({"role": "product", "image": f"data:image/png;base64,{product_img_b64}"})
-            if primary_char:
-                ref_images.append({"role": "character", "image": f"data:image/png;base64,{primary_char['img_b64']}"})
-        else:
-            if primary_char:
-                ref_images.append({"role": "character", "image": f"data:image/png;base64,{primary_char['img_b64']}"})
-            if product_img_b64:
-                ref_images.append({"role": "product", "image": f"data:image/png;base64,{product_img_b64}"})
+        # 检测分镜中是否有多个角色出场
+        haystack = (clip_prompt or "").lower()
+        matched_char_indices = []
+        for i, bible in enumerate(character_bibles):
+            if bible.get("name", "").lower().strip() in haystack:
+                matched_char_indices.append(i)
+        if len(matched_char_indices) == 0 and primary_char_idx is not None:
+            matched_char_indices = [primary_char_idx]
 
+        # 构建角色→图片映射（支持多角度）
+        role_to_image = {}
+        if product_img_b64:
+            role_to_image["product"] = f"data:image/png;base64,{product_img_b64}"
+
+        if primary_char:
+            # 主角正面图（主图）
+            role_to_image["character_primary"] = f"data:image/png;base64,{primary_char['img_b64']}"
+            # 主角角度图（全身/侧面等，如有）
+            char_images = primary_char.get("img_b64_list", [])
+            if len(char_images) > 1:
+                role_to_image["character_angle"] = f"data:image/png;base64,{char_images[1]}"
+            # 次角色（分镜中出场的其他角色）
+            for i in matched_char_indices:
+                if i == primary_char_idx or i >= len(char_refs):
+                    continue
+                sec_char = char_refs[i]
+                role_to_image["character_secondary"] = f"data:image/png;base64,{sec_char['img_b64']}"
+                break
+
+        approved_keyframe_path = approved_keyframes.get(idx - 1)
+        if approved_keyframe_path and approved_keyframe_path.exists():
+            try:
+                role_to_image["approved_keyframe"] = (
+                    "data:image/png;base64,"
+                    + base64.b64encode(approved_keyframe_path.read_bytes()).decode("utf-8")
+                )
+            except Exception:
+                pass
+
+        # 连续性参考帧
         is_first = (idx == 1)
-        # 第 2 层：全局场景锚点（仅并行模式或无前帧尾时使用）
-        _has_prev_frame = bool(
-            (prev_clip_path and scene_cfg.get("use_previous_last_frame", True))
-            or prev_last_frame_b64
-        )
-        use_scene_anchor = (
-            not is_first
-            and scene_cfg.get("use_scene_anchor", True)
-            and scene_anchor_frames
-            and not _has_prev_frame
-        )
-        if use_scene_anchor:
-            # 只取第 1 张锚点帧（避免过载，最多 3 张参考图）
-            ref_images.append({"role": "continuity", "image": scene_anchor_frames[0]})
-        # 第 3 层：前一段最后一帧
+        continuity_image = None
         if not is_first:
-            # 串行模式：从前一段视频提取
             if prev_clip_path and scene_cfg.get("use_previous_last_frame", True):
                 try:
                     last_frame_b64 = _extract_frame_b64(prev_clip_path, time_sec=duration - 0.1)
                     if last_frame_b64:
-                        ref_images.append({"role": "continuity", "image": last_frame_b64})
+                        continuity_image = last_frame_b64
                 except Exception:
                     pass
-            # P0-3 修复：并行模式下使用外部传入的尾帧（通常是第 1 段尾帧）
             elif prev_last_frame_b64 and scene_cfg.get("use_previous_last_frame", True):
-                ref_images.append({"role": "continuity", "image": prev_last_frame_b64})
+                continuity_image = prev_last_frame_b64
+            elif scene_cfg.get("use_scene_anchor", True) and scene_anchor_frames:
+                continuity_image = scene_anchor_frames[0]
 
-        if len(ref_images) < MAX_REF_IMAGES and len(char_refs) > 1:
-            for extra in char_refs[1:]:
-                if len(ref_images) >= MAX_REF_IMAGES:
-                    break
-                try:
-                    ref_images.append({"role": "character", "image": f"data:image/png;base64,{extra['img_b64']}"})
-                except Exception:
-                    continue
+        if continuity_image:
+            role_to_image["continuity"] = continuity_image
 
+        # 计算是否有多角度角色图
+        multi_angle = "character_angle" in role_to_image
+        multi_char = len(matched_char_indices) > 1 and "character_secondary" in role_to_image
+
+        role_order = _reference_strategy_for_narrative(
+            narrative,
+            product_available=bool(product_img_b64),
+            character_available=bool(primary_char),
+            continuity_available=bool(continuity_image),
+            multi_character=multi_char,
+            multi_angle_char=multi_angle,
+        )
+        if "approved_keyframe" in role_to_image:
+            role_order = ["approved_keyframe"] + [
+                role for role in role_order if role != "approved_keyframe"
+            ]
+
+        ref_images = [
+            {"role": role, "image": role_to_image[role]}
+            for role in role_order
+            if role in role_to_image
+        ]
+
+        # 去重（防重复图片）
         seen = set()
         deduped = []
         for item in ref_images:
@@ -2510,18 +5285,43 @@ def run_generation_pipeline(
         """生成单个片段（含自动重试 + 缓存跳过），返回本地文件路径"""
         clip_path = clips_dir / f"clip_{idx:02d}_{output_name}.mp4"
 
-        ref_images = _build_ref_images(idx, prev_clip_path, prev_last_frame_b64)
-        final_prompt = prompt
+        ref_images = _build_ref_images(idx, clip_prompt=prompt, prev_clip_path=prev_clip_path, prev_last_frame_b64=prev_last_frame_b64)
+        narrative = _get_narrative_for_idx(idx).lower().strip()
+
+        # 改动5：prompt 质量前置门禁（在 scene_consistency 和 ref_binding 之前去重）
+        final_prompt = _prompt_quality_gate(
+            prompt,
+            narrative=narrative,
+            product_name=product_info.get("name", ""),
+            segment_index=idx,
+        )
+
         if scene_cfg.get("inject_scene_prompt", True):
-            final_prompt = _inject_scene_consistency_prompt(prompt, is_first_clip=(idx == 1))
+            # 故事驱动模式已在 prompt 开头注入场景锚定，跳过重复注入
+            if not final_prompt.startswith("SCENE:") and not final_prompt.startswith("Continuing") and not final_prompt.startswith("Same scene"):
+                final_prompt = _inject_scene_consistency_prompt(final_prompt, is_first_clip=(idx == 1))
 
         if ref_images:
-            narrative = _get_narrative_for_idx(idx).lower().strip()
             final_prompt = _bind_reference_tags_to_prompt(final_prompt, ref_images, narrative)
+        final_prompt = _compact_prompt_for_generation(final_prompt)
 
         clip_seed = (seed + idx - 1) if seed is not None else None
         ref_image_values = _ref_image_values(ref_images)
-        base_manifest = _build_clip_manifest(
+
+        def _candidate_prompt_for_strategy(candidate_strategy: str) -> str:
+            if candidate_strategy == "product_rescue" and _is_product_required_narrative(narrative):
+                return _compact_prompt_for_generation(
+                    f"{final_prompt}, product centered, large unobstructed packaging, exact same product color and shape as product reference"
+                )
+            if candidate_strategy == "character_rescue" and any(
+                item.get("role") == "character" for item in ref_images if isinstance(item, dict)
+            ):
+                return _compact_prompt_for_generation(
+                    f"{final_prompt}, same person, same hairstyle, same outfit, stable face, minimal head rotation"
+                )
+            return final_prompt
+
+        final_clip_manifest = _build_clip_manifest(
             final_prompt=final_prompt,
             ref_images=ref_images,
             idx=idx,
@@ -2531,8 +5331,8 @@ def run_generation_pipeline(
             aspect_ratio=aspect_ratio,
             seed=clip_seed,
             negative_prompt=NEGATIVE_PROMPT,
+            candidate_strategy="single",
         )
-        final_clip_manifest = dict(base_manifest)
         final_clip_manifest["target_name"] = clip_path.name
 
         def _valid_cached_clip(target_path: Path, manifest: dict) -> bool:
@@ -2558,13 +5358,25 @@ def run_generation_pipeline(
             print(f"  ✅ 片段 {idx} manifest 缓存命中，跳过生成")
             return clip_path
 
-        def _generate_to_path(target_path: Path) -> Path:
+        def _generate_to_path(target_path: Path, candidate_strategy: str = "single", override_prompt: Optional[str] = None) -> Path:
             max_retries = 3
             last_error = None
-            target_manifest = dict(base_manifest)
+            candidate_prompt = override_prompt if override_prompt else _candidate_prompt_for_strategy(candidate_strategy)
+            target_manifest = _build_clip_manifest(
+                final_prompt=candidate_prompt,
+                ref_images=ref_images,
+                idx=idx,
+                model=effective_kling_model,
+                mode=mode,
+                duration=duration,
+                aspect_ratio=aspect_ratio,
+                seed=clip_seed,
+                negative_prompt=NEGATIVE_PROMPT,
+                candidate_strategy=candidate_strategy,
+            )
             target_manifest["target_name"] = target_path.name
             idempotency_key = _build_video_idempotency_key(
-                final_prompt,
+                candidate_prompt,
                 ref_image_values,
                 idx,
                 target_path,
@@ -2577,15 +5389,36 @@ def run_generation_pipeline(
             if _valid_cached_clip(target_path, target_manifest):
                 print(f"  ✅ 片段 {idx} 候选缓存命中：{target_path.name}")
                 return target_path
+
+            # 首帧低成本预检：仅在第一个候选且开启预检时执行
+            if preflight_keyframe and candidate_strategy == "single" and (idx - 1) not in approved_keyframes:
+                _kf_path = clips_dir / f"clip_{idx:02d}_{output_name}_preflight.png"
+                _kf_passed, _kf_issues, _kf_img = _preflight_keyframe_check(
+                    client=client,
+                    prompt=candidate_prompt,
+                    ref_images=ref_images,
+                    narrative=narrative,
+                    product_image_path=product_image_path,
+                    main_char_path=main_char_path,
+                    save_path=_kf_path,
+                    aspect_ratio=aspect_ratio,
+                    image_fidelity=_get_fidelity_for_narrative(narrative, image_fidelity),
+                )
+                if not _kf_passed:
+                    raise RuntimeError(
+                        f"片段 {idx} 首帧预检未通过，拦截视频生成以避免浪费额度。问题：{_kf_issues[0] if _kf_issues else '未知'}"
+                    )
+                print(f"  ✅ 片段 {idx} 首帧预检通过")
+
             for attempt in range(1, max_retries + 1):
                 try:
                     video_result = client.generate_video(
-                        prompt=final_prompt,
+                        prompt=candidate_prompt,
                         aspect_ratio=aspect_ratio,
                         duration=duration,
                         mode=mode,
                         reference_images=ref_image_values if ref_image_values else None,
-                        image_fidelity=image_fidelity,
+                        image_fidelity=_get_fidelity_for_narrative(narrative, image_fidelity),  # 改动3：动态 fidelity
                         human_fidelity=human_fidelity,
                         seed=clip_seed,
                         negative_prompt=NEGATIVE_PROMPT,
@@ -2626,17 +5459,11 @@ def run_generation_pipeline(
         scores: Dict[Path, float] = {}
         issues: Dict[Path, List[str]] = {}
 
-        for v in range(1, best_of_n + 1):
-            cand_path = clips_dir / f"clip_{idx:02d}_{output_name}_cand{v}.mp4"
-            candidates.append(cand_path)
-            _generate_to_path(cand_path)
-
-        for cand_path in candidates:
+        def _score_generated_candidate(cand_path: Path) -> Tuple[float, List[str]]:
             try:
                 candidate_roles = {
                     item.get("role", "unknown") for item in ref_images if isinstance(item, dict)
                 }
-                narrative = _get_narrative_for_idx(idx).lower().strip()
                 product_ref_for_candidate = (
                     product_image_path
                     if product_image_path
@@ -2649,19 +5476,65 @@ def run_generation_pipeline(
                     if main_char_path and "character" in candidate_roles
                     else None
                 )
-                score, candidate_issues = _score_candidate_video_quality(
+                return _score_candidate_video_quality(
                     cand_path,
                     quality_frames=int(quality_frames or 12),
                     product_reference_image=product_ref_for_candidate,
                     character_reference_image=character_ref_for_candidate,
                 )
-                scores[cand_path] = score
-                issues[cand_path] = candidate_issues
             except Exception as e:
-                scores[cand_path] = 0.0
-                issues[cand_path] = [f"质量检测失败：{e}"]
+                return 0.0, [f"质量检测失败：{e}"]
 
-        best_path = max(candidates, key=lambda p: scores.get(p, 0.0))
+        early_stop_score = 85.0
+        best_path: Optional[Path] = None
+        best_strategy = "single"
+        repaired_prompt: Optional[str] = None
+        repair_tags: List[str] = []
+
+        for v in range(1, best_of_n + 1):
+            cand_path = clips_dir / f"clip_{idx:02d}_{output_name}_cand{v}.mp4"
+            candidates.append(cand_path)
+
+            if v == 1:
+                strategy = "single"
+                _generate_to_path(cand_path, candidate_strategy=strategy)
+            elif v == 2 and repaired_prompt:
+                # 候选2：使用失败原因驱动的精准修复 prompt
+                strategy = "issue_driven_repair"
+                _generate_to_path(cand_path, candidate_strategy=strategy, override_prompt=repaired_prompt)
+            else:
+                # 候选3+：回退到原来的通用 rescue 策略
+                strategy = "product_rescue" if _is_product_required_narrative(narrative) else "character_rescue"
+                _generate_to_path(cand_path, candidate_strategy=strategy)
+
+            score, candidate_issues = _score_generated_candidate(cand_path)
+            scores[cand_path] = score
+            issues[cand_path] = candidate_issues
+            if best_path is None or score > scores.get(best_path, 0.0):
+                best_path = cand_path
+                best_strategy = strategy
+
+            print(f"  📊 片段 {idx} 候选 {v}/{best_of_n}（{strategy}）：{score:.0f} 分")
+
+            # 候选1失败后，按具体原因生成修复 prompt
+            if v == 1 and score < early_stop_score and candidate_issues:
+                _primary_char_bible = character_bibles[0] if character_bibles else None
+                repaired_prompt, repair_tags = _repair_prompt_by_issues(
+                    prompt,
+                    candidate_issues,
+                    product_bible=product_bible,
+                    character_bible=_primary_char_bible,
+                )
+                if repair_tags:
+                    print(f"     🔧 候选1问题：{candidate_issues[0]}")
+                    print(f"     🔧 生成修复策略：{repair_tags}")
+
+            if score >= early_stop_score:
+                print(f"  ✅ 片段 {idx} 候选已达标（≥{early_stop_score:.0f}），停止继续生成候选以节省成本")
+                break
+
+        if best_path is None:
+            best_path = max(candidates, key=lambda p: scores.get(p, 0.0))
         best_score = scores.get(best_path, 0.0)
         # P1 修复：所有候选质量检测均未通过时直接失败，避免选中明显废片
         if best_score <= 0:
@@ -2669,9 +5542,11 @@ def run_generation_pipeline(
                 f"片段 {idx} 的 {best_of_n} 个候选全部未通过质量检测（最高分 {best_score:.0f}），"
                 f"无法选出有效片段。主要问题：{issues.get(best_path, ['未知'])[:1]}"
             )
-        print(f"  🏆 片段 {idx} best-of：{best_score:.0f} 分（候选 {best_of_n}）")
+        print(f"  🏆 片段 {idx} 自适应 best-of：{best_score:.0f} 分（已生成 {len(candidates)}/{best_of_n} 个候选）")
         if issues.get(best_path):
             print(f"     主要问题：{issues[best_path][0]}")
+        if best_strategy == "issue_driven_repair" and repair_tags:
+            print(f"     修复标签：{repair_tags}")
 
         if best_path != clip_path:
             try:
@@ -2684,6 +5559,7 @@ def run_generation_pipeline(
                 _clip_manifest_path(best_path).unlink(missing_ok=True)
             except Exception:
                 pass
+        final_clip_manifest["candidate_strategy"] = best_strategy
         _write_clip_manifest(clip_path, final_clip_manifest)
 
         if not keep_candidates:
@@ -2728,22 +5604,15 @@ def run_generation_pipeline(
             print(f"    ✅ 场景锚点已建立：{len(scene_anchor_frames)} 张关键帧")
 
     # ── 第 2-N 段：并行或串行生成 ──
-    # 并行模式：所有段都用第 1 段尾帧 + 场景锚点作为 prev（场景锚点是主力，prev 是辅助）
+    # 并行模式：只使用商品/人物参考图和场景锚点，不再把第 1 段尾帧当作所有后续段的上一帧。
     # 串行模式：每段动态传前一段路径，极致一致性
     remaining_prompts = clip_prompts[1:]
     if remaining_prompts:
         failed_indices = []
-        # 第 1 段尾帧（用于并行模式下所有后续段的 prev 参考）
-        first_clip_last_frame = None
-        if parallel and scene_cfg.get("use_previous_last_frame", True):
-            try:
-                first_clip_last_frame = _extract_frame_b64(first_clip, time_sec=duration - 0.1)
-            except Exception:
-                pass
 
         if parallel:
             print(f"\n🎬 并行生成剩余 {len(remaining_prompts)} 个片段（最大并发 {max_workers}）...")
-            print(f"   模式：第 1 段尾帧 + 全局场景锚点 作为一致性参考")
+            print("   模式：商品/人物参考图 + 全局场景锚点（不使用伪上一帧，降低冲突）")
 
             # 构建并行任务参数（idx 是 1-based）
             tasks = []
@@ -2761,9 +5630,7 @@ def run_generation_pipeline(
                 with _status_lock:
                     _clip_status[idx] = "生成中"
                 try:
-                    # P0-3 修复：并行模式传入第 1 段尾帧，激活第 3 层连续性参考
-                    # 各段没有真正的前一段视频，但可以用第 1 段尾帧作为统一参考
-                    path = _generate_one_clip(idx, prompt, None, first_clip_last_frame)
+                    path = _generate_one_clip(idx, prompt, None, None)
                     with _status_lock:
                         _clip_status[idx] = "完成"
                         _results[idx] = path
@@ -3102,11 +5969,14 @@ def run_generation_pipeline(
         from config import CLIP_STRUCTURE
         pace = _detect_pace_from_clips(CLIP_STRUCTURE)
 
+    # 改动4：cinematic_style 已传入，pick_bgm_for_product 内部按风格优先匹配 BGM
+    # _av_style bgm_keywords 已打印到日志供调试参考
     bgm_file = pick_bgm_for_product(
         product_type,
         target_duration=total_video_duration,
         cinematic_style=style,
         pace=pace,
+        music_contract=music_contract,
     )
 
     if not bgm_file:
@@ -3446,6 +6316,8 @@ def run_generation_pipeline(
     # Q5 修复：字幕动画按叙事类型自动选择，不再所有场景都用同一个动画
     # 口播模式强制 typewriter（字幕与人声同步）
     # 非口播：hook→pop（抓注意力）/ cta→slide（行动感）/ showcase→fade（稳重）
+    # 节奏增强：根据 BPM 和情绪强度动态调整字幕动画和字号
+    _font_size_ratio = DOUYIN_CONFIG["subtitle"]["font_size_ratio"]
     if voiceover_enabled:
         sub_animation = "typewriter"
         print("📝 口播模式：启用打字机字幕动画（增强同步感）")
@@ -3462,6 +6334,38 @@ def run_generation_pipeline(
             sub_animation = "fade"
         else:
             sub_animation = DOUYIN_CONFIG["subtitle"]["animation"]
+        
+        # 节奏驱动的字幕样式调整（BPM → 动画类型，情绪强度 → 字号比例）
+        if rhythm_curve:
+            _overall_bpm = getattr(rhythm_curve, "overall_bpm", 0)
+            _avg_intensity = 0.5
+            _segments = getattr(rhythm_curve, "segments", [])
+            if _segments:
+                _intensity_map = {"low": 0.3, "moderate": 0.5, "high": 0.7, "extreme": 0.9}
+                _total = 0.0
+                for s in _segments:
+                    _emo = getattr(s, "emotion_level", None)
+                    _emo_val = _emo.value if hasattr(_emo, 'value') else "moderate"
+                    _total += _intensity_map.get(_emo_val, 0.5)
+                _avg_intensity = _total / len(_segments)
+            
+            # BPM 驱动动画类型调整
+            if _overall_bpm > 120:
+                if sub_animation == "fade":
+                    sub_animation = "slide"
+                print(f"📝 节奏加速：BPM {_overall_bpm} → 动画升级为 {sub_animation}")
+            elif _overall_bpm < 80 and sub_animation == "pop":
+                sub_animation = "fade"
+                print(f"📝 节奏放缓：BPM {_overall_bpm} → 动画调整为 {sub_animation}")
+            
+            # 情绪强度驱动字号微调（±10%）
+            if _avg_intensity > 0.7:
+                _font_size_ratio = _font_size_ratio * 1.1
+                print(f"📝 高情绪强度 {_avg_intensity:.0%} → 字号 +10%")
+            elif _avg_intensity < 0.3:
+                _font_size_ratio = _font_size_ratio * 0.9
+                print(f"📝 低情绪强度 {_avg_intensity:.0%} → 字号 -10%")
+        
         print(f"📝 字幕动画：{sub_animation}（叙事类型：{_dominant_narrative}）")
 
     try:
@@ -3469,7 +6373,7 @@ def run_generation_pipeline(
             video=graded_path,
             subtitles=subtitles,
             output=subtitled_path,
-            font_size=int(video_height * DOUYIN_CONFIG["subtitle"]["font_size_ratio"]),
+            font_size=int(video_height * _font_size_ratio),
             primary_color=BRAND_CONFIG.get("primary_color", "#FFFFFF"),
             accent_color=BRAND_CONFIG.get("accent_color", "#FF6B6B"),
             animation=sub_animation,
@@ -3818,6 +6722,32 @@ def run_generation_pipeline(
             raise
         except Exception as dur_err:
             print(f"⚠️  时长校验跳过（ffprobe 不可用）：{dur_err}")
+
+        # ============================================================
+        # AI 视频质量增强（pro/4k 模式启用）
+        # ============================================================
+        if mode in ("pro", "4k") and not preview:
+            print()
+            print("✨ AI 视频质量增强...")
+            try:
+                _enhancer = AIVideoEnhancer()
+                _enhanced_path = final_dir / f"{output_name}_enhanced.mp4"
+                _enhancements = ["denoise", "deflicker", "color_enhance"]
+                if mode == "4k":
+                    _enhancements.append("deblur")
+                _enh_result = _enhancer.enhance_video(
+                    final_path,
+                    output_path=_enhanced_path,
+                    enhancements=_enhancements,
+                )
+                if _enh_result.success and _enhanced_path.exists():
+                    final_path = _enhanced_path
+                    print(f"✅ 视频增强完成：{', '.join(_enhancements)}")
+                else:
+                    print(f"⚠️  视频增强跳过：{_enh_result.message}")
+            except Exception as _enh_err:
+                print(f"⚠️  视频增强失败，使用原片：{_enh_err}")
+
     except Exception as e:
         print(f"❌ 最终导出失败：{e}")
         raise RuntimeError("最终导出失败，已阻断中间文件被标记为成功成片") from e
@@ -3848,9 +6778,10 @@ def run_generation_pipeline(
     # 发布级质量门禁：放在 pipeline 内部，保证单条和批量入口都执行
     # ============================================================
     quality_result = None
+    production_quality_report = None
     if not preview:
         print()
-        print("🔍 开始发布级视频质量检测...")
+        print("🔍 开始发布级视频质量检测（初筛）...")
         quality_result = check_video_quality(
             final_path,
             num_frames=15,
@@ -3863,6 +6794,39 @@ def run_generation_pipeline(
         print_quality_report(quality_result, final_path.name)
         if not quality_result.passed:
             raise RuntimeError("最终成片质量检测未通过，已阻断输出为成功产物")
+
+        print()
+        print("🎬 开始7大维度深度质量检测与自动修复...")
+        _segments_for_quality = None
+        if ad_script and ad_script.get("segments"):
+            _segments_for_quality = ad_script["segments"]
+        _beat_timings_for_quality = None
+        if rhythm_curve and rhythm_curve.beats:
+            _beat_timings_for_quality = [b.time for b in rhythm_curve.beats]
+
+        final_path, prod_report = run_production_quality_check(
+            final_path,
+            product_reference=product_image_path if product_image_path else None,
+            character_reference=main_char_path if main_char_path else None,
+            subtitles=subtitles,
+            beat_timings=_beat_timings_for_quality,
+            segments=_segments_for_quality,
+            auto_fix=True,
+            platform="douyin",
+        )
+        production_quality_report = prod_report
+        _prod_guard = ProductionQualityGuard()
+        _prod_guard.print_report(prod_report, final_path.name)
+
+        if not prod_report.passed:
+            if strict_mode:
+                raise RuntimeError(
+                    f"发布级深度质量检测未通过（综合 {prod_report.overall_score:.0f}/100），"
+                    f"严重问题 {len(prod_report.get_critical_issues())} 项"
+                )
+            else:
+                print(f"⚠️  发布级深度检测得分 {prod_report.overall_score:.0f}/100，非严格模式继续")
+
         if wide_path:
             print()
             print("🔍 开始 16:9 版本发布级质量检测...")
@@ -3878,6 +6842,56 @@ def run_generation_pipeline(
             print_quality_report(wide_quality_result, wide_path.name)
             if not wide_quality_result.passed:
                 raise RuntimeError("16:9 成片质量检测未通过，已阻断输出为成功产物")
+
+            print()
+            print("🎬 16:9 版本7大维度深度质量检测与自动修复...")
+            wide_path, _wide_prod_report = run_production_quality_check(
+                wide_path,
+                product_reference=product_image_path if product_image_path else None,
+                character_reference=main_char_path if main_char_path else None,
+                subtitles=subtitles,
+                beat_timings=_beat_timings_for_quality,
+                segments=_segments_for_quality,
+                auto_fix=True,
+                platform="douyin",
+            )
+            _prod_guard.print_report(_wide_prod_report, wide_path.name)
+            if not _wide_prod_report.passed and strict_mode:
+                raise RuntimeError(
+                    f"16:9 发布级深度质量检测未通过（综合 {_wide_prod_report.overall_score:.0f}/100）"
+                )
+
+        workflow_summary = _record_production_workflow_completion(
+            output_name=output_name,
+            final_path=final_path,
+            quality_result=quality_result,
+            product_info=product_info,
+            ad_script=ad_script,
+            generation_params={
+                "style": style,
+                "mode": mode,
+                "duration": duration,
+                "aspect_ratio": aspect_ratio,
+                "target_duration": target_duration,
+                "rhythm_style": rhythm_style,
+                "best_of": best_of,
+                "kling_model": effective_kling_model,
+                "strategy": getattr(workflow_decision_result, "recommended_strategy", "standard"),
+            },
+            character_assets=char_refs,
+            product_image_path=product_image_path,
+            character_bibles=character_bibles,
+            product_bible=product_bible,
+            decision_result=workflow_decision_result,
+        )
+        print(
+            "🔁 工作流闭环完成："
+            f"资产 {len(workflow_summary['registered_assets'])}，"
+            f"反馈 {'已写入' if workflow_summary['feedback_collected'] else '未写入'}，"
+            f"实验 {'已追踪' if workflow_summary['experiment_tracked'] else '未追踪'}"
+        )
+        for warning in workflow_summary.get("warnings", []):
+            print(f"   ⚠️ {warning}")
 
     # ============================================================
     # 清理中间文件（只保留 _final.mp4 / _16x9_final.mp4 / _cover.jpg）
@@ -3896,6 +6910,7 @@ def run_generation_pipeline(
         # P0-B：跨片段一致性警告列表（空列表 = 无问题）
         "consistency_warnings": locals().get("_consistency_warnings", []),
         "quality_result": quality_result,
+        "workflow_summary": locals().get("workflow_summary", {}),
     }
 
 
@@ -3946,6 +6961,12 @@ def run_one_click_create(
     voiceover_style = getattr(args, "voiceover_style", DEFAULT_VOICEOVER_STYLE)
     voice = getattr(args, "voice", DEFAULT_VOICE)
     script_style = getattr(args, "script_style", DEFAULT_SCRIPT_STYLE)
+    resolved_cast_plan = build_cast_plan({**product_info, "characters": characters} if characters else product_info)
+    resolved_characters = resolved_cast_plan.get("core_characters", [])
+    product_info["cast_plan"] = resolved_cast_plan
+    product_info["characters"] = resolved_characters
+    product_info["supporting_characters"] = resolved_cast_plan.get("supporting_characters", [])
+    product_info["ambient_entities"] = resolved_cast_plan.get("ambient_entities", [])
 
     # 目标总时长适配：通过节奏模板动态调整每段时长
     target_duration = getattr(args, "target_duration", None)
@@ -3970,7 +6991,7 @@ def run_one_click_create(
             image_fidelity=getattr(args, "image_fidelity", DEFAULT_IMAGE_FIDELITY),
             human_fidelity=getattr(args, "human_fidelity", DEFAULT_HUMAN_FIDELITY),
             seed=getattr(args, "seed", None),
-            characters=characters,
+            characters=resolved_characters,
             output_dir=output_dir,
             hook_type=hook_type,
             use_voiceover=use_voiceover,
@@ -3983,7 +7004,7 @@ def run_one_click_create(
             rhythm_style=rhythm_style,
             parallel=not getattr(args, "serial", False),
             min_clips=getattr(args, "min_clips", 3),
-            best_of=getattr(args, "best_of", 2),
+            best_of=getattr(args, "best_of", 1),
             quality_frames=getattr(args, "quality_frames", 12),
             keep_candidates=getattr(args, "keep_candidates", False),
             preview=getattr(args, "preview", False),
@@ -3992,6 +7013,10 @@ def run_one_click_create(
             brand_intro_outro=getattr(args, "brand_intro_outro", False),
             kling_model=getattr(args, "kling_model", None),
             multi_shot=getattr(args, "multi_shot", False),
+            preflight_keyframe=getattr(args, "preflight_keyframe", True),
+            image_first=getattr(args, "image_first", True),
+            image_first_mode=getattr(args, "image_first_mode", "standard"),
+            image_first_variants=getattr(args, "image_first_variants", 2),
         )
 
         final_path = result["final_path"]
@@ -4108,16 +7133,20 @@ def expand_theme_with_llm(theme: str, args) -> Optional[dict]:
     system_prompt = """你是专业的短视频广告策划专家。用户会给你一句产品主题描述，
 你需要根据主题自动推断出最适合的广告参数，以严格的 JSON 格式输出，不要有任何额外说明。
 
-输出字段说明：
-product_info:
-  name: 产品名称（简洁，2-8字）
-  type: 产品类型，从以下选择：美妆 食品 科技 服装 app 家居 健康 母婴 宠物 运动 default
-  selling_point: 核心卖点（一句话，10-25字，突出用户利益）
-  audience: 目标人群（如 18-30岁都市女性）
-  style: 广告风格（如 温暖治愈、科技感、青春活力、极简高端）
-  age: 主角年龄（数字，如 25）
-  gender: 主角性别（女 或 男）
-  outfit: 服装描述（英文，符合场景和受众，如 casual cozy sweater）
+    输出字段说明：
+    product_info:
+      name: 产品名称（简洁，2-8字）
+      type: 产品类型，从以下选择：美妆 食品 科技 服装 app 家居 健康 母婴 宠物 运动 default
+      selling_point: 核心卖点（一句话，10-25字，突出用户利益）
+      audience: 目标人群（如 18-30岁都市女性）
+      style: 广告风格（如 温暖治愈、科技感、青春活力、极简高端）
+      age: 主角年龄（数字，如 25）
+      gender: 主角性别（女 或 男）
+      outfit: 服装描述（英文，符合场景和受众，如 casual cozy sweater）
+      characters: 核心角色列表，只放需要跨镜头保持一致并生成定妆照的角色/动物主体。普通单人商品 1 个；家庭/多人决策通常 2 个；宠物产品可包含主人 + 宠物。
+        每个角色包含 name, role, role_type, reference_required, description, age, gender, outfit, expression_baseline。
+      supporting_characters: 配角列表，不生成定妆照，例如孩子、客服、顾问、医生、店员等。每个角色同样包含 name, role, role_type=supporting, reference_required=false, description。
+      ambient_entities: 环境实体列表，例如路人、人群、车辆、宠物背景、办公室同事，只作为背景描述，不作为命名主角。
 
 args:
   style: 电影风格，从以下选一个最合适的：hitchcock kubrick spielberg aronofsky scorsese nolan anderson wong-kar-wai tarkovsky zhang-yimou koreeda tarantino jia-zhangke hou-hsiao-hsien bong-joon-ho denis-villeneuve luc-besson miyazaki
@@ -4128,13 +7157,15 @@ args:
   voiceover: 是否需要口播旁白（true 或 false）
   voice: 音色，从以下选一个：female_young female_warm male_pro male_magnetic energetic_female
 
-选择原则：
-- 温暖/情感类产品 → miyazaki / wong-kar-wai + storytelling + story
-- 科技/功能类产品 → nolan / denis-villeneuve + demonstration + shocking
-- 美妆/时尚类产品 → luc-besson / zhang-yimou + pain_point_solution + pain_point
-- 食品/生活类产品 → spielberg / koreeda + before_after + question
-- 快节奏产品 → rhythm_style=fast；沉浸式产品 → rhythm_style=cinematic
-- 需要讲解的功能性产品开启 voiceover=true，纯视觉类 voiceover=false"""
+    选择原则：
+    - 温暖/情感类产品 → miyazaki / wong-kar-wai + storytelling + story
+    - 科技/功能类产品 → nolan / denis-villeneuve + demonstration + shocking
+    - 美妆/时尚类产品 → luc-besson / zhang-yimou + pain_point_solution + pain_point
+    - 食品/生活类产品 → spielberg / koreeda + before_after + question
+    - 快节奏产品 → rhythm_style=fast；沉浸式产品 → rhythm_style=cinematic
+    - 需要讲解的功能性产品开启 voiceover=true，纯视觉类 voiceover=false
+    - **角色数量由系统自动根据产品类型推断，你只需返回产品基础信息即可**
+    - characters / supporting_characters / ambient_entities 字段可以留空，系统会自动填充最优角色配置"""
 
     prompt = f"请根据以下主题展开广告参数：\n\n{theme}"
 
@@ -4147,6 +7178,7 @@ args:
 def main():
     """主函数：一键成片"""
     args = parse_args()
+    low_cost_policy_applied = False
 
     # --no-llm：禁用 LLM，强制走模板模式
     if args.no_llm:
@@ -4307,6 +7339,14 @@ def main():
             args.kling_model = args_dict["kling_model"]
         if "multi_shot" in args_dict:
             args.multi_shot = args_dict["multi_shot"]
+        if "preflight_keyframe" in args_dict:
+            args.preflight_keyframe = args_dict["preflight_keyframe"]
+        if "image_first" in args_dict:
+            args.image_first = args_dict["image_first"]
+        if "image_first_mode" in args_dict:
+            args.image_first_mode = args_dict["image_first_mode"]
+        if "image_first_variants" in args_dict:
+            args.image_first_variants = args_dict["image_first_variants"]
         if "strict_mode" in args_dict:
             args.strict = args_dict["strict_mode"]
         if "force" in args_dict:
@@ -4386,60 +7426,71 @@ def main():
                 print("⚠️  未输入主题，切换到手动模式")
                 _use_manual = True
 
-        if not _use_manual:
-            print()
-            print("🤖 AI 正在解析主题，生成最佳参数配置...")
-            _expanded = expand_theme_with_llm(_theme_input, args)
-            if _expanded is None:
-                print("⚠️  LLM 不可用（未配置或调用失败），切换到手动填写模式")
-                print("   提示：在 config.py 中配置 LLM_API_KEY 和 LLM_BASE_URL 以启用主题模式")
+            if not _use_manual:
                 print()
-                _use_manual = True
-            else:
-                product_info = _expanded["product_info"]
-                # 将 LLM 推荐的 args 参数回写到 args 对象
-                _llm_args = _expanded.get("args", {})
-                _VALID_STYLES = {
-                    "hitchcock", "kubrick", "spielberg", "aronofsky", "scorsese",
-                    "nolan", "anderson", "wong-kar-wai", "tarkovsky", "zhang-yimou",
-                    "koreeda", "tarantino", "jia-zhangke", "hou-hsiao-hsien",
-                    "bong-joon-ho", "denis-villeneuve", "luc-besson", "miyazaki",
-                }
-                _VALID_SCRIPT_STYLES = {
-                    "pain_point_solution", "before_after", "storytelling",
-                    "demonstration", "social_proof",
-                }
-                _VALID_HOOKS = {
-                    "question", "shocking", "before_after", "demonstration",
-                    "story", "challenge", "celeb_style", "pain_point",
-                }
-                _VALID_RHYTHMS = {"fast", "moderate", "cinematic"}
-                _VALID_VOICES = {
-                    "female_young", "female_warm", "male_pro",
-                    "male_magnetic", "energetic_female",
-                }
-                if _llm_args.get("style") in _VALID_STYLES:
-                    args.style = _llm_args["style"]
-                if _llm_args.get("script_style") in _VALID_SCRIPT_STYLES:
-                    args.script_style = _llm_args["script_style"]
-                if _llm_args.get("hook") in _VALID_HOOKS:
-                    args.hook = _llm_args["hook"]
-                if _llm_args.get("rhythm_style") in _VALID_RHYTHMS:
-                    args.rhythm_style = _llm_args["rhythm_style"]
-                if isinstance(_llm_args.get("target_duration"), int):
-                    args.target_duration = _llm_args["target_duration"]
-                if isinstance(_llm_args.get("voiceover"), bool):
-                    args.voiceover = _llm_args["voiceover"]
-                if _llm_args.get("voice") in _VALID_VOICES:
-                    args.voice = _llm_args["voice"]
-                print("✅ AI 参数配置完成")
-                # 主题模式下询问商品参考图（可选）
-                print()
-                _img_input = input("🖼️  商品参考图路径或 URL（直接回车跳过）：").strip()
-                if _img_input:
-                    args.product_image = _img_input
+                print("🤖 AI 正在解析主题，生成最佳参数配置...")
+                _expanded = expand_theme_with_llm(_theme_input, args)
+                if _expanded is None:
+                    print("⚠️  LLM 不可用（未配置或调用失败），切换到手动填写模式")
+                    print("   提示：在 config.py 中配置 LLM_API_KEY 和 LLM_BASE_URL 以启用主题模式")
+                    print()
+                    _use_manual = True
                 else:
-                    args.allow_no_product_image = True
+                    product_info = _expanded["product_info"]
+                    # Q-Final 修复：清空 LLM 返回的角色字段，让 build_cast_plan 统一推断
+                    # 避免 LLM 返回的角色数量与系统设计不一致（如家财险只给 1-2 个角色）
+                    # build_cast_plan 是角色计划的唯一真源（single source of truth）
+                    product_info.pop("characters", None)
+                    product_info.pop("supporting_characters", None)
+                    product_info.pop("ambient_entities", None)
+                    cast_plan = build_cast_plan(product_info)
+                    product_info["cast_plan"] = cast_plan
+                    product_info["characters"] = cast_plan.get("core_characters", [])
+                    product_info["supporting_characters"] = cast_plan.get("supporting_characters", [])
+                    product_info["ambient_entities"] = cast_plan.get("ambient_entities", [])
+                    # 将 LLM 推荐的 args 参数回写到 args 对象
+                    _llm_args = _expanded.get("args", {})
+                    _VALID_STYLES = {
+                        "hitchcock", "kubrick", "spielberg", "aronofsky", "scorsese",
+                        "nolan", "anderson", "wong-kar-wai", "tarkovsky", "zhang-yimou",
+                        "koreeda", "tarantino", "jia-zhangke", "hou-hsiao-hsien",
+                        "bong-joon-ho", "denis-villeneuve", "luc-besson", "miyazaki",
+                    }
+                    _VALID_SCRIPT_STYLES = {
+                        "pain_point_solution", "before_after", "storytelling",
+                        "demonstration", "social_proof",
+                    }
+                    _VALID_HOOKS = {
+                        "question", "shocking", "before_after", "demonstration",
+                        "story", "challenge", "celeb_style", "pain_point",
+                    }
+                    _VALID_RHYTHMS = {"fast", "moderate", "cinematic"}
+                    _VALID_VOICES = {
+                        "female_young", "female_warm", "male_pro",
+                        "male_magnetic", "energetic_female",
+                    }
+                    if _llm_args.get("style") in _VALID_STYLES:
+                        args.style = _llm_args["style"]
+                    if _llm_args.get("script_style") in _VALID_SCRIPT_STYLES:
+                        args.script_style = _llm_args["script_style"]
+                    if _llm_args.get("hook") in _VALID_HOOKS:
+                        args.hook = _llm_args["hook"]
+                    if _llm_args.get("rhythm_style") in _VALID_RHYTHMS:
+                        args.rhythm_style = _llm_args["rhythm_style"]
+                    if isinstance(_llm_args.get("target_duration"), int):
+                        args.target_duration = _llm_args["target_duration"]
+                    if isinstance(_llm_args.get("voiceover"), bool):
+                        args.voiceover = _llm_args["voiceover"]
+                    if _llm_args.get("voice") in _VALID_VOICES:
+                        args.voice = _llm_args["voice"]
+                    print("✅ AI 参数配置完成")
+                    # 主题模式下询问商品参考图（可选）
+                    print()
+                    _img_input = input("🖼️  商品参考图路径或 URL（直接回车跳过）：").strip()
+                    if _img_input:
+                        args.product_image = _img_input
+                    else:
+                        args.allow_no_product_image = True
 
         if _use_manual:
             print("请输入产品信息（直接回车使用默认值）：")
@@ -4462,22 +7513,59 @@ def main():
                 "gender": character_gender,
                 "outfit": outfit,
             }
+            cast_plan = build_cast_plan(product_info)
+            product_info["cast_plan"] = cast_plan
+            product_info["characters"] = cast_plan.get("core_characters", [])
+            product_info["supporting_characters"] = cast_plan.get("supporting_characters", [])
+            product_info["ambient_entities"] = cast_plan.get("ambient_entities", [])
 
-        print()
-        print("=" * 60)
-        print("📋 产品信息确认")
-        print("=" * 60)
-        for k, v in product_info.items():
-            print(f"  {k}: {v}")
-        print()
+            print()
+            print("=" * 60)
+            print("📋 产品信息确认")
+            print("=" * 60)
+            for k, v in product_info.items():
+                if k == "cast_plan" and v:
+                    print(
+                        f"  cast_plan: 核心 {len(v.get('core_characters', []))} / "
+                        f"配角 {len(v.get('supporting_characters', []))} / "
+                        f"环境实体 {len(v.get('ambient_entities', []))}"
+                    )
+                    print(f"    rationale: {v.get('rationale', '')}")
+                elif k == "characters" and v:
+                    print(f"  characters(core/ref): {len(v)} 个")
+                    for char in v:
+                        role = f" / {char.get('role')}" if char.get("role") else ""
+                        print(f"    - {char.get('name', 'Character')}{role}: {char.get('description', '')}")
+                elif k == "supporting_characters" and v:
+                    print(f"  supporting_characters: {len(v)} 个")
+                    for char in v:
+                        role = f" / {char.get('role')}" if char.get("role") else ""
+                        print(f"    - {char.get('name', 'Supporting')}{role}: {char.get('description', '')}")
+                elif k == "ambient_entities" and v:
+                    print(f"  ambient_entities: {', '.join(str(item) for item in v)}")
+                else:
+                    print(f"  {k}: {v}")
+            print()
 
         # 成本估算提示
         ab_count = max(1, min(getattr(args, "ab_versions", 1), 3))
         _preview_mode = getattr(args, "preview", False)
         _est_mode = "std" if _preview_mode else args.mode
         _est_clips = 1 if _preview_mode else 5
-        # P2 修复：从 args 动态读取角色数，不应硬编码为 1
-        _est_num_chars = len(getattr(args, "characters", None) or []) or 1
+        _resolved_characters = build_cast_plan(product_info).get("core_characters", [])
+        _est_num_chars = len(_resolved_characters) or 1
+        _policy_changes = apply_low_cost_generation_policy(
+            args,
+            num_clips=_est_clips,
+            num_characters=_est_num_chars,
+            ab_versions=ab_count,
+        )
+        low_cost_policy_applied = True
+        if _policy_changes:
+            print("💸 已应用低成本策略：")
+            for change in _policy_changes:
+                print(f"   - {change}")
+            _est_mode = "std" if _preview_mode else args.mode
         cost_info = estimate_cost(
             mode=_est_mode,
             duration_per_clip=args.duration,
@@ -4485,6 +7573,15 @@ def main():
             num_characters=_est_num_chars,
             ab_versions=ab_count,
             best_of=getattr(args, "best_of", 1),
+            image_first_segments=_estimate_image_first_segment_count(
+                _est_clips,
+                getattr(args, "image_first_mode", "standard"),
+                enabled=getattr(args, "image_first", True)
+                and getattr(args, "preflight_keyframe", True)
+                and getattr(args, "strict", True)
+                and not _preview_mode,
+            ),
+            image_first_variants=max(1, int(getattr(args, "image_first_variants", 2) or 1)),
         )
         if _preview_mode:
             print("⚡ 预览模式：使用 std 模式，仅生成 1 段快速试错")
@@ -4507,7 +7604,24 @@ def main():
             print("已取消")
             sys.exit(0)
 
-    # ── 公共参数校验（交互模式 + 模板模式共用）──────────────────────
+        # ── 公共参数校验（交互模式 + 模板模式共用）──────────────────────
+        if not low_cost_policy_applied:
+            ab_count = max(1, min(getattr(args, "ab_versions", 1), 3))
+            _preview_mode = getattr(args, "preview", False)
+            _est_clips = 1 if _preview_mode else 5
+            _resolved_characters = build_cast_plan(product_info).get("core_characters", [])
+            _est_num_chars = len(_resolved_characters) or 1
+        _policy_changes = apply_low_cost_generation_policy(
+            args,
+            num_clips=_est_clips,
+            num_characters=_est_num_chars,
+            ab_versions=ab_count,
+        )
+        if _policy_changes:
+            print("💸 已应用低成本策略：")
+            for change in _policy_changes:
+                print(f"   - {change}")
+
     if not product_info.get("name", "").strip():
         print("❌ 错误：产品名称不能为空")
         sys.exit(1)
@@ -4626,6 +7740,64 @@ def main():
     except Exception as e:
         print(f"\n❌ 生成失败：{e}")
         sys.exit(1)
+
+
+def run_with_production_workflow(
+    product_info: dict,
+    *,
+    cinematic_style: str = DEFAULT_CINEMATIC_STYLE,
+    voiceover_enabled: bool = True,
+) -> Path:
+    """
+    使用完整生产级工作流编排器生成视频（推荐，一次成功率最高）。
+
+    包含21个步骤：质量前置、图片先行验证、智能决策、自动修复、资产注册、反馈闭环。
+    """
+    from workflow_orchestrator import VideoGenerationWorkflow, ExecutionMode
+
+    print("\n" + "=" * 70)
+    print("🚀 启动生产级工作流（质量前置 + 图片先行 + 智能决策）")
+    print("=" * 70)
+
+    product_info = {
+        **product_info,
+        "cinematic_style": cinematic_style,
+    }
+
+    target_audience = product_info.get("target_audience", "general")
+
+    wf = VideoGenerationWorkflow(
+        product_info=product_info,
+        target_audience=target_audience,
+    )
+
+    wf.add_progress_callback(
+        lambda step, status, progress: print(
+            f"  [{status:>10}] {step} ({progress:.0%})" if progress > 0 else f"  [{status:>10}] {step}"
+        )
+    )
+
+    ctx = wf.run(mode=ExecutionMode.HYBRID)
+
+    if ctx.status.value != "completed":
+        raise RuntimeError(f"工作流执行失败: {ctx.status.value}")
+
+    final_video = ctx.data.get("production_ready_video")
+    if not final_video or not Path(final_video).exists():
+        final_video = ctx.data.get("output_video")
+
+    if not final_video or not Path(final_video).exists():
+        raise RuntimeError("工作流未产生输出视频")
+
+    final_path = Path(final_video)
+    print(f"\n✅ 生产级工作流完成！")
+    print(f"📹 最终视频: {final_path}")
+
+    quality_result = ctx.data.get("final_quality_result")
+    if quality_result:
+        print(f"🎯 综合质量分: {quality_result.overall_score:.1f}/100")
+
+    return final_path
 
 
 if __name__ == "__main__":
