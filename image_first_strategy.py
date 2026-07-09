@@ -57,6 +57,8 @@ class KeyframeCandidate:
     sharpness_score: float = 0.0
     composition_score: float = 0.0
     passed: bool = False
+    blockers: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
     issues: List[str] = field(default_factory=list)
 
 
@@ -143,25 +145,26 @@ def check_keyframe_quality(
     character_reference_path: Optional[Path] = None,
     narrative: str = "",
     strict_mode: bool = True,
-) -> Tuple[bool, float, List[str]]:
+) -> Tuple[bool, float, List[str], List[str]]:
     """
-    对生成的关键帧图片进行严格质量检测。
+    对生成的关键帧图片进行质量检测（v2 分级机制）。
 
     Returns:
-        (是否通过, 综合质量评分, 问题列表)
+        (是否通过, 综合质量评分, blocker问题列表, warning问题列表)
     """
-    issues = []
+    blockers = []
+    warnings = []
     scores = {}
 
     if not image_path.exists():
-        return False, 0.0, ["图片文件不存在"]
+        return False, 0.0, ["图片文件不存在"], []
 
     try:
         with Image.open(image_path) as img:
             img = img.convert("RGB")
             width, height = img.size
     except Exception as e:
-        return False, 0.0, [f"图片格式错误：{e}"]
+        return False, 0.0, [f"图片格式错误：{e}"], []
 
     # 1. 清晰度检测（拉普拉斯方差）
     gray = img.convert("L")
@@ -170,10 +173,10 @@ def check_keyframe_quality(
     sharpness = edge_stat.stddev[0]
     scores["sharpness"] = min(100.0, sharpness)
 
-    if sharpness < 30:
-        issues.append(f"图片清晰度不足（{sharpness:.1f} < 30）")
-    elif sharpness < 50:
-        issues.append(f"图片清晰度一般（{sharpness:.1f}），建议重新生成")
+    if sharpness < 20:
+        blockers.append(f"图片严重模糊（{sharpness:.1f} < 20）")
+    elif sharpness < 40:
+        warnings.append(f"图片清晰度一般（{sharpness:.1f}），建议重新生成")
 
     # 2. 与商品参考图一致性
     if product_reference_path and product_reference_path.exists():
@@ -181,10 +184,10 @@ def check_keyframe_quality(
             sim = _product_similarity(product_reference_path, [image_path])
             scores["product_similarity"] = sim * 100
 
-            if sim < 0.50:
-                issues.append(f"商品一致性严重不足（{sim:.2f} < 0.50）")
-            elif sim < 0.65:
-                issues.append(f"商品一致性较弱（{sim:.2f}）")
+            if sim < 0.40:
+                blockers.append(f"商品一致性严重不足（{sim:.2f} < 0.40）")
+            elif sim < 0.60:
+                warnings.append(f"商品一致性较弱（{sim:.2f}）")
         else:
             scores["product_similarity"] = 100.0
     else:
@@ -196,28 +199,26 @@ def check_keyframe_quality(
             sim = _character_similarity(character_reference_path, [image_path])
             scores["character_similarity"] = sim * 100
 
-            if sim < 0.45:
-                issues.append(f"角色一致性严重不足（{sim:.2f} < 0.45）")
-            elif sim < 0.55:
-                issues.append(f"角色一致性较弱（{sim:.2f}）")
+            if sim < 0.35:
+                blockers.append(f"角色一致性严重不足（{sim:.2f} < 0.35）")
+            elif sim < 0.50:
+                warnings.append(f"角色一致性较弱（{sim:.2f}）")
         else:
             scores["character_similarity"] = 100.0
     else:
         scores["character_similarity"] = 100.0
 
     # 4. 构图评分（主体是否居中、占比合理）
-    # 简化版：检测亮度分布是否均匀
     stat = ImageStat.Stat(gray)
     brightness = stat.mean[0]
     brightness_std = stat.stddev[0]
 
-    # 亮度分布评分（标准差适中表示有层次）
-    if brightness_std < 10:
-        composition_score = 40.0  # 过于平淡
-        issues.append("图片对比度过低，构图可能过于平淡")
-    elif brightness_std > 80:
-        composition_score = 60.0  # 过于杂乱
-        issues.append("图片对比度过高，可能存在过曝或过暗区域")
+    if brightness_std < 8:
+        composition_score = 40.0
+        warnings.append("图片对比度过低，构图可能过于平淡")
+    elif brightness_std > 85:
+        composition_score = 55.0
+        warnings.append("图片对比度过高，可能存在过曝或过暗区域")
     else:
         composition_score = 90.0
 
@@ -233,13 +234,20 @@ def check_keyframe_quality(
 
     total_score = sum(scores.get(k, 0) * w for k, w in weights.items())
 
-    # 严格模式：有任何严重问题即失败
-    if strict_mode:
-        passed = len(issues) == 0 and total_score >= 70.0
+    # 6. 通过判定
+    # - 有任何 blocker → 不通过
+    # - 总分 < 55 → 不通过
+    # - strict_mode 下要求更高（总分 >= 65 且 warning 不超过 2 个）
+    if blockers:
+        passed = False
+    elif total_score < 55:
+        passed = False
+    elif strict_mode:
+        passed = total_score >= 65 and len(warnings) <= 3
     else:
-        passed = total_score >= 60.0
+        passed = True
 
-    return passed, total_score, issues
+    return passed, total_score, blockers, warnings
 
 
 # ── 批量图片生成与筛选 ──
@@ -256,6 +264,7 @@ def generate_keyframe_candidates(
     n_variants: int = 2,  # 每个片段生成几张备选
     aspect_ratio: str = "9:16",
     image_fidelity: float = 0.9,
+    negative_prompt: str = NEGATIVE_PROMPT,
 ) -> List[KeyframeCandidate]:
     """
     为关键片段批量生成图片候选，返回所有候选供后续筛选。
@@ -318,7 +327,7 @@ def generate_keyframe_candidates(
             try:
                 result = client.generate_image(
                     prompt=image_prompt,
-                    negative_prompt=NEGATIVE_PROMPT,
+                    negative_prompt=negative_prompt,
                     reference_image=ref_image_b64,
                     image_reference=ref_type,
                     image_fidelity=image_fidelity,
@@ -392,7 +401,7 @@ def select_best_keyframes(
         best_score = -1
 
         for candidate in seg_candidates:
-            passed, score, issues = check_keyframe_quality(
+            passed, score, blockers, warnings = check_keyframe_quality(
                 candidate.image_path,
                 product_reference_path=product_reference_path,
                 character_reference_path=character_reference_path,
@@ -402,13 +411,19 @@ def select_best_keyframes(
 
             candidate.quality_score = score
             candidate.passed = passed
-            candidate.issues = issues
+            candidate.blockers = blockers
+            candidate.warnings = warnings
+            candidate.issues = blockers + warnings
 
             # 细化评分
             if product_reference_path and product_reference_path.exists():
                 candidate.product_similarity = _product_similarity(product_reference_path, [candidate.image_path])
+            else:
+                candidate.product_similarity = None  # 无参考图，不适用
             if character_reference_path and character_reference_path.exists():
                 candidate.character_similarity = _character_similarity(character_reference_path, [candidate.image_path])
+            else:
+                candidate.character_similarity = None  # 无参考图，不适用
 
             if passed and score > best_score:
                 best_score = score
@@ -420,8 +435,8 @@ def select_best_keyframes(
             result.messages.append(
                 f"✅ 片段 {seg_idx+1} ({best_candidate.narrative}) 最佳图片："
                 f"评分 {best_candidate.quality_score:.1f}，"
-                f"商品一致性 {best_candidate.product_similarity:.2f}，"
-                f"角色一致性 {best_candidate.character_similarity:.2f}"
+                f"商品一致性 {'N/A（无参考图）' if best_candidate.product_similarity is None else f'{best_candidate.product_similarity:.2f}'}，"
+                f"角色一致性 {'N/A（无参考图）' if best_candidate.character_similarity is None else f'{best_candidate.character_similarity:.2f}'}"
             )
         else:
             # 没有通过的，选评分最高的作为失败记录
@@ -438,21 +453,153 @@ def select_best_keyframes(
     total_segments = len(segment_candidates)
     passed_segments = len(result.passed_candidates)
 
+    # 硬性一致性复核：即使 check_keyframe_quality 通过了，也要再检查一次
+    # 防止检测逻辑漏判导致低一致性图片混入
+    product_critical_narratives = {"showcase", "product", "cta", "result", "hook"}
+    final_passed = []
+    for cand in result.passed_candidates:
+        failed = False
+        fail_reason = ""
+
+        if product_reference_path and product_reference_path.exists():
+            if cand.narrative in product_critical_narratives and cand.product_similarity < 0.30:
+                failed = True
+                fail_reason = f"商品一致性过低（{cand.product_similarity:.2f} < 0.30），产品未正确呈现"
+
+        if character_reference_path and character_reference_path.exists():
+            if cand.narrative not in {"product", "demo"} and cand.character_similarity < 0.25:
+                failed = True
+                fail_reason = f"角色一致性过低（{cand.character_similarity:.2f} < 0.25），人物未正确呈现"
+
+        if failed:
+            cand.passed = False
+            cand.blockers.append(fail_reason)
+            cand.issues.append(fail_reason)
+            result.failed_candidates.append(cand)
+            result.messages.append(
+                f"❌ 片段 {cand.segment_index+1} ({cand.narrative}) 硬拦截：{fail_reason}"
+            )
+        else:
+            final_passed.append(cand)
+
+    result.passed_candidates = final_passed
+    passed_segments = len(final_passed)
+
     if total_segments > 0:
         pass_rate = passed_segments / total_segments
-        result.estimated_video_success_rate = min(0.95, 0.60 + pass_rate * 0.35)
+        result.estimated_video_success_rate = min(0.95, 0.40 + pass_rate * 0.50)
 
-        if pass_rate >= 0.8:
+        if pass_rate >= 1.0:
             result.can_proceed_to_video = True
-            result.messages.append(f"🎯 图片验证通过率 {pass_rate:.1%}，预估视频成功率 {result.estimated_video_success_rate:.1%}")
-        elif pass_rate >= 0.5:
-            result.can_proceed_to_video = True
-            result.messages.append(f"⚠️ 图片验证通过率 {pass_rate:.1%}，建议降低fidelity后重试未通过片段")
+            result.messages.append(f"🎯 图片验证全部通过，预估视频成功率 {result.estimated_video_success_rate:.1%}")
         else:
             result.can_proceed_to_video = False
-            result.messages.append(f"❌ 图片验证通过率过低（{pass_rate:.1%}），建议修复参考图或Prompt后再生成")
+            result.messages.append(f"❌ 图片验证未全部通过（通过率 {pass_rate:.1%}），关键片段失败则不生成视频")
+            result.messages.append("💡 建议：优化失败片段的参考图或 Prompt 后重试")
+
+    # 自我进化：记录图片先行验证的结果到历史库
+    try:
+        from quality_gate import record_failure_case, record_success_case
+
+        for cand in result.passed_candidates:
+            record_success_case(
+                product_category=product_category,
+                style_preference=style_preference,
+                num_clips=total_segments,
+                quality_score=cand.quality_score,
+                extra={
+                    "source": "image_first",
+                    "narrative_type": cand.narrative,
+                    "segment_index": cand.segment_index,
+                    "character_similarity": cand.character_similarity,
+                    "product_similarity": cand.product_similarity,
+                    "prompt_length": len(cand.prompt) if cand.prompt else 0,
+                },
+            )
+
+        for cand in result.failed_candidates:
+            fail_reason = "; ".join(cand.blockers[:3]) if cand.blockers else "unknown"
+            # 分类失败类型
+            fail_type = "image_first_failed"
+            fr_lower = fail_reason.lower()
+            if "商品一致性" in fr_lower or "product" in fr_lower:
+                fail_type = "product_inconsistency"
+            elif "角色一致性" in fr_lower or "character" in fr_lower or "face" in fr_lower:
+                fail_type = "character_inconsistency"
+            elif "质量" in fr_lower or "quality" in fr_lower or "模糊" in fr_lower:
+                fail_type = "image_quality_low"
+            record_failure_case(
+                failure_type=fail_type,
+                failure_reason=fail_reason[:200],
+                product_category=product_category,
+                style_preference=style_preference,
+                num_clips=total_segments,
+                segment_index=cand.segment_index,
+                narrative_type=cand.narrative,
+                quality_score=cand.quality_score,
+                prompt_length=len(cand.prompt) if cand.prompt else 0,
+                has_character_ref=character_reference_path is not None and character_reference_path.exists(),
+                has_product_ref=product_reference_path is not None and product_reference_path.exists(),
+                extra={
+                    "source": "image_first",
+                },
+            )
+    except Exception as e:
+        logger.warning(f"记录图片先行验证历史数据失败：{e}")
 
     return result
+
+
+def _auto_repair_prompt_for_failure(prompt: str, blockers: List[str], narrative: str) -> str:
+    """
+    根据关键帧失败原因自动修复 prompt。
+    自我进化机制：从失败中学习，自动调整 prompt 提高成功率。
+    """
+    if not blockers:
+        return prompt
+
+    repaired = prompt
+    blocker_text = " ".join(blockers).lower()
+
+    if "商品一致性" in blocker_text or "product" in blocker_text or "consistency" in blocker_text:
+        additions = [
+            "product clearly visible and centered",
+            "exact product packaging shape and colors",
+            "product in sharp focus",
+            "product details highly detailed",
+            "product prominently displayed",
+        ]
+        repaired = ", ".join(additions) + ", " + repaired
+
+    if "角色一致性" in blocker_text or "character" in blocker_text or "face" in blocker_text:
+        additions = [
+            "clear front-facing portrait",
+            "detailed facial features",
+            "face in sharp focus",
+            "exact face shape and features",
+            "natural skin texture",
+        ]
+        repaired = ", ".join(additions) + ", " + repaired
+
+    if "模糊" in blocker_text or "blur" in blocker_text or "sharp" in blocker_text:
+        additions = [
+            "ultra sharp focus",
+            "crisp details",
+            "high definition",
+            "professional photography",
+        ]
+        repaired = ", ".join(additions) + ", " + repaired
+
+    if "构图" in blocker_text or "composition" in blocker_text:
+        additions = [
+            "centered composition",
+            "rule of thirds",
+            "balanced framing",
+            "professional composition",
+        ]
+        repaired = ", ".join(additions) + ", " + repaired
+
+    return repaired
 
 
 # ── Prompt清洗工具 ──
@@ -500,6 +647,9 @@ def run_image_first_strategy(
     aspect_ratio: str = "9:16",
     image_fidelity: float = 0.9,
     strict_mode: bool = True,
+    negative_prompt: str = NEGATIVE_PROMPT,
+    product_category: str = "default",
+    style_preference: str = "default",
 ) -> ImageFirstResult:
     """
     运行完整的图片先行验证流程。
@@ -525,6 +675,7 @@ def run_image_first_strategy(
         n_variants=n_variants,
         aspect_ratio=aspect_ratio,
         image_fidelity=image_fidelity,
+        negative_prompt=negative_prompt,
     )
 
     if not candidates:
@@ -544,6 +695,53 @@ def run_image_first_strategy(
     result.strategy = mode.value
     # 估算图片成本（每张约 ¥0.10）
     result.total_image_cost = len(candidates) * 0.10
+
+    # 4. 自动修复重试：有关键片段失败时，自动修复 prompt 再试一次
+    failed_segments = {c.segment_index for c in result.failed_candidates}
+    if failed_segments and len(failed_segments) < len(key_segments):
+        logger.info(f"🔧 自动修复重试：{len(failed_segments)} 个片段失败，尝试修复 prompt 后重试...")
+
+        repaired_prompts = list(clip_prompts)
+        for cand in result.failed_candidates:
+            seg_idx = cand.segment_index
+            if seg_idx < len(repaired_prompts):
+                orig_prompt = repaired_prompts[seg_idx]
+                repaired = _auto_repair_prompt_for_failure(orig_prompt, cand.blockers, cand.narrative)
+                if repaired != orig_prompt:
+                    repaired_prompts[seg_idx] = repaired
+                    result.messages.append(
+                        f"🔧 片段 {seg_idx+1} ({cand.narrative}) 自动修复 prompt："
+                        f"{'、'.join(cand.blockers[:2])}"
+                    )
+
+        retry_candidates = generate_keyframe_candidates(
+            client=client,
+            segment_indices=sorted(failed_segments),
+            clip_prompts=repaired_prompts,
+            ad_script=ad_script,
+            product_reference_path=product_reference_path,
+            character_reference_path=character_reference_path,
+            save_dir=save_dir,
+            n_variants=1,
+            aspect_ratio=aspect_ratio,
+            image_fidelity=image_fidelity,
+            negative_prompt=negative_prompt,
+        )
+
+        if retry_candidates:
+            all_candidates = candidates + retry_candidates
+            result = select_best_keyframes(
+                all_candidates,
+                product_reference_path=product_reference_path,
+                character_reference_path=character_reference_path,
+                strict_mode=strict_mode,
+            )
+            result.strategy = mode.value
+            result.total_image_cost = (len(candidates) + len(retry_candidates)) * 0.10
+            result.messages.append(
+                f"🔄 自动重试完成：新增 {len(retry_candidates)} 张候选，"
+                f"最终通过 {len(result.passed_candidates)}/{len(key_segments)} 片段"
+            )
 
     logger.info(f"🎯 图片先行验证完成：{len(result.passed_candidates)}/{len(key_segments)} 片段通过")
 
@@ -579,8 +777,8 @@ def print_image_first_report(result: ImageFirstResult) -> None:
             print(f"   片段 {c.segment_index+1} ({c.narrative}):")
             print(f"      路径：{c.image_path.name}")
             print(f"      质量评分：{c.quality_score:.1f}/100")
-            print(f"      商品一致性：{c.product_similarity:.2f}")
-            print(f"      角色一致性：{c.character_similarity:.2f}")
+            print(f"      商品一致性：{'N/A（无参考图）' if c.product_similarity is None else f'{c.product_similarity:.2f}'}")
+            print(f"      角色一致性：{'N/A（无参考图）' if c.character_similarity is None else f'{c.character_similarity:.2f}'}")
 
     if result.failed_candidates:
         print("\n❌ 失败候选详情：")

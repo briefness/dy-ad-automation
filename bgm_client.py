@@ -13,6 +13,7 @@ API 文档：https://freetouse.com/api
 """
 
 import os
+import re
 import hashlib
 import json
 import random

@@ -2424,13 +2424,18 @@ def add_fancy_subtitles(
             print(f"  ✂️  字幕裁剪：{len(subtitles)} → {len(clipped_subs)} 条（超出视频时长）")
             subtitles = clipped_subs
 
+    # 计算安全边距（先算边距，再基于实际边距算安全宽度）
+    margin_v = int(video_h * bottom_margin_ratio)
+    margin_lr = int(video_w * 0.15)  # 左右各留 15%，防止被抖音右侧点赞栏（约 8%）遮挡
+
     # 字号按视频宽度自适应（基准：1080 宽 -> font_size）
     scale = video_w / 1080.0
     actual_font_size = int(font_size * scale)
     highlight_size = int(actual_font_size * 1.3)  # 高亮字放大 30%
 
-    # P1 修复：长文本自动缩小字号，避免单行超出安全宽度
-    # 估算：中文字符约占 1 个字号宽度，英文/数字约 0.5 个
+    # 长文本自动缩小字号，避免单行超出安全宽度
+    # 必须用实际渲染的 margin_lr 来算安全宽度，否则字号算大了会超出
+    safe_text_width = video_w - 2 * margin_lr
     max_line_len = 0
     for sub in subtitles:
         text = sub.get("text", "")
@@ -2439,17 +2444,12 @@ def add_fancy_subtitles(
         if width_estimate > max_line_len:
             max_line_len = width_estimate
 
-    safe_text_width = video_w - 2 * int(video_w * 0.08)  # 减去左右安全边距
     if max_line_len > 0 and actual_font_size * max_line_len > safe_text_width:
         new_size = int(safe_text_width / max_line_len)
-        new_size = max(new_size, int(actual_font_size * 0.6))  # 最多缩小 40%
+        new_size = max(new_size, int(actual_font_size * 0.5))  # 最多缩小 50%（长文本宁小勿超）
         print(f"  📏 长文本自适应字号：{actual_font_size} → {new_size}（最长 {max_line_len:.0f} 字）")
         actual_font_size = new_size
         highlight_size = int(actual_font_size * 1.3)
-
-    # 计算安全边距
-    margin_v = int(video_h * bottom_margin_ratio)
-    margin_lr = int(video_w * 0.15)  # #6 修复：左右各留 15%，防止被抖音右侧点赞栏（约 8%）遮挡
 
     # 构建 ASS 字幕文件（使用 output stem 命名，避免多版本并行时文件冲突）
     ass_path = output.parent / f"{output.stem}_fancy_subs.ass"

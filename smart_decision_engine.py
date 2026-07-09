@@ -36,6 +36,8 @@ from quality_gate import (
     estimate_cost,
     optimize_by_history,
     predict_failure,
+    record_failure_case,
+    get_failure_rate_by_type,
 )
 
 logger = setup_logger(__name__)
@@ -551,6 +553,89 @@ def build_partial_generation_plan(
     }
 
 
+# ── 图片先行验证校准 ──
+
+def _calibrate_with_image_first_result(
+    result: SmartDecisionResult,
+    image_first_result: Any,
+) -> None:
+    """
+    用图片先行验证的实际结果校准预测成功率。
+    
+    核心原则：实际生成验证过的数据 > 理论预测。
+    图片先行验证已经花了 API 成本，是最可靠的信号。
+    """
+    passed = getattr(image_first_result, "passed_count", 0)
+    total = getattr(image_first_result, "total_segments", 0)
+    can_proceed = getattr(image_first_result, "can_proceed_to_video", False)
+
+    if total == 0:
+        return
+
+    pass_rate = passed / total
+    original_rate = result.estimated_success_rate
+
+    result.messages.append("📸 图片先行验证校准：")
+    result.messages.append(f"   关键帧通过率：{passed}/{total} ({pass_rate:.0%})")
+
+    if can_proceed and pass_rate >= 1.0:
+        calibrated = max(original_rate, 0.85)
+        result.estimated_success_rate = min(calibrated, 0.95)
+        result.messages.append(
+            f"   ✅ 全部通过，成功率校准为 {result.estimated_success_rate:.0%}"
+            f"（原预测 {original_rate:.0%} → 实际验证后上调）"
+        )
+    elif can_proceed and pass_rate >= 0.6:
+        calibrated = (original_rate + 0.75) / 2
+        result.estimated_success_rate = min(calibrated, 0.85)
+        result.messages.append(
+            f"   ⚠️ 部分通过，成功率校准为 {result.estimated_success_rate:.0%}"
+            f"（原预测 {original_rate:.0%}）"
+        )
+    elif not can_proceed:
+        result.estimated_success_rate = min(original_rate, 0.40)
+        result.messages.append(
+            f"   ❌ 图片验证未通过，成功率下调至 {result.estimated_success_rate:.0%}"
+        )
+
+    best_keyframes = getattr(image_first_result, "best_keyframes", {})
+    passed_candidates = getattr(image_first_result, "passed_candidates", [])
+    if passed_candidates:
+        avg_quality = 0.0
+        avg_char_sim = 0.0
+        avg_prod_sim = 0.0
+        char_count = 0
+        prod_count = 0
+        for cand in passed_candidates:
+            quality = getattr(cand, "quality_score", 0)
+            char_sim = getattr(cand, "character_similarity", None)
+            prod_sim = getattr(cand, "product_similarity", None)
+            avg_quality += quality
+            if char_sim is not None:
+                avg_char_sim += char_sim
+                char_count += 1
+            if prod_sim is not None:
+                avg_prod_sim += prod_sim
+                prod_count += 1
+        total = len(passed_candidates)
+        if total > 0:
+            avg_quality /= total
+            char_display = "N/A" if char_count == 0 else f"{avg_char_sim / char_count:.2f}"
+            prod_display = "N/A" if prod_count == 0 else f"{avg_prod_sim / prod_count:.2f}"
+            result.messages.append(
+                f"   📊 平均质量：{avg_quality:.0f}/100，"
+                f"角色一致性：{char_display}，"
+                f"商品一致性：{prod_display}"
+            )
+
+            if avg_quality >= 80:
+                result.estimated_success_rate = min(result.estimated_success_rate + 0.03, 0.95)
+                result.messages.append("   ⬆️ 质量优秀，成功率 +3%")
+            elif avg_quality < 60:
+                result.estimated_success_rate = max(result.estimated_success_rate - 0.05, 0.20)
+                result.messages.append("   ⬇️ 质量偏低，成功率 -5%")
+
+
 # ── 主智能决策流程 ──
 
 def run_smart_decision(
@@ -559,6 +644,7 @@ def run_smart_decision(
     product_category: str = "美妆",
     style_preference: str = "cinematic",
     budget: float = 100.0,
+    image_first_result: Any = None,
 ) -> SmartDecisionResult:
     """
     运行智能决策流程。
@@ -680,16 +766,61 @@ def run_smart_decision(
     else:
         result.estimated_success_rate = base_success_rate
 
+    # Step 4.3: 历史失败率校准（自我进化：用历史数据调整理论预测）
+    hist_fail_count, hist_total, hist_fail_rate = get_failure_rate_by_type(
+        "video_generation_failed",
+        product_category=product_category,
+        lookback_days=30,
+    )
+    if hist_total >= 5:
+        hist_success_rate = 1.0 - hist_fail_rate
+        result.messages.append(
+            f"📊 历史数据校准：近30天 {hist_total} 条案例，"
+            f"成功率 {hist_success_rate:.0%}"
+        )
+        result.estimated_success_rate = result.estimated_success_rate * 0.7 + hist_success_rate * 0.3
+        result.messages.append(
+            f"   加权后预测成功率：{result.estimated_success_rate:.1%}"
+            f"（理论70% + 历史30%）"
+        )
+
+    # Step 4.5: 图片先行验证结果校准（实际数据 > 理论预测）
+    if image_first_result is not None:
+        _calibrate_with_image_first_result(result, image_first_result)
+
     # Step 5: 决策策略选择
-    # 核心原则：宁缺毋滥，不达标就不生成，避免浪费额度
-    # 只有同时满足：1) 成功率够高 2) 没有未解决的严重问题，才放行
+    # 核心原则：
+    # 1. 实际验证 > 理论预测（图片先行验证通过的权重最高）
+    # 2. 宁缺毋滥，不达标就不生成，避免浪费额度
+    # 3. 只有同时满足：成功率够高 + 没有未解决的严重问题，才放行
     auto_fix_count = len([p for p in result.repair_paths if p.auto_fixable])
     manual_fix_count = len([p for p in result.repair_paths if not p.auto_fixable])
 
-    # 质量门整体未通过时，即使成功率高也不能直接放行
-    # （除非所有失败项都是可自动修复的，且修复后成功率达标）
+    # 检查图片先行验证状态（实际验证结果优先级最高）
+    image_first_passed = False
+    if image_first_result is not None:
+        image_first_passed = getattr(image_first_result, "can_proceed_to_video", False)
+        image_pass_rate = getattr(image_first_result, "passed_count", 0) / max(1, getattr(image_first_result, "total_segments", 0))
+        if image_first_passed and image_pass_rate >= 1.0:
+            result.messages.append(
+                "📸 图片先行验证全部通过（实际生成验证），降低理论警告权重"
+            )
+
     quality_gate_passed = getattr(quality_gate_result, "passed", True)
-    if not quality_gate_passed and manual_fix_count > 0:
+
+    # 决策逻辑：图片先行全通过时，放宽质量门警告的限制
+    # （因为已经用实际生成验证过了，理论警告的参考价值下降）
+    if image_first_passed and result.estimated_success_rate >= 0.75:
+        result.can_proceed = True
+        result.recommended_strategy = "full_generate_image_validated"
+        result.messages.append(
+            f"✅ 推荐策略：全量生成（图片先行验证通过 + 成功率≥75%）"
+        )
+        if manual_fix_count > 0:
+            result.messages.append(
+                f"   ⚠️ 仍有 {manual_fix_count} 个优化建议，但不影响生成"
+            )
+    elif not quality_gate_passed and manual_fix_count > 0 and not image_first_passed:
         result.can_proceed = False
         result.recommended_strategy = "block_quality_gate"
         result.messages.append(
@@ -700,24 +831,12 @@ def run_smart_decision(
         result.can_proceed = True
         result.recommended_strategy = "full_generate"
         result.messages.append("✅ 推荐策略：全量生成（成功率≥75%，无手动修复项）")
-
-    elif result.estimated_success_rate >= 0.60 and manual_fix_count <= 1:
-        result.can_proceed = True
-        result.recommended_strategy = "partial_generate"
-        result.messages.append(f"💡 推荐策略：渐进式生成（成功率60-75%，{manual_fix_count}个手动修复项）")
-
-        result.partial_generation_plan = build_partial_generation_plan(
-            num_clips=5,
-            strategy="partial_generate",
-            budget=budget,
-        )
-
     else:
         result.can_proceed = False
-        if result.estimated_success_rate < 0.60:
+        if result.estimated_success_rate < 0.75:
             result.recommended_strategy = "block"
             result.messages.append(
-                f"❌ 推荐策略：阻止生成（成功率{result.estimated_success_rate:.0%} < 60%，大概率失败浪费额度）"
+                f"❌ 推荐策略：阻止生成（成功率{result.estimated_success_rate:.0%} < 75%，把握不足避免浪费额度）"
             )
         else:
             result.recommended_strategy = "block_needs_fix"
@@ -729,6 +848,27 @@ def run_smart_decision(
     # Step 6: 成本估算
     if quality_gate_result.cost_estimate:
         result.estimated_cost = quality_gate_result.cost_estimate.total_cost
+
+    # Step 7: 记录失败案例（自我进化的数据闭环）
+    if not result.can_proceed:
+        try:
+            num_clips = len(quality_gate_result.prompt_checks)
+            record_failure_case(
+                failure_type="quality_gate_block",
+                failure_reason=f"{result.recommended_strategy}: {'; '.join(p.issue for p in result.repair_paths[:3])}",
+                product_category=product_category,
+                style_preference=style_preference,
+                num_clips=num_clips,
+                quality_score=getattr(quality_gate_result, "quality_score", 0),
+                estimated_cost=result.estimated_cost,
+                extra={
+                    "recommended_strategy": result.recommended_strategy,
+                    "estimated_success_rate": result.estimated_success_rate,
+                    "repair_paths_count": len(result.repair_paths),
+                },
+            )
+        except Exception as e:
+            logger.warning(f"记录失败案例失败：{e}")
 
     result.decision_path = [
         "快速筛查",

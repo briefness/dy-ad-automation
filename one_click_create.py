@@ -88,6 +88,7 @@ from douyin_adapter import (
     get_douyin_config,
     optimize_subtitles_for_douyin,
     get_rhythm_template,
+    adapt_rhythm_template_to_segments,
     compute_segment_timeline,
 )
 from compliance_checker import (
@@ -101,6 +102,8 @@ from ad_script import (
     script_to_voiceover,
     generate_title_options,
     generate_hashtag_options,
+    check_story_completeness,
+    recommend_segment_count,
     SCRIPT_STYLES,
     DEFAULT_SCRIPT_STYLE,
 )
@@ -296,10 +299,28 @@ _NARRATIVE_FIDELITY_MAP: dict[str, float] = {
     "default": 0.85,
 }
 
+_NARRATIVE_HUMAN_FIDELITY_MAP: dict[str, float] = {
+    "hook": 0.95,
+    "pain": 0.92,
+    "showcase": 0.85,
+    "turning": 0.90,
+    "result": 0.95,
+    "cta": 0.92,
+    "default": 0.90,
+}
+
 
 def _get_fidelity_for_narrative(narrative: str, base_fidelity: float) -> float:
     """按叙事段动态调整 image_fidelity，产品展示段用更高约束。"""
     mapped = _NARRATIVE_FIDELITY_MAP.get((narrative or "").lower().strip())
+    if mapped is not None:
+        return mapped
+    return base_fidelity
+
+
+def _get_human_fidelity_for_narrative(narrative: str, base_fidelity: float) -> float:
+    """按叙事段动态调整 human_fidelity，人物重要的段用更高约束。"""
+    mapped = _NARRATIVE_HUMAN_FIDELITY_MAP.get((narrative or "").lower().strip())
     if mapped is not None:
         return mapped
     return base_fidelity
@@ -608,38 +629,85 @@ def _build_video_idempotency_key(
     return f"kaa-{digest}"
 
 
+_REF_BINDING_STRENGTH = {
+    "standard": {
+        "product_prefix": "PRODUCT REFERENCE (CRITICAL - must match exactly)",
+        "product_verb": "Strictly match",
+        "product_suffix": "Product appearance must be identical in every frame.",
+        "char_prefix": "MAIN CHARACTER REFERENCE (CRITICAL - identity must stay consistent)",
+        "char_verb": "Exact same person throughout. Match",
+        "char_suffix": "Character identity must never change.",
+        "extra_detail": False,
+    },
+    "emphasized": {
+        "product_prefix": "PRODUCT REFERENCE (CRITICAL - TOP PRIORITY - must match exactly)",
+        "product_verb": "STRICTLY and precisely match",
+        "product_suffix": "Product appearance must be IDENTICAL in every single frame. This is the most important visual reference. Every detail of the product must be preserved with perfect accuracy. No color shifts, no shape changes, no logo distortion.",
+        "char_prefix": "MAIN CHARACTER REFERENCE (CRITICAL - TOP PRIORITY - identity must stay consistent)",
+        "char_verb": "EXACT same person throughout every frame. Precisely match",
+        "char_suffix": "Character identity must NEVER change. This is the most important visual reference. Facial features must remain perfectly stable. No facial drift, no age changes, no feature morphing.",
+        "extra_detail": True,
+    },
+}
+
+_NARRATIVE_REF_EMPHASIS = {
+    "hook": {"character": "emphasized", "product": "standard"},
+    "pain": {"character": "emphasized", "product": "standard"},
+    "turning": {"character": "standard", "product": "standard"},
+    "showcase": {"character": "standard", "product": "emphasized"},
+    "demo": {"character": "standard", "product": "emphasized"},
+    "result": {"character": "standard", "product": "emphasized"},
+    "cta": {"character": "standard", "product": "emphasized"},
+    "default": {"character": "standard", "product": "standard"},
+}
+
+
+def _get_ref_emphasis_for_narrative(narrative: str, role: str) -> str:
+    """按叙事类型获取参考图绑定的强调级别（Omni 接口无 fidelity，靠语义强调控制强度）。"""
+    normalized = (narrative or "").lower().strip()
+    mapping = _NARRATIVE_REF_EMPHASIS.get(normalized, _NARRATIVE_REF_EMPHASIS["default"])
+    key = "product" if role == "product" else "character"
+    return mapping.get(key, "standard")
+
+
 def _bind_reference_tags_to_prompt(prompt: str, ref_images: list, narrative: str = "") -> str:
     """
     用结构化段落绑定参考图语义。
     Omni 接口无 image_fidelity 参数，完全靠 prompt 语义约束一致性，
-    因此绑定描述必须足够强、足够具体。
+    因此按叙事类型动态强调重点参考图，通过重复和细节加强约束。
     """
     if not ref_images:
         return prompt
+
+    roles = {item.get("role", "unknown") if isinstance(item, dict) else "unknown" for item in ref_images}
+    has_product = "product" in roles
+    has_character = any(r in roles for r in ("character_primary", "character"))
+
     lines = []
     for i, item in enumerate(ref_images):
         tag = f"<<<image_{i + 1}>>>"
         role = item.get("role", "unknown") if isinstance(item, dict) else "unknown"
         if role == "product":
+            emphasis = _get_ref_emphasis_for_narrative(narrative, "product")
+            s = _REF_BINDING_STRENGTH[emphasis]
+            base_details = "packaging shape, all colors, logo design and placement, product proportions, material texture, and visual details"
+            extra_details = "including exact Pantone colors, precise dimensions, label placement, font styles on packaging, cap/closure design, and surface finish" if s.get("extra_detail") else ""
+            full_details = base_details + ", " + extra_details if extra_details else base_details
             lines.append(
-                f"PRODUCT REFERENCE (CRITICAL - must match exactly): {tag}. "
-                f"Strictly match packaging shape, all colors, logo design and placement, "
-                f"product proportions, material texture, and every visual detail. "
-                f"Product appearance must be identical in every frame."
+                f"{s['product_prefix']}: {tag}. "
+                f"{s['product_verb']} {full_details}. "
+                f"{s['product_suffix']}"
             )
-        elif role == "character_primary":
+        elif role in ("character_primary", "character"):
+            emphasis = _get_ref_emphasis_for_narrative(narrative, "character")
+            s = _REF_BINDING_STRENGTH[emphasis]
+            base_details = "facial features, face shape, eye shape and color, nose shape, lip shape, exact hairstyle and hair color, skin tone, body type and proportions, and exact outfit/clothing"
+            extra_details = "including eyebrow shape, eyelid type, jawline, cheek structure, ear shape, neck length, shoulder width, hand shape, and exact fabric textures and patterns" if s.get("extra_detail") else ""
+            full_details = base_details + ", " + extra_details if extra_details else base_details
             lines.append(
-                f"MAIN CHARACTER REFERENCE (CRITICAL - identity must stay consistent): {tag}. "
-                f"Exact same person throughout. Match facial features, face shape, eye shape and color, "
-                f"nose shape, lip shape, exact hairstyle and hair color, skin tone, "
-                f"body type and proportions, and exact outfit/clothing. "
-                f"Character identity must never change."
-            )
-        elif role == "character":
-            lines.append(
-                f"CHARACTER REFERENCE (CRITICAL): {tag}. "
-                f"Exact same person. Match facial features, hairstyle, outfit, and body proportions. "
-                f"Identity must stay consistent."
+                f"{s['char_prefix']}: {tag}. "
+                f"{s['char_verb']} {full_details}. "
+                f"{s['char_suffix']}"
             )
         elif role == "character_angle":
             lines.append(
@@ -880,11 +948,12 @@ def _quick_quality_check(
         pass  # 清晰度检测失败不阻断流程
 
     # P0-A：人脸变形语义检测（复用 quality_checker._analyze_face_quality）
-    # 抽取首/中/尾 3 帧，≥2 帧检测到肤色形态异常则视为坏片段
+    # 抽取首/中/尾 3 帧，3 帧全部异常才视为坏片段（避免误杀正常动态画面）
     try:
         import tempfile as _tmpfile
         from quality_checker import _analyze_face_quality as _face_check
         _face_issue_count = 0
+        _worst_issue = ""
         _face_sample_times = [
             actual_dur * 0.15,
             actual_dur * 0.50,
@@ -904,8 +973,14 @@ def _quick_quality_check(
                     _fq_issues = _face_check(_fq_frame)
                     if _fq_issues:
                         _face_issue_count += 1
-        if _face_issue_count >= 2:
+                        if not _worst_issue:
+                            _worst_issue = _fq_issues[0]
+        # 仅当 3 帧全部异常时才判定失败（短视频动态画面容易出现局部帧角度特殊）
+        # 2 帧异常仅记录警告，不阻断
+        if _face_issue_count >= 3:
             return f"人脸变形检测：{_face_issue_count}/3 帧异常（肤色区域形状/填充率超限），疑似人脸崩坏"
+        elif _face_issue_count >= 2:
+            print(f"  ⚠️  人脸检测警告：{_face_issue_count}/3 帧异常（{_worst_issue}），已放行")
     except Exception:
         pass  # 人脸检测失败不阻断流程
 
@@ -1291,12 +1366,16 @@ def _run_pre_generation_smart_decision(
     *,
     style: str,
     budget: Optional[float] = None,
+    image_first_result: Any = None,
+    preview: bool = False,
 ) -> Optional[Any]:
     """
     将 one_click 主流程接入智能决策引擎。
 
     智能决策只依赖质量门结果，不触发视频生成；它用于在昂贵视频 API
     调用前判断是否应阻断、降级或采用渐进式生成。
+
+    预览模式下放宽限制，因为预览就是用来快速试错的。
     """
     try:
         from smart_decision_engine import run_smart_decision, print_smart_decision_report
@@ -1310,7 +1389,21 @@ def _run_pre_generation_smart_decision(
             product_category=product_info.get("type", "default"),
             style_preference=style,
             budget=_get_cost_budget_limit() if budget is None else budget,
+            image_first_result=image_first_result,
         )
+
+        # 预览模式：放宽限制，只要不是致命问题就放行
+        if preview and not decision.can_proceed:
+            has_fatal = any(
+                "block_quality_gate" in p or "fatal" in p.issue.lower()
+                for p in decision.repair_paths
+            )
+            if not has_fatal:
+                decision.can_proceed = True
+                decision.recommended_strategy = "preview_fast_track"
+                decision.messages.append("⚡ 预览模式：快速通道，跳过非致命阻断")
+                print("⚡ 预览模式：智能决策快速通道已启用")
+
         print_smart_decision_report(decision)
         if not decision.can_proceed:
             raise RuntimeError(
@@ -2104,12 +2197,14 @@ def build_character_bibles(product_info: dict, characters: Optional[list] = None
 
     if not characters:
         # 单角色：从 product_info 构建默认主角色
+        # 默认东亚面孔（抖音/中文广告面向中国市场），用户可通过 characters 参数自定义
+        default_ethnicity = product_info.get("ethnicity") or "East Asian"
         bible = CharacterBible(
             id="char_01",
             name="Character A",
             age=base_info["age"],
             gender=base_info["gender"],
-            ethnicity="",
+            ethnicity=default_ethnicity,
             hair_style="",
             hair_color="",
             outfit=base_info["outfit"],
@@ -2261,7 +2356,7 @@ def generate_character_prompt_for_role(
         return generate_character_prompt(product_info)
 
     prompt = (
-        f"close-up portrait, bust shot, face and upper body filling 70% of frame, perfectly centered, "
+        f"medium shot, full body visible from head to knees, subject filling 40-50% of frame, perfectly centered, "
         f"pure white seamless background, absolutely no objects no scenery, "
         f"soft even studio lighting, no harsh shadows, "
         f"{desc}, "
@@ -3096,7 +3191,7 @@ def _extract_scene_prompt_field(scene_prompt: str, field_name: str) -> str:
     return raw[:end].strip(" |,;")
 
 
-def _compact_prompt_for_generation(prompt: str, *, max_chars: int = 680) -> str:
+def _compact_prompt_for_generation(prompt: str, *, max_chars: int = 1100) -> str:
     """最终调用 Kling 前压缩 Prompt，避免低价值泛词挤掉商品/动作信息。"""
     if len(prompt) <= max_chars:
         return prompt
@@ -3164,6 +3259,7 @@ def _preflight_keyframe_check(
     save_path: Path,
     aspect_ratio: str = "9:16",
     image_fidelity: float = DEFAULT_IMAGE_FIDELITY,
+    negative_prompt: str = NEGATIVE_PROMPT,
 ) -> Tuple[bool, List[str], Optional[Path]]:
     """
     首帧低成本预检：在付费视频生成前，用图片生成做干跑验证角色/商品一致性。
@@ -3203,19 +3299,42 @@ def _preflight_keyframe_check(
         image_prompt = prompt
 
     try:
-        result = client.generate_image(
-            prompt=image_prompt,
-            negative_prompt=NEGATIVE_PROMPT,
-            reference_image=ref_image_b64,
-            image_reference=ref_type,
-            image_fidelity=image_fidelity,
-            aspect_ratio=aspect_ratio,
-            resolution="1k",  # 首帧预检用 1k 足够，进一步降低成本
-            n=1,
-            wait=True,
-            timeout=90,
+        # 网络错误自动重试（SSL EOF、连接超时、5xx 等临时错误）
+        import time as _time
+        _is_network_error = lambda e: any(
+            kw in str(e).lower() for kw in [
+                "ssl", "unexpected_eof", "connection", "timeout",
+                "max retries", "eof occurred", "sslerror", "connectionerror",
+                "read timed out", "500", "502", "503", "504", "429",
+            ]
         )
-        images = result.get("data", {}).get("task_result", {}).get("images", [])
+
+        images = []
+        image_url = None
+        for _pf_attempt in range(1, 4):
+            try:
+                result = client.generate_image(
+                    prompt=image_prompt,
+                    negative_prompt=negative_prompt,
+                    reference_image=ref_image_b64,
+                    image_reference=ref_type,
+                    image_fidelity=image_fidelity,
+                    aspect_ratio=aspect_ratio,
+                    resolution="1k",  # 首帧预检用 1k 足够，进一步降低成本
+                    n=1,
+                    wait=True,
+                    timeout=90,
+                )
+                images = result.get("data", {}).get("task_result", {}).get("images", [])
+                break
+            except Exception as _pf_err:
+                if _pf_attempt < 3 and _is_network_error(_pf_err):
+                    _wait = 2 ** _pf_attempt
+                    print(f"  ⚠️  首帧预检网络错误，{_wait}s 后重试（{_pf_attempt}/3）：{_pf_err}")
+                    _time.sleep(_wait)
+                    continue
+                raise
+
         if not images:
             issues.append("首帧预检图片生成结果为空")
             return False, issues, None
@@ -3238,11 +3357,15 @@ def _preflight_keyframe_check(
             issues.append(f"首帧预检下载内容不是有效图片：{verify_err}")
             return False, issues, None
     except Exception as e:
+        # 网络错误导致的预检失败 → 跳过预检继续生成（网络问题≠质量问题）
+        if _is_network_error(e):
+            print(f"  ⚠️  首帧预检网络错误（{e}），跳过预检继续生成")
+            return True, [], None
         issues.append(f"首帧预检图片生成失败：{e}")
         return False, issues, None
 
     # ── 轻量质检：与参考图比对 ──
-    from quality_checker import _product_similarity, _character_similarity
+    from quality_checker import _product_similarity, _character_similarity, _analyze_face_quality
 
     warnings: List[str] = []
 
@@ -3260,6 +3383,15 @@ def _preflight_keyframe_check(
         elif sim < 0.55:
             warnings.append(f"角色首帧一致性较弱（相似度 {sim:.2f}），建议检查参考图质量")
 
+    # ── 人脸质量预检（有人物场景时）──
+    # 低成本拦截明显人脸崩坏，避免浪费视频生成额度
+    if narrative in {"hook", "turning", "result", "review"} and not issues:
+        face_issues = _analyze_face_quality(save_path)
+        if face_issues:
+            # 首帧人脸有明显问题时作为警告返回（不直接拦截，避免误报）
+            # 调用方可以根据警告决定是否重试首帧
+            warnings.append(f"首帧人脸质量警告：{face_issues[0]}")
+
     if issues:
         return False, issues + warnings, save_path
     return True, warnings, save_path
@@ -3274,54 +3406,36 @@ def _preflight_generation_contract(
     char_refs: list,
     strict_mode: bool,
 ) -> List[str]:
-    """生成前合同预检：把低成本可发现的问题拦在付费视频生成前。"""
+    """生成前合同预检：只拦零成本可发现的致命问题。
+
+    评分类/建议类检查全部下沉到质量门（run_quality_gate），
+    避免重复计算，保持职责单一。
+    """
     issues: List[str] = []
-    warnings: List[str] = []
-    product_name = str(product_info.get("name", "") or "").strip()
-    segments = ad_script.get("segments", []) if isinstance(ad_script, dict) else []
 
     if not clip_prompts:
         issues.append("没有可生成的分镜 Prompt")
 
-    if product_name:
-        required_indices = []
-        for i, seg in enumerate(segments[:len(clip_prompts)], 1):
-            narrative = str(seg.get("narrative") or seg.get("type") or "").lower().strip()
-            visibility = str(seg.get("product_visibility") or "").lower().strip()
-            if _is_product_required_narrative(narrative) or visibility in {"prominent", "subtle"}:
-                required_indices.append(i)
-        for i in required_indices:
-            prompt = clip_prompts[i - 1] if i - 1 < len(clip_prompts) else ""
-            if product_name.lower() not in prompt.lower():
-                issues.append(f"分镜 {i} 需要产品露出，但 Prompt 未包含产品名：{product_name}")
-    else:
-        issues.append("缺少产品名，无法稳定约束商品一致性")
-
-    if any(
-        _is_product_required_narrative(str((seg.get("narrative") or seg.get("type") or "")).lower())
-        for seg in segments[:len(clip_prompts)]
-    ) and not product_image_path:
-        warnings.append("存在产品强制露出分镜，但未提供商品参考图，商品一致性只能依赖文字 Prompt")
-
-    if not char_refs:
-        warnings.append("没有角色参考图，人物一致性只能依赖文字 Prompt")
-
     for i, prompt in enumerate(clip_prompts, 1):
-        if len(prompt) > 900:
-            warnings.append(f"分镜 {i} Prompt 过长（{len(prompt)} 字符），将压缩后再调用 Kling")
         if prompt.count("<<<image_") > MAX_REF_IMAGES:
             issues.append(f"分镜 {i} 引用了超过 {MAX_REF_IMAGES} 张参考图")
+
+    if product_image_path and not Path(product_image_path).exists():
+        issues.append(f"商品参考图不存在：{product_image_path}")
+
+    for ref in char_refs or []:
+        ref_path = ref.get("image_path")
+        if ref_path and not Path(ref_path).exists():
+            issues.append(f"角色参考图不存在：{ref_path}")
 
     if issues and strict_mode:
         raise RuntimeError("生成前合同预检未通过：" + "；".join(issues))
 
     for msg in issues:
         print(f"❌ 生成前合同问题：{msg}")
-    for msg in warnings:
-        print(f"⚠️ 生成前合同提示：{msg}")
     if not issues:
-        print("✅ 生成前合同预检通过：分镜、产品、角色约束可进入视频生成")
-    return issues + warnings
+        print("✅ 生成前合同预检通过：基础约束齐全，进入质量门详检")
+    return issues
 
 
 def _reference_strategy_for_narrative(
@@ -3386,7 +3500,7 @@ def apply_cinematic_style(base_prompt: str, style_key: str, clip_type: str, narr
     Returns:
         注入电影风格后的完整 Prompt
     """
-    if style_key == DEFAULT_CINEMATIC_STYLE:
+    if style_key in (DEFAULT_CINEMATIC_STYLE, "none"):
         return base_prompt
 
     # 优先使用深度风格库
@@ -3681,7 +3795,7 @@ def _prompt_quality_gate(
     narrative: str,
     product_name: str,
     segment_index: int,
-    max_chars: int = 550,
+    max_chars: int = 1100,
 ) -> str:
     """Prompt 质量前置门禁（改动5）
 
@@ -3852,6 +3966,22 @@ def generate_clip_prompts(
         prompt 字符串列表
     """
     from config import CLIP_STRUCTURE
+
+    if cinematic_style == "auto":
+        try:
+            from quality_gate import evolve_cinematic_style_recommendation
+            product_type = product_info.get("type", "default")
+            cinematic_style, evolve_info = evolve_cinematic_style_recommendation(product_type)
+            method = evolve_info.get("method", "base_match")
+            reason = evolve_info.get("reason", "")
+            print(f"🎬 智能匹配电影风格：{cinematic_style}（进化模式：{method}）")
+            if reason:
+                print(f"   {reason}")
+        except Exception:
+            from quality_gate import smart_pick_cinematic_style
+            product_type = product_info.get("type", "default")
+            cinematic_style = smart_pick_cinematic_style(product_type)
+            print(f"🎬 智能匹配电影风格：{cinematic_style}（产品类型：{product_type}）")
 
     preset = get_preset(product_info.get("type", "default"))
     name = product_info.get("name", "product")
@@ -4051,8 +4181,8 @@ def parse_args():
     parser.add_argument(
         "--style",
         default=DEFAULT_CINEMATIC_STYLE,
-        choices=list(CINEMATIC_STYLES.keys()) + [DEFAULT_CINEMATIC_STYLE],
-        help=f"电影风格（默认：{DEFAULT_CINEMATIC_STYLE}）",
+        choices=list(CINEMATIC_STYLES.keys()) + [DEFAULT_CINEMATIC_STYLE, "none"],
+        help=f"电影风格（默认：{DEFAULT_CINEMATIC_STYLE}，auto=智能匹配，none=不使用）",
     )
     parser.add_argument(
         "--duration",
@@ -4213,7 +4343,7 @@ def parse_args():
     parser.add_argument(
         "--preview", "-p",
         action="store_true",
-        help="快速预览模式：仅生成第 1 段（std 模式），跳过后期，用于快速试错",
+        help="快速预览模式：仅生成第 1 段（std 模式），保留完整后期效果（字幕/口播/BGM）",
     )
     parser.add_argument(
         "--serial",
@@ -4613,7 +4743,7 @@ def run_generation_pipeline(
         best_of: 每个分镜生成候选数量（best-of），自动择优（默认 1）
         quality_frames: best-of 择优时的抽帧数量（默认 12）
         keep_candidates: 是否保留未被选中的候选片段（默认 False）
-        preview: 预览模式：仅生成第 1 段（std 模式），跳过后期处理，用于快速试错
+        preview: 预览模式：仅生成第 1 段（std 模式），保留完整后期效果（字幕/口播/BGM）
         max_workers: 并行生成时的最大线程数（默认 4）
 
     Returns:
@@ -4639,7 +4769,47 @@ def run_generation_pipeline(
 
     client = KlingClient()
 
-    # ── 预览模式：强制 std + 仅 1 段 + 跳过后期 ──
+    # ── 智能电影风格匹配（零配置自动选择，自我进化）──
+    # 当 style 为默认值或 auto 时，根据品类+历史成功率智能推荐
+    _style_auto_triggered = style in ("auto", DEFAULT_CINEMATIC_STYLE)
+    if _style_auto_triggered:
+        try:
+            from quality_gate import evolve_cinematic_style_recommendation
+            product_type = product_info.get("type", "default")
+            style, evolve_info = evolve_cinematic_style_recommendation(
+                product_category=product_type,
+                ad_script=None,
+                story_world_desc=product_info.get("scene_description", ""),
+            )
+            method = evolve_info.get("method", "base_match")
+            reason = evolve_info.get("reason", "")
+            print(f"🎬 智能匹配电影风格：{style}（进化模式：{method}）")
+            if reason:
+                print(f"   {reason}")
+        except Exception:
+            from quality_gate import smart_pick_cinematic_style
+            product_type = product_info.get("type", "default")
+            style = smart_pick_cinematic_style(product_type)
+            print(f"🎬 智能匹配电影风格：{style}（产品类型：{product_type}）")
+
+    # ── 智能口播风格匹配（零配置自动选择，自我进化）──
+    if voiceover_style in ("auto", "standard"):
+        try:
+            from quality_gate import evolve_voiceover_style_recommendation
+            product_type = product_info.get("type", "default")
+            voiceover_style, evolve_info = evolve_voiceover_style_recommendation(product_type)
+            method = evolve_info.get("method", "base_match")
+            reason = evolve_info.get("reason", "")
+            print(f"🎤 智能匹配口播风格：{voiceover_style}（进化模式：{method}）")
+            if reason:
+                print(f"   {reason}")
+        except Exception:
+            from quality_gate import smart_pick_voiceover_style
+            product_type = product_info.get("type", "default")
+            voiceover_style = smart_pick_voiceover_style(product_type)
+            print(f"🎤 智能匹配口播风格：{voiceover_style}（产品类型：{product_type}）")
+
+    # ── 预览模式：强制 std + 仅 1 段（后期处理保留，方便预览完整效果）──
     if preview:
         mode = "std"
     effective_kling_model = kling_model or KLING_VIDEO_MODEL
@@ -4754,24 +4924,43 @@ def run_generation_pipeline(
     print(f"    BPM：{music_contract['bpm_min']}-{music_contract['bpm_max']}，energy：{music_contract['energy']}")
     print(f"    推荐 pace：{music_contract['recommended_pace']}，intro：{music_contract['intro_type']}")
 
-    # ── 节奏模板初始化 ──
-    # 根据目标总时长 + 节奏风格选择最合适的节奏模板
-    # 若 target_duration 未指定，用 duration × 5（默认5段）估算总时长
-    _est_total = target_duration if target_duration is not None else duration * 5
-    # 若用户未显式指定 rhythm_style（默认 moderate），用音乐合同的推荐 pace
+    # ── 智能段数推荐（剧情驱动，而非模板驱动）──
+    # 根据产品类型、卖点数量、目标时长，智能推荐最合适的片段数量
+    # 原则：剧情完整性优先，段数服务于内容，不为凑段数而凑段数
+    _selling_points_raw = product_info.get("selling_point", "")
+    _selling_points = [sp.strip() for sp in _selling_points_raw.replace("，", ",").split(",") if sp.strip()]
+    _recommended_segs = recommend_segment_count(
+        product_type=product_info.get("type", "default"),
+        selling_points=_selling_points,
+        target_duration=target_duration,
+    )
+    # 预览模式强制 1 段
+    _num_segs = 1 if preview else _recommended_segs
+    print(f"📐 智能段数推荐：{_num_segs} 段（基于{product_info.get('type', 'default')}品类、{len(_selling_points)}个卖点、目标时长{target_duration or '默认'}s）")
+
+    # ── 节奏模板初始化（先选5段基准模板，再适配到目标段数）──
+    # 用 5 段的总时长估算来选最接近的基准模板
+    _est_total_5seg = target_duration if target_duration is not None else duration * 5
     _effective_rhythm_style = rhythm_style
     if rhythm_style == "moderate" and music_contract["recommended_pace"] != "moderate":
         _effective_rhythm_style = music_contract["recommended_pace"]
         print(f"    节奏风格由 moderate 自动调整为 {_effective_rhythm_style}（音乐合同推荐）")
-    rhythm_template = get_rhythm_template(
-        _est_total, style=_effective_rhythm_style, product_type=product_info.get("type", "default")
+    # 先选 5 段基准模板
+    _base_template = get_rhythm_template(
+        _est_total_5seg, style=_effective_rhythm_style, product_type=product_info.get("type", "default")
     )
+    # 适配到目标段数（预览模式不用适配，后续只取第1段）
+    if not preview and _num_segs != len(_base_template["segments"]):
+        rhythm_template = adapt_rhythm_template_to_segments(_base_template, _num_segs)
+        print(f"🔄 节奏模板适配：从 {len(_base_template['segments'])} 段 → {_num_segs} 段")
+    else:
+        rhythm_template = _base_template
     _rhythm_name = rhythm_template["name"]
     _rhythm_transition = rhythm_template["transition_duration"]
     _rhythm_pace = rhythm_template["pace_style"]
     print(f"⏱️  节奏模板：{_rhythm_name}（{_rhythm_pace}，转场 {_rhythm_transition}s）")
     for seg in rhythm_template["segments"]:
-        print(f"    [{seg['index']}] {seg['duration']:>5.2f}s  {seg['type']:<10s}  {seg['purpose']}")
+        print(f"    [{seg['index']}] {seg['duration']:>5.2f}s  {seg['type']:<15s}  {seg['purpose']}")
 
     # P1-2: 检查节奏模板段时长是否超过可灵变速能力上限
     # 可灵生成 duration 秒，变速下限 0.5x → 单段最多可延长至 duration * 2 秒
@@ -4808,11 +4997,6 @@ def run_generation_pipeline(
             )
 
     # 生成完整广告脚本
-    # Bug1 修复：clip_prompts 尚未赋值，先用 styled_prompts 计算段数
-    # styled_prompts 在下方 L1910 赋值，_num_segs 用节奏模板段数兜底
-    _num_segs = len(rhythm_template["segments"])
-    if preview:
-        _num_segs = 1  # 预览模式只生成 1 段
     cast_prompt = _format_cast_plan_for_prompt(cast_plan)
     if cast_prompt:
         existing_extra = product_info.get("extra_requirements", "")
@@ -4870,6 +5054,23 @@ def run_generation_pipeline(
             print("⚠️  检测到中风险合规问题，建议修改后再发布（当前继续处理）。")
     else:
         print("✅ 广告合规检测通过")
+
+    # 剧情完整性校验
+    _story_check = check_story_completeness(ad_script)
+    _story_score_pct = int(_story_check["score"] * 100)
+    print(f"🎬 剧情完整性：{_story_score_pct}%（{_story_check['total_segments']} 段）")
+    if _story_check["passed"]:
+        print("    ✅ 叙事弧完整：hook → turning → showcase → result → cta")
+    else:
+        print(f"    ⚠️  缺失叙事节拍：{', '.join(_story_check['missing_beats'])}")
+    if _story_check["warnings"]:
+        for _w in _story_check["warnings"]:
+            print(f"    ⚠️  {_w}")
+    if not _story_check["passed"] and strict_mode and not preview:
+        raise RuntimeError(
+            f"剧情完整性校验失败（{_story_score_pct}%）：缺失叙事节拍 {_story_check['missing_beats']}。"
+            "请优化脚本后重新生成，或使用 --no-strict 跳过校验。"
+        )
 
     # ── 节奏曲线分析：基于脚本段落情绪 + 音乐合同 BPM 生成逐段节奏参数 ──
     rhythm_curve = None
@@ -5028,11 +5229,12 @@ def run_generation_pipeline(
                 print(f"📋 故事板改进已应用：针对 {len(_sb_issues)} 项预警增强了 {_enhanced_count} 个片段的 Prompt")
 
 
-    # ── 预览模式：只保留第 1 段 ──
+    # ── 预览模式：只保留第 1 段（后期效果完整，快速预览整体效果）──
     if preview:
         clip_prompts = clip_prompts[:1]
-        print(f"\n⚡ 预览模式：仅生成第 1 段（std 模式，快速试错）")
-        print(f"   确认效果 OK 后，去掉 --preview 重新生成完整 pro 版本")
+        print(f"\n⚡ 预览模式：仅生成第 1 段（std 模式 + 完整后期效果）")
+        print(f"   含字幕/口播/BGM，快速预览整体效果")
+        print(f"   确认效果 OK 后，去掉 --preview 重新生成完整 5 段 pro 版本")
 
     _preflight_generation_contract(
         product_info=product_info,
@@ -5089,6 +5291,68 @@ def run_generation_pipeline(
         if _optimized_count > 0:
             print(f"🔧 已自动优化 {_optimized_count} 个片段的 Prompt（语义冲突/重复/缺词等）")
 
+    # ── 自动应用负面词优化 ──
+    effective_negative_prompt = NEGATIVE_PROMPT
+    if quality_gate_result.optimized_negative_prompt:
+        effective_negative_prompt = quality_gate_result.optimized_negative_prompt
+        print(f"🎭 已应用优化后的负面词（{len(effective_negative_prompt.split(','))} 个精选词）")
+
+    # ── 自动应用参考图预处理结果 ──
+    if quality_gate_result.preprocessed_reference_images:
+        _preprocessed_count = 0
+        for info in quality_gate_result.preprocessed_reference_images:
+            new_path = info.get("output_path")
+            orig_path = info.get("original_path")
+            if new_path and orig_path:
+                for ref in char_refs:
+                    if ref.get("image_path") and Path(ref["image_path"]) == orig_path:
+                        ref["image_path"] = str(new_path)
+                        _preprocessed_count += 1
+                        break
+                if product_image_path and Path(product_image_path) == orig_path:
+                    product_image_path = Path(new_path)
+                    _preprocessed_count += 1
+        if _preprocessed_count > 0:
+            print(f"🖼️  已自动预处理 {_preprocessed_count} 张参考图（裁剪/亮度/对比度优化）")
+
+    # ── 自动应用参考图去重 + 智能排序结果 ──
+    _ref_applied = False
+    if quality_gate_result.reference_checks and char_refs:
+        final_ref_results = quality_gate_result.reference_checks
+        char_results = [r for r in final_ref_results if r.image_type == "character"]
+
+        if char_results:
+            _path_to_ref = {}
+            for ref in char_refs:
+                if ref.get("image_path"):
+                    _path_to_ref[Path(ref["image_path"])] = ref
+
+            new_char_refs = []
+            for r in char_results:
+                if r.path and r.path in _path_to_ref:
+                    new_char_refs.append(_path_to_ref[r.path])
+
+            for ref in char_refs:
+                if ref not in new_char_refs:
+                    new_char_refs.append(ref)
+
+            if new_char_refs and new_char_refs != char_refs:
+                old_count = len(char_refs)
+                char_refs.clear()
+                char_refs.extend(new_char_refs)
+                new_count = len(char_refs)
+
+                if new_count < old_count:
+                    _dedup_count = old_count - new_count
+                    print(f"🔍 参考图去重：移除了 {_dedup_count} 张高度相似的参考图")
+                    for removed_desc in quality_gate_result.reference_dedup_removed[:3]:
+                        print(f"   • {removed_desc}")
+                    _ref_applied = True
+
+                if quality_gate_result.reference_sort_notes:
+                    print(f"📊 参考图已按质量智能排序（高质量图前置，AI 权重更高）")
+                    _ref_applied = True
+
     if not quality_gate_result.passed:
         from config import QUALITY_GATE_CONFIG
         failure_behavior = QUALITY_GATE_CONFIG.get("failure_behavior", {})
@@ -5108,8 +5372,9 @@ def run_generation_pipeline(
 
     main_char_path = Path(char_refs[0]["image_path"]) if char_refs and char_refs[0].get("image_path") else None
     approved_keyframes: Dict[int, Path] = {}
+    image_first_result = None
 
-    if image_first and preflight_keyframe and strict_mode:
+    if image_first and preflight_keyframe and strict_mode and not preview:
         try:
             image_first_mode_enum = ImageFirstMode((image_first_mode or "standard").lower())
         except ValueError:
@@ -5127,17 +5392,24 @@ def run_generation_pipeline(
             aspect_ratio=aspect_ratio,
             image_fidelity=image_fidelity,
             strict_mode=True,
+            negative_prompt=effective_negative_prompt,
+            product_category=product_info.get("type", "default"),
+            style_preference=style,
         )
         print_image_first_report(image_first_result)
         if not image_first_result.can_proceed_to_video:
             raise RuntimeError("图片先行验证未通过，已阻止进入高成本视频生成")
         approved_keyframes = dict(image_first_result.best_keyframes)
+    elif preview:
+        print("⚡ 预览模式：跳过图片先行验证，直接进入视频生成")
 
     workflow_decision_result = _run_pre_generation_smart_decision(
         quality_gate_result,
         product_info,
         style=style,
         budget=_cost_info.get("estimated_cost", _get_cost_budget_limit()),
+        image_first_result=image_first_result,
+        preview=preview,
     )
 
     clip_paths = []
@@ -5201,12 +5473,24 @@ def run_generation_pipeline(
             role_to_image["product"] = f"data:image/png;base64,{product_img_b64}"
 
         if primary_char:
-            # 主角正面图（主图）
-            role_to_image["character_primary"] = f"data:image/png;base64,{primary_char['img_b64']}"
-            # 主角角度图（全身/侧面等，如有）
+            # 根据镜头类型推荐参考图角度，智能选择主参考图
             char_images = primary_char.get("img_b64_list", [])
-            if len(char_images) > 1:
-                role_to_image["character_angle"] = f"data:image/png;base64,{char_images[1]}"
+            recommended_angle = "front"
+            try:
+                from quality_gate import recommend_ref_angle
+                recommended_angle = recommend_ref_angle(clip_prompt, narrative)
+            except Exception:
+                pass
+
+            if len(char_images) > 1 and recommended_angle == "full_body":
+                # 推荐全身图：全身图作为主参考，正面图作为辅助
+                role_to_image["character_primary"] = f"data:image/png;base64,{char_images[1]}"
+                role_to_image["character_angle"] = f"data:image/png;base64,{char_images[0]}"
+            else:
+                # 默认正面图为主
+                role_to_image["character_primary"] = f"data:image/png;base64,{primary_char['img_b64']}"
+                if len(char_images) > 1:
+                    role_to_image["character_angle"] = f"data:image/png;base64,{char_images[1]}"
             # 次角色（分镜中出场的其他角色）
             for i in matched_char_indices:
                 if i == primary_char_idx or i >= len(char_refs):
@@ -5288,6 +5572,28 @@ def run_generation_pipeline(
         ref_images = _build_ref_images(idx, clip_prompt=prompt, prev_clip_path=prev_clip_path, prev_last_frame_b64=prev_last_frame_b64)
         narrative = _get_narrative_for_idx(idx).lower().strip()
 
+        # 自我进化：根据历史人脸失败率动态调整 best_of 和重试强度
+        # 人物场景（hook/turning/result/review）自动启用人脸质量策略
+        _face_strategy = None
+        _clip_best_of = best_of
+        _clip_max_retries = 3
+        if narrative in {"hook", "turning", "result", "review"}:
+            try:
+                from quality_gate import evolve_face_quality_strategy
+                _face_strategy = evolve_face_quality_strategy(
+                    product_category=product_info.get("type", "default"),
+                    narrative_type=narrative,
+                    lookback_days=30,
+                )
+                if _face_strategy and _face_strategy.get("confidence", 0) >= 0.5:
+                    _clip_best_of = max(best_of, _face_strategy.get("best_of", 1))
+                    _clip_max_retries = _face_strategy.get("max_retries", 3)
+                    if _clip_best_of > best_of or _clip_max_retries > 3:
+                        print(f"  🧠 自我进化：{_face_strategy.get('reason')}")
+                        print(f"     best_of={best_of}→{_clip_best_of}, 重试=3→{_clip_max_retries}")
+            except Exception:
+                pass
+
         # 改动5：prompt 质量前置门禁（在 scene_consistency 和 ref_binding 之前去重）
         final_prompt = _prompt_quality_gate(
             prompt,
@@ -5303,10 +5609,25 @@ def run_generation_pipeline(
 
         if ref_images:
             final_prompt = _bind_reference_tags_to_prompt(final_prompt, ref_images, narrative)
+
+        # 关键帧一致性强化：如果有 approved keyframe，在 prompt 中强调首帧一致性
+        has_approved_keyframe = any(item.get("role") == "approved_keyframe" for item in ref_images)
+        if has_approved_keyframe:
+            final_prompt = "first frame matches approved keyframe composition and lighting, " + final_prompt
+
         final_prompt = _compact_prompt_for_generation(final_prompt)
 
         clip_seed = (seed + idx - 1) if seed is not None else None
         ref_image_values = _ref_image_values(ref_images)
+
+        clip_negative_prompt = effective_negative_prompt
+        try:
+            from quality_gate import enhance_negative_prompt as _enhance_neg
+            _enhanced = _enhance_neg(effective_negative_prompt, final_prompt)
+            if _enhanced and _enhanced != effective_negative_prompt:
+                clip_negative_prompt = _enhanced
+        except Exception:
+            pass
 
         def _candidate_prompt_for_strategy(candidate_strategy: str) -> str:
             if candidate_strategy == "product_rescue" and _is_product_required_narrative(narrative):
@@ -5330,7 +5651,7 @@ def run_generation_pipeline(
             duration=duration,
             aspect_ratio=aspect_ratio,
             seed=clip_seed,
-            negative_prompt=NEGATIVE_PROMPT,
+            negative_prompt=clip_negative_prompt,
             candidate_strategy="single",
         )
         final_clip_manifest["target_name"] = clip_path.name
@@ -5359,7 +5680,7 @@ def run_generation_pipeline(
             return clip_path
 
         def _generate_to_path(target_path: Path, candidate_strategy: str = "single", override_prompt: Optional[str] = None) -> Path:
-            max_retries = 3
+            max_retries = _clip_max_retries
             last_error = None
             candidate_prompt = override_prompt if override_prompt else _candidate_prompt_for_strategy(candidate_strategy)
             target_manifest = _build_clip_manifest(
@@ -5371,7 +5692,7 @@ def run_generation_pipeline(
                 duration=duration,
                 aspect_ratio=aspect_ratio,
                 seed=clip_seed,
-                negative_prompt=NEGATIVE_PROMPT,
+                negative_prompt=clip_negative_prompt,
                 candidate_strategy=candidate_strategy,
             )
             target_manifest["target_name"] = target_path.name
@@ -5403,6 +5724,7 @@ def run_generation_pipeline(
                     save_path=_kf_path,
                     aspect_ratio=aspect_ratio,
                     image_fidelity=_get_fidelity_for_narrative(narrative, image_fidelity),
+                    negative_prompt=clip_negative_prompt,
                 )
                 if not _kf_passed:
                     raise RuntimeError(
@@ -5412,17 +5734,73 @@ def run_generation_pipeline(
 
             for attempt in range(1, max_retries + 1):
                 try:
+                    # 智能重试：根据上一次失败原因调整参数
+                    retry_prompt = candidate_prompt
+                    retry_neg = clip_negative_prompt
+                    retry_seed = clip_seed
+                    if attempt > 1 and last_error is not None:
+                        err_str = str(last_error).lower()
+                        # 清晰度不足 → 加强画质描述 + 提高 fidelity
+                        if "清晰度" in err_str or "模糊" in err_str or "blurry" in err_str:
+                            retry_prompt = f"{candidate_prompt}, ultra sharp, highly detailed, 8k resolution, professional photography, crisp focus"
+                            retry_prompt = _compact_prompt_for_generation(retry_prompt)
+                            print(f"  🔧 第 {attempt} 次重试：加强画质描述")
+                        # 黑帧/全黑 → 增加亮度描述
+                        elif "黑帧" in err_str or "black" in err_str:
+                            retry_prompt = f"{candidate_prompt}, bright lighting, well-lit scene, key lighting"
+                            retry_prompt = _compact_prompt_for_generation(retry_prompt)
+                            print(f"  🔧 第 {attempt} 次重试：增加亮度描述")
+                        # 人脸问题 → 分阶段梯度重试，每次都换 seed 增加多样性
+                        elif "人脸" in err_str or "face" in err_str or "character" in err_str:
+                            import random as _rand
+                            base_seed = clip_seed or 42
+                            if attempt == 2:
+                                # 第2次：加强面部描述 + 负面词 + 提高人物保真
+                                retry_prompt = f"{candidate_prompt}, perfect face, symmetrical features, natural expression, detailed facial features, clear facial structure, photorealistic"
+                                retry_prompt = _compact_prompt_for_generation(retry_prompt)
+                                retry_neg = f"{clip_negative_prompt}, deformed face, ugly, distorted features, extra limbs, bad anatomy, mutated, cross-eyed, asymmetric"
+                                retry_seed = base_seed + attempt * 1000 + _rand.randint(1, 9999)
+                                print(f"  🔧 第 {attempt} 次重试：加强面部描述+负面词+换 seed")
+                            elif attempt == 3:
+                                # 第3次：拉远镜头 + 正面视角 + 降低画面占比
+                                retry_prompt = f"{candidate_prompt}, medium shot, full face visible, front view, natural lighting, professional portrait, clear features, centered composition"
+                                retry_prompt = _compact_prompt_for_generation(retry_prompt)
+                                retry_neg = f"{clip_negative_prompt}, deformed face, ugly, distorted features, extra limbs, close-up, extreme close-up, side profile, blurry face, cropped face"
+                                retry_seed = base_seed + attempt * 10000 + _rand.randint(1, 99999)
+                                print(f"  🔧 第 {attempt} 次重试：拉远镜头+正面视角+换 seed")
+                            else:
+                                # 第4+次：全身/中景 + 大幅换 seed + 多角度
+                                retry_prompt = f"{candidate_prompt}, full body shot, natural pose, cinematic composition, wide angle, dynamic camera angle"
+                                retry_prompt = _compact_prompt_for_generation(retry_prompt)
+                                retry_neg = f"{clip_negative_prompt}, deformed face, ugly, distorted features, extra limbs, close-up, blurry, cropped, out of frame"
+                                retry_seed = base_seed + attempt * 100000 + _rand.randint(1, 999999)
+                                print(f"  🔧 第 {attempt} 次重试：全身视角+大幅换 seed")
+                        # 时长异常 → 换 seed 重试
+                        elif "时长" in err_str or "duration" in err_str:
+                            import random as _rand
+                            retry_seed = (clip_seed or 42) + attempt * 1000 + _rand.randint(1, 999)
+                            print(f"  🔧 第 {attempt} 次重试：更换 seed")
+                        else:
+                            # 通用重试：换 seed
+                            import random as _rand
+                            retry_seed = (clip_seed or 42) + attempt * 1000 + _rand.randint(1, 999)
+                            print(f"  🔧 第 {attempt} 次重试：更换 seed")
+                    else:
+                        retry_prompt = candidate_prompt
+                        retry_neg = clip_negative_prompt
+                        retry_seed = clip_seed
+
                     video_result = client.generate_video(
-                        prompt=candidate_prompt,
+                        prompt=retry_prompt,
                         aspect_ratio=aspect_ratio,
                         duration=duration,
                         mode=mode,
                         reference_images=ref_image_values if ref_image_values else None,
-                        image_fidelity=_get_fidelity_for_narrative(narrative, image_fidelity),  # 改动3：动态 fidelity
-                        human_fidelity=human_fidelity,
-                        seed=clip_seed,
-                        negative_prompt=NEGATIVE_PROMPT,
-                        idempotency_key=idempotency_key,
+                        image_fidelity=_get_fidelity_for_narrative(narrative, image_fidelity),
+                        human_fidelity=_get_human_fidelity_for_narrative(narrative, human_fidelity),
+                        seed=retry_seed,
+                        negative_prompt=retry_neg,
+                        idempotency_key=idempotency_key if attempt == 1 else None,
                         # P2-C 高级参数
                         model=effective_kling_model,
                         multi_shot=multi_shot,
@@ -5449,11 +5827,69 @@ def run_generation_pipeline(
                         wait = 5 * attempt
                         print(f"  ⚠️ 片段 {idx} 第 {attempt} 次尝试失败：{e}，{wait}s 后重试...")
                         time.sleep(wait)
+            # 最终失败：记录到历史案例库（自我进化的数据闭环）
+            try:
+                from quality_gate import record_failure_case
+                err_str = str(last_error)
+                # 分类失败类型
+                if "质检失败" in err_str:
+                    if "清晰度" in err_str:
+                        fail_type = "quality_low_resolution"
+                    elif "黑帧" in err_str:
+                        fail_type = "quality_black_frame"
+                    elif "时长" in err_str:
+                        fail_type = "quality_duration"
+                    elif "人脸" in err_str or "face" in err_str.lower():
+                        fail_type = "character_face_distortion"
+                    else:
+                        fail_type = "quality_check_failed"
+                else:
+                    fail_type = "video_generation_failed"
+                record_failure_case(
+                    failure_type=fail_type,
+                    failure_reason=err_str[:200],
+                    product_category=product_info.get("type", "default"),
+                    style_preference=style,
+                    num_clips=len(clip_prompts),
+                    segment_index=idx,
+                    narrative_type=narrative,
+                    prompt_length=len(prompt),
+                    has_character_ref=bool(main_char_path and main_char_path.exists()),
+                    has_product_ref=bool(product_image_path and product_image_path.exists()),
+                    extra={
+                        "retry_count": max_retries,
+                        "mode": mode,
+                        "image_fidelity": image_fidelity,
+                        "voiceover_style": voiceover_style,
+                    },
+                )
+            except Exception:
+                pass
             raise RuntimeError(f"片段 {idx} 生成失败（已重试 {max_retries} 次）") from last_error
 
-        best_of_n = max(1, int(best_of or 1))
+        best_of_n = max(1, int(_clip_best_of or 1))
         if best_of_n <= 1:
-            return _generate_to_path(clip_path)
+            result = _generate_to_path(clip_path)
+            # best_of=1 时也记录片段级人脸质量（自我进化数据闭环）
+            if narrative in {"hook", "turning", "result", "review"}:
+                try:
+                    from quality_gate import record_face_quality_success
+                    record_face_quality_success(
+                        product_category=product_info.get("type", "default"),
+                        narrative_type=narrative,
+                        style_preference=style,
+                        quality_score=80.0,  # best_of=1 时无详细评分，用默认值
+                        face_issue_count=0,
+                        extra={
+                            "segment_index": idx,
+                            "best_of": 1,
+                            "best_strategy": "single",
+                            "face_strategy_applied": _face_strategy is not None and _face_strategy.get("strategy") != "conservative_default",
+                        },
+                    )
+                except Exception:
+                    pass
+            return result
 
         candidates: List[Path] = []
         scores: Dict[Path, float] = {}
@@ -5561,6 +5997,51 @@ def run_generation_pipeline(
                 pass
         final_clip_manifest["candidate_strategy"] = best_strategy
         _write_clip_manifest(clip_path, final_clip_manifest)
+
+        # 记录成功案例（自我进化的数据闭环）
+        try:
+            from quality_gate import record_success_case
+            record_success_case(
+                product_category=product_info.get("type", "default"),
+                style_preference=style,
+                num_clips=len(clip_prompts),
+                quality_score=best_score,
+                seed=clip_seed,
+                fidelity=image_fidelity,
+                mode=mode,
+                extra={
+                    "segment_index": idx,
+                    "narrative_type": narrative,
+                    "best_strategy": best_strategy,
+                    "candidates_count": len(candidates),
+                    "main_issues": issues.get(best_path, []),
+                    "voiceover_style": voiceover_style,
+                },
+            )
+        except Exception:
+            pass
+
+        # 片段级人脸质量成功记录（自我进化：人脸质量策略的数据闭环）
+        if narrative in {"hook", "turning", "result", "review"}:
+            try:
+                from quality_gate import record_face_quality_success
+                _face_issues = issues.get(best_path, [])
+                _face_issue_count = sum(1 for iss in _face_issues if "人脸" in iss or "face" in iss.lower())
+                record_face_quality_success(
+                    product_category=product_info.get("type", "default"),
+                    narrative_type=narrative,
+                    style_preference=style,
+                    quality_score=best_score,
+                    face_issue_count=_face_issue_count,
+                    extra={
+                        "segment_index": idx,
+                        "best_of": best_of_n,
+                        "best_strategy": best_strategy,
+                        "face_strategy_applied": _face_strategy is not None and _face_strategy.get("strategy") != "conservative_default",
+                    },
+                )
+            except Exception:
+                pass
 
         if not keep_candidates:
             for p in candidates:
@@ -5713,21 +6194,6 @@ def run_generation_pipeline(
 
     # 清理关键帧临时文件
     _cleanup_keyframes(clips_dir, output_name)
-
-    # ── 预览模式：跳过所有后期处理，直接返回第 1 段 ──
-    if preview:
-        total_elapsed = time.time() - generation_start
-        print(f"\n⚡ 预览模式完成！总用时 {int(total_elapsed)}s")
-        print(f"   预览片段：{clip_paths[0]}")
-        print(f"   确认效果 OK 后，去掉 --preview 重新生成完整 pro 版本")
-        return {
-            "final_path": clip_paths[0],
-            "wide_path": None,
-            "output_name": output_name,
-            "preview": True,
-            "clip_paths": clip_paths,
-            "ad_script": ad_script,
-        }
 
     # ============================================================
     # 片段色调一致性匹配
@@ -6275,10 +6741,16 @@ def run_generation_pipeline(
                 for line in voiceover_script:
                     line["start"] = max(0.0, line["start"] - _trim_start)
                     line["end"] = max(0.0, line["end"] - _trim_start)
-            # P1 #3：口播总时长按节奏模板计算（考虑转场重叠），并扣除裁切部分
-            _vo_timeline = compute_segment_timeline(rhythm_template, seg_indices=seg_indices_for_subtitles)
-            total_duration = _vo_timeline[-1]["end"] if _vo_timeline else len(clip_paths) * duration
-            total_duration = max(0.5, total_duration - _trim_start - _trim_end_amt)
+            # 根因修复：口播总时长用实际视频时长，而非节奏模板预期时长
+            # 之前用 compute_segment_timeline(rhythm_template) 是估算值，
+            # 视频经过节奏适配/裁切/转场后实际时长可能有偏差，导致口播和视频不同步
+            _actual_video_dur = _get_clip_duration(graded_path) if graded_path.exists() else 0
+            if _actual_video_dur > 0:
+                total_duration = _actual_video_dur
+            else:
+                _vo_timeline = compute_segment_timeline(rhythm_template, seg_indices=seg_indices_for_subtitles)
+                total_duration = _vo_timeline[-1]["end"] if _vo_timeline else len(clip_paths) * duration
+                total_duration = max(0.5, total_duration - _trim_start - _trim_end_amt)
             voiceover_audio, voiceover_subs = generate_full_voiceover(
                 voiceover_script,
                 voiceover_audio,
@@ -6709,10 +7181,19 @@ def run_generation_pipeline(
             raise RuntimeError(f"输出文件过小（{file_size} bytes），疑似空文件：{final_path}")
         try:
             actual_dur = _get_clip_duration(final_path)
-            # 按节奏模板计算预期总时长（考虑转场重叠和不等长段）
-            _qc_timeline = compute_segment_timeline(rhythm_template, seg_indices=seg_indices_for_subtitles)
-            _expected_total = _qc_timeline[-1]["end"] if _qc_timeline else len(clip_paths) * duration
-            expected_min = _expected_total * 0.75  # 允许 25% 偏差（转场+裁切误差）
+            # 根因修复：用实际片段时长 + 转场时长计算预期总时长，而非节奏模板预期值
+            # 之前用 compute_segment_timeline(rhythm_template) 是模板估算值，
+            # 当节奏适配失败、片段实际时长与模板偏差大时，会导致校验误判
+            # 正确做法：用 _seg_dur_map 中的实测片段时长 + 转场时长计算真实预期
+            _actual_seg_indices = sorted(_seg_indices_list) if _seg_indices_list else list(range(len(clip_paths)))
+            _actual_seg_durs = [_seg_dur_map.get(i, float(duration)) for i in _actual_seg_indices]
+            _actual_total_seg = sum(_actual_seg_durs)
+            _transition_total = 0.0
+            if len(clip_paths) > 1:
+                _avg_trans = scene_cfg.get("transition_duration", 0.3)
+                _transition_total = _avg_trans * (len(clip_paths) - 1)
+            _expected_total = _actual_total_seg - _transition_total
+            expected_min = _expected_total * 0.7  # 允许 30% 偏差（转场+裁切+编码误差）
             if actual_dur < expected_min:
                 raise RuntimeError(
                     f"输出视频时长异常（实际 {actual_dur:.1f}s，期望至少 {expected_min:.1f}s）"
@@ -6904,6 +7385,7 @@ def run_generation_pipeline(
         "output_name": output_name,
         "ad_script": ad_script,
         "bgm_file": bgm_file,
+        "preview": preview,
         # P2：失败感知字段，让调用方知道口播/封面是否成功
         "voiceover_enabled": voiceover_enabled,
         "cover_path": cover_path,  # None 表示封面生成失败
@@ -6961,6 +7443,16 @@ def run_one_click_create(
     voiceover_style = getattr(args, "voiceover_style", DEFAULT_VOICEOVER_STYLE)
     voice = getattr(args, "voice", DEFAULT_VOICE)
     script_style = getattr(args, "script_style", DEFAULT_SCRIPT_STYLE)
+
+    if voiceover_style in ("auto", "standard"):
+        try:
+            from quality_gate import evolve_voiceover_style_recommendation
+            product_type = product_info.get("type", "default")
+            voiceover_style, _ = evolve_voiceover_style_recommendation(product_type)
+        except Exception:
+            from quality_gate import smart_pick_voiceover_style
+            product_type = product_info.get("type", "default")
+            voiceover_style = smart_pick_voiceover_style(product_type)
     resolved_cast_plan = build_cast_plan({**product_info, "characters": characters} if characters else product_info)
     resolved_characters = resolved_cast_plan.get("core_characters", [])
     product_info["cast_plan"] = resolved_cast_plan

@@ -4,20 +4,65 @@
       "prompt": "Character reference portrait for 众安家财险 advertisement, 35-year-old female, wearing smart casual blouse, calm protective smile, plain solid light gray studio background, no distractions, soft studio lighting, even illumination, no harsh shadows, bust shot close-up portrait, face and upper body filling 60% of frame, centered composition, high detail, crystal clear facial features, sharp focus on face, front-facing, neutral natural expression, 9:16 vertical, professional character reference sheet quality",
       "score": 0.402,
       "passed": false
+    },
+    {
+      "prompt": "huge subject, massive close-up, huge subject, massive close-up, close-up portrait, bust shot, extreme close-up, face and shoulders filling 85% of frame, tightly cropped, perfectly centered, solid pure white background, completely blank empty, nothing in background, total void, soft even studio lighting, no harsh shadows, 35-year-old female, wearing smart casual blouse, calm protective smile, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality, no background elements whatsoever, flat white only, no watermark, no text, no logo, clean image, ultra sharp facial features, crystal clear face, hyperdetailed skin texture, tack sharp focus on eyes, no background elements whatsoever, flat white only",
+      "score": 0.358,
+      "passed": false
+    },
+    {
+      "prompt": "huge subject, massive close-up, close-up portrait, bust shot, extreme close-up, face and shoulders filling 85% of frame, tightly cropped, perfectly centered, solid pure white background, completely blank empty, nothing in background, total void, soft even studio lighting, no harsh shadows, 35-year-old female, wearing smart casual blouse, calm protective smile, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality, no background elements whatsoever, flat white only, no watermark, no text, no logo, clean image, ultra sharp facial features, crystal clear face, hyperdetailed skin texture, tack sharp focus on eyes",
+      "score": 0.295,
+      "passed": false
+    },
+    {
+      "prompt": "close-up portrait, bust shot, face and upper body filling 70% of frame, perfectly centered, pure white seamless background, absolutely no objects no scenery, soft even studio lighting, no harsh shadows, 35-year-old female, wearing smart casual blouse, calm protective smile, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality",
+      "score": 0.9068583001927119,
+      "passed": true
     }
   ],
   "app_male_adult_front": [
     {
+      "prompt": "huge subject, massive close-up, huge subject, massive close-up, close-up portrait, bust shot, extreme close-up, face and shoulders filling 85% of frame, tightly cropped, perfectly centered, solid pure white background, completely blank empty, nothing in background, total void, soft even studio lighting, no harsh shadows, 38-year-old male, short black hair, wearing casual knit polo, steady trustworthy expression, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality, no background elements whatsoever, flat white only, perfectly centered composition, subject dead center, no watermark, no text, no logo, clean image, no background elements whatsoever, flat white only, perfectly centered composition, subject dead center",
+      "score": 0.444,
+      "passed": false
+    },
+    {
       "prompt": "Character reference portrait for 众安家财险 advertisement, 38-year-old male, short black hair, wearing casual knit polo, steady trustworthy expression, plain solid light gray studio background, no distractions, soft studio lighting, even illumination, no harsh shadows, bust shot close-up portrait, face and upper body filling 60% of frame, centered composition, high detail, crystal clear facial features, sharp focus on face, front-facing, neutral natural expression, 9:16 vertical, professional character reference sheet quality",
       "score": 0.425,
       "passed": false
+    },
+    {
+      "prompt": "huge subject, massive close-up, close-up portrait, bust shot, extreme close-up, face and shoulders filling 85% of frame, tightly cropped, perfectly centered, solid pure white background, completely blank empty, nothing in background, total void, soft even studio lighting, no harsh shadows, 38-year-old male, short black hair, wearing casual knit polo, steady trustworthy expression, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality, no background elements whatsoever, flat white only, perfectly centered composition, subject dead center, no watermark, no text, no logo, clean image",
+      "score": 0.423,
+      "passed": false
+    },
+    {
+      "prompt": "close-up portrait, bust shot, face and upper body filling 70% of frame, perfectly centered, pure white seamless background, absolutely no objects no scenery, soft even studio lighting, no harsh shadows, 38-year-old male, short black hair, wearing casual knit polo, steady trustworthy expression, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality",
+      "score": 0.9547879651738946,
+      "passed": true
     }
   ],
   "app_neutral_child_front": [
     {
+      "prompt": "huge subject, massive close-up, close-up portrait, bust shot, extreme close-up, face and shoulders filling 85% of frame, tightly cropped, perfectly centered, solid pure white background, completely blank empty, nothing in background, total void, soft even studio lighting, no harsh shadows, 8-year-old 男, wearing simple clean casual clothes, natural happy expression, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality, no background elements whatsoever, flat white only, perfectly centered composition, subject dead center, ultra sharp facial features, crystal clear face, hyperdetailed skin texture, tack sharp focus on eyes",
+      "score": 0.398,
+      "passed": false
+    },
+    {
       "prompt": "Character reference portrait for 众安家财险 advertisement, 8-year-old 女, wearing simple clean casual clothes, natural happy expression, plain solid light gray studio background, no distractions, soft studio lighting, even illumination, no harsh shadows, bust shot close-up portrait, face and upper body filling 60% of frame, centered composition, high detail, crystal clear facial features, sharp focus on face, front-facing, neutral natural expression, 9:16 vertical, professional character reference sheet quality",
       "score": 0.375,
       "passed": false
+    },
+    {
+      "prompt": "huge subject, massive close-up, huge subject, massive close-up, close-up portrait, bust shot, extreme close-up, face and shoulders filling 85% of frame, tightly cropped, perfectly centered, solid pure white background, completely blank empty, nothing in background, total void, soft even studio lighting, no harsh shadows, 8-year-old 男, wearing simple clean casual clothes, natural happy expression, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality, no background elements whatsoever, flat white only, perfectly centered composition, subject dead center, ultra sharp facial features, crystal clear face, hyperdetailed skin texture, tack sharp focus on eyes, no background elements whatsoever, flat white only",
+      "score": 0.29,
+      "passed": false
+    },
+    {
+      "prompt": "close-up portrait, bust shot, face and upper body filling 70% of frame, perfectly centered, pure white seamless background, absolutely no objects no scenery, soft even studio lighting, no harsh shadows, 8-year-old 男, wearing simple clean casual clothes, natural happy expression, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality",
+      "score": 1.0595016947839624,
+      "passed": true
     }
   ],
   "app_neutral_adult_front": [
@@ -25,6 +70,77 @@
       "prompt": "Character reference portrait for 众安家财险 advertisement, 32-year-old 女, wearing well-fitted business attire, friendly reassuring smile, pure seamless white studio background, completely blank, no objects no decorations, no distractions, soft studio lighting, even illumination, no harsh shadows, extreme close-up portrait, face and shoulders filling 80% of frame, tightly cropped, centered composition, high detail, crystal clear facial features, sharp focus on face, front-facing, neutral natural expression, 9:16 vertical, professional character reference sheet quality, huge subject size, filling entire frame, ultra simple background, zero background detail, huge subject size, filling entire frame, ultra simple background, zero background detail, perfectly centered composition, subject dead center, ultra sharp facial features, crystal clear face, hyperdetailed skin texture, tack sharp focus on eyes",
       "score": 0.4017338967010502,
       "passed": false
+    },
+    {
+      "prompt": "huge subject, massive close-up, close-up portrait, bust shot, extreme close-up, face and shoulders filling 85% of frame, tightly cropped, perfectly centered, solid pure white background, completely blank empty, nothing in background, total void, soft even studio lighting, no harsh shadows, 32-year-old 男, wearing well-fitted business attire, friendly reassuring smile, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality, no background elements whatsoever, flat white only, ultra sharp facial features, crystal clear face, hyperdetailed skin texture, tack sharp focus on eyes",
+      "score": 0.281,
+      "passed": false
+    },
+    {
+      "prompt": "huge subject, massive close-up, huge subject, massive close-up, close-up portrait, bust shot, extreme close-up, face and shoulders filling 85% of frame, tightly cropped, perfectly centered, solid pure white background, completely blank empty, nothing in background, total void, soft even studio lighting, no harsh shadows, 32-year-old 男, wearing well-fitted business attire, friendly reassuring smile, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality, no background elements whatsoever, flat white only, ultra sharp facial features, crystal clear face, hyperdetailed skin texture, tack sharp focus on eyes, no background elements whatsoever, flat white only, perfectly centered composition, subject dead center, ultra sharp facial features, crystal clear face, hyperdetailed skin texture, tack sharp focus on eyes",
+      "score": 0.252,
+      "passed": false
+    },
+    {
+      "prompt": "close-up portrait, bust shot, face and upper body filling 70% of frame, perfectly centered, pure white seamless background, absolutely no objects no scenery, soft even studio lighting, no harsh shadows, 32-year-old 男, wearing well-fitted business attire, friendly reassuring smile, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality",
+      "score": 0.9524896721381908,
+      "passed": true
+    }
+  ],
+  "家居_female_adult_front": [
+    {
+      "prompt": "close-up portrait, bust shot, face and upper body filling 70% of frame, perfectly centered, pure white seamless background, absolutely no objects no scenery, soft even studio lighting, no harsh shadows, 35-year-old female, wearing smart casual blouse, calm protective smile, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality",
+      "score": 0.9122188551327177,
+      "passed": true
+    }
+  ],
+  "家居_male_adult_front": [
+    {
+      "prompt": "close-up portrait, bust shot, face and upper body filling 70% of frame, perfectly centered, pure white seamless background, absolutely no objects no scenery, soft even studio lighting, no harsh shadows, 38-year-old male, short black hair, wearing casual knit polo, steady trustworthy expression, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality",
+      "score": 0.745,
+      "passed": true
+    }
+  ],
+  "家居_neutral_child_front": [
+    {
+      "prompt": "close-up portrait, bust shot, face and upper body filling 70% of frame, perfectly centered, pure white seamless background, absolutely no objects no scenery, soft even studio lighting, no harsh shadows, 8-year-old 女, wearing simple clean casual clothes, natural happy expression, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality",
+      "score": 1.025,
+      "passed": true
+    }
+  ],
+  "家居_neutral_adult_front": [
+    {
+      "prompt": "close-up portrait, bust shot, face and upper body filling 70% of frame, perfectly centered, pure white seamless background, absolutely no objects no scenery, soft even studio lighting, no harsh shadows, 32-year-old 女, wearing well-fitted business attire, friendly reassuring smile, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality",
+      "score": 0.79,
+      "passed": true
+    }
+  ],
+  "default_female_adult_front": [
+    {
+      "prompt": "close-up portrait, bust shot, face and upper body filling 70% of frame, perfectly centered, pure white seamless background, absolutely no objects no scenery, soft even studio lighting, no harsh shadows, 35-year-old female, wearing smart casual blouse, calm protective smile, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality",
+      "score": 0.9853093666538852,
+      "passed": true
+    }
+  ],
+  "default_male_adult_front": [
+    {
+      "prompt": "close-up portrait, bust shot, face and upper body filling 70% of frame, perfectly centered, pure white seamless background, absolutely no objects no scenery, soft even studio lighting, no harsh shadows, 38-year-old male, short black hair, wearing casual knit polo, steady trustworthy expression, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality",
+      "score": 0.7664285714285715,
+      "passed": true
+    }
+  ],
+  "default_neutral_child_front": [
+    {
+      "prompt": "close-up portrait, bust shot, face and upper body filling 70% of frame, perfectly centered, pure white seamless background, absolutely no objects no scenery, soft even studio lighting, no harsh shadows, 8-year-old 女, wearing simple clean casual clothes, natural happy expression, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality",
+      "score": 1.0112152822320006,
+      "passed": true
+    }
+  ],
+  "default_neutral_adult_front": [
+    {
+      "prompt": "close-up portrait, bust shot, face and upper body filling 70% of frame, perfectly centered, pure white seamless background, absolutely no objects no scenery, soft even studio lighting, no harsh shadows, 32-year-old 女, wearing well-fitted business attire, friendly reassuring smile, front-facing, neutral natural expression, high detail, crystal clear facial features, tack sharp focus on eyes, 9:16 vertical, character reference sheet quality",
+      "score": 0.7664285714285715,
+      "passed": true
     }
   ]
 }

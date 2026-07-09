@@ -69,13 +69,12 @@ class TestCinematicStyles:
         """至少有 1 种风格"""
         assert len(CINEMATIC_STYLES) >= 1
 
-    def test_cinematic_styles_has_none(self):
-        """默认风格应为 'none'，且 argparse choices 包含它"""
+    def test_cinematic_styles_has_default(self):
+        """默认风格应为 'auto'，且是有效的风格值"""
         from config import DEFAULT_CINEMATIC_STYLE
-        assert DEFAULT_CINEMATIC_STYLE == "none"
-        # 验证 none 可作为合法风格传入（通过 choices 构造）
-        valid_choices = list(CINEMATIC_STYLES.keys()) + [DEFAULT_CINEMATIC_STYLE]
-        assert "none" in valid_choices
+        assert DEFAULT_CINEMATIC_STYLE == "auto"
+        valid_choices = list(CINEMATIC_STYLES.keys()) + [DEFAULT_CINEMATIC_STYLE, "none"]
+        assert DEFAULT_CINEMATIC_STYLE in valid_choices
 
     def test_cinematic_styles_has_required_keys(self):
         """每种风格必须包含必要字段"""
@@ -1212,11 +1211,13 @@ class TestFinalQualityBugFixes:
     def test_tts_retries_on_429(self, tmp_path):
         """火山 TTS 遇到 429 应应用层重试，而不是直接放弃口播"""
         import tts_client
+        import base64
+        import json
 
         class FakeResp:
-            def __init__(self, status_code: int, chunks: list[bytes]):
+            def __init__(self, status_code: int, audio_data: bytes | None = None):
                 self.status_code = status_code
-                self._chunks = chunks
+                self._audio_data = audio_data
                 self.text = "rate limited"
 
             def __enter__(self):
@@ -1229,11 +1230,21 @@ class TestFinalQualityBugFixes:
                 return {"code": self.status_code, "message": self.text}
 
             def iter_content(self, chunk_size=4096):
-                yield from self._chunks
+                if self._audio_data:
+                    yield self._audio_data
 
+            def iter_lines(self, decode_unicode=False):
+                if self._audio_data:
+                    chunk_b64 = base64.b64encode(self._audio_data).decode()
+                    yield json.dumps({"code": 0, "data": chunk_b64})
+                    yield json.dumps({"code": 20000000, "message": "ok", "data": None})
+                return
+                yield
+
+        fake_audio = b"x" * 2048
         responses = [
-            FakeResp(429, []),
-            FakeResp(200, [b"x" * 2048]),
+            FakeResp(429),
+            FakeResp(200, fake_audio),
         ]
 
         with patch("requests.post", side_effect=responses) as post:

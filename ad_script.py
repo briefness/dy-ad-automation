@@ -3332,6 +3332,190 @@ def script_to_voiceover(
     return lines
 
 
+# ============================================================
+# 剧情完整性校验
+# ============================================================
+
+# 完整叙事弧必需的叙事功能（按顺序）
+REQUIRED_NARRATIVE_BEATS = [
+    "hook",      # 钩子：吸引注意力，提出问题/痛点
+    "turning",   # 转折：痛点放大/引入产品
+    "showcase",  # 展示：产品功能/使用场景
+    "result",    # 效果：使用后的改变/对比
+    "cta",       # 行动号召：引导下单/关注
+]
+
+# 叙事功能别名映射（用于模糊匹配）
+NARRATIVE_ALIASES = {
+    "hook": ["hook", "pain", "question", "story", "before", "intro", "opening"],
+    "turning": ["turning", "turn", "pain_amplify", "problem", "conflict", "discovery", "introduce"],
+    "showcase": ["showcase", "show", "product", "demo", "reason", "proof", "feature", "benefit"],
+    "result": ["result", "after", "effect", "outcome", "compare_result", "transformation", "payoff"],
+    "cta": ["cta", "call_to_action", "action", "cta_choose", "closing", "end"],
+}
+
+
+def _normalize_narrative(narrative: str) -> str:
+    """将叙事类型标准化为核心 beat。"""
+    if not narrative:
+        return ""
+    n = narrative.lower().strip()
+    for beat, aliases in NARRATIVE_ALIASES.items():
+        if n == beat or n in aliases:
+            return beat
+    return n
+
+
+def check_story_completeness(ad_script: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    检查广告脚本的剧情完整性。
+
+    一个完整的广告叙事弧必须包含：
+      hook → turning → showcase → result → cta
+
+    Args:
+        ad_script: 广告脚本字典
+
+    Returns:
+        校验结果字典：
+        - passed: bool，是否通过
+        - missing_beats: list，缺失的叙事节拍
+        - extra_beats: list，多余的叙事节拍
+        - beat_count: dict，每种节拍的出现次数
+        - total_segments: int，总段数
+        - warnings: list，警告信息
+        - score: float，完整性评分（0-1）
+    """
+    segments = ad_script.get("segments", []) if isinstance(ad_script, dict) else []
+    if not segments:
+        return {
+            "passed": False,
+            "missing_beats": REQUIRED_NARRATIVE_BEATS,
+            "extra_beats": [],
+            "beat_count": {},
+            "total_segments": 0,
+            "warnings": ["脚本没有任何片段"],
+            "score": 0.0,
+        }
+
+    # 提取每段的叙事类型并标准化
+    normalized_beats = []
+    for seg in segments:
+        n = seg.get("narrative", "") or seg.get("type", "") or ""
+        normalized_beats.append(_normalize_narrative(n))
+
+    # 统计每个 beat 的出现次数
+    beat_count = {}
+    for beat in normalized_beats:
+        beat_count[beat] = beat_count.get(beat, 0) + 1
+
+    # 检查缺失的节拍
+    present_beats = set(beat_count.keys())
+    missing_beats = [b for b in REQUIRED_NARRATIVE_BEATS if b not in present_beats]
+
+    # 检查多余的节拍（不在必需列表中的）
+    extra_beats = [b for b in beat_count if b not in REQUIRED_NARRATIVE_BEATS]
+
+    warnings = []
+    if missing_beats:
+        warnings.append(f"缺失叙事节拍：{', '.join(missing_beats)}")
+
+    # 检查顺序是否合理（大致按叙事弧顺序）
+    last_beat_idx = -1
+    for beat in normalized_beats:
+        if beat in REQUIRED_NARRATIVE_BEATS:
+            idx = REQUIRED_NARRATIVE_BEATS.index(beat)
+            if idx < last_beat_idx - 1:
+                warnings.append(f"叙事顺序异常：{beat} 出现在 {REQUIRED_NARRATIVE_BEATS[last_beat_idx]} 之前")
+                break
+            last_beat_idx = max(last_beat_idx, idx)
+
+    # 检查首尾是否正确
+    if normalized_beats and normalized_beats[0] not in ("hook",):
+        warnings.append("首段不是 hook 类型，可能无法有效吸引注意力")
+    if normalized_beats and normalized_beats[-1] not in ("cta",):
+        warnings.append("末段不是 CTA，可能缺乏行动引导")
+
+    # 计算完整性评分
+    total_required = len(REQUIRED_NARRATIVE_BEATS)
+    found_required = total_required - len(missing_beats)
+    base_score = found_required / total_required
+
+    # 顺序正确加分
+    order_bonus = 0.1 if not any("顺序" in w for w in warnings) else 0.0
+    # 首尾正确加分
+    bookend_bonus = 0.0
+    if normalized_beats and normalized_beats[0] == "hook":
+        bookend_bonus += 0.05
+    if normalized_beats and normalized_beats[-1] == "cta":
+        bookend_bonus += 0.05
+
+    score = min(1.0, base_score + order_bonus + bookend_bonus)
+
+    return {
+        "passed": len(missing_beats) == 0,
+        "missing_beats": missing_beats,
+        "extra_beats": extra_beats,
+        "beat_count": beat_count,
+        "total_segments": len(segments),
+        "warnings": warnings,
+        "score": score,
+    }
+
+
+def recommend_segment_count(
+    product_type: str = "default",
+    selling_points: Optional[List[str]] = None,
+    target_duration: Optional[float] = None,
+) -> int:
+    """
+    根据产品类型和卖点数量，智能推荐合适的片段数量。
+
+    原则：剧情完整性优先，段数服务于内容。
+    - 简单产品/单卖点：3-4 段足够（hook + showcase + result + cta，或合并部分）
+    - 中等复杂度/双卖点：5 段（标准结构）
+    - 复杂产品/多卖点：6-7 段（增加展示段或对比段）
+
+    Args:
+        product_type: 产品类型
+        selling_points: 卖点列表
+        target_duration: 目标总时长（秒）
+
+    Returns:
+        推荐的片段数量
+    """
+    # 基础段数
+    base_segments = 5
+
+    # 根据卖点数量调整
+    num_selling_points = len(selling_points) if selling_points else 1
+    if num_selling_points <= 1:
+        base_segments = 4  # 单卖点可以更紧凑
+    elif num_selling_points <= 2:
+        base_segments = 5  # 标准
+    else:
+        base_segments = min(7, 5 + (num_selling_points - 2))  # 多卖点增加展示段
+
+    # 根据目标时长调整
+    if target_duration is not None:
+        if target_duration <= 12:
+            base_segments = min(base_segments, 3)
+        elif target_duration <= 18:
+            base_segments = min(base_segments, 4)
+        elif target_duration <= 25:
+            base_segments = min(base_segments, 5)
+        elif target_duration <= 35:
+            base_segments = min(base_segments, 6)
+        else:
+            base_segments = min(7, base_segments)
+
+    # 产品类型微调
+    complex_categories = {"保险", "金融", "教育", "医疗", "数码", "家电"}
+    if product_type in complex_categories and num_selling_points >= 2:
+        base_segments = min(7, base_segments + 1)
+
+    return max(3, base_segments)
+
 
 if __name__ == "__main__":
     # 测试

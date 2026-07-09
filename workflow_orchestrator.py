@@ -1289,6 +1289,22 @@ class VideoGenerationWorkflow(WorkflowOrchestrator):
             )
 
             if voiceover_audio and voiceover_audio.exists():
+                from utils_ffprobe import get_video_duration
+                from tts_client import adjust_voiceover_to_video_duration, adjust_subtitles_to_duration
+
+                actual_video_duration = get_video_duration(str(merged_path))
+                if actual_video_duration > 0:
+                    adjusted_vo, _, adjust_ratio = adjust_voiceover_to_video_duration(
+                        voiceover_audio,
+                        actual_video_duration,
+                        output_path=output_dir / "voiceover_adjusted.mp3",
+                    )
+                    if adjust_ratio != 1.0:
+                        subtitles = adjust_subtitles_to_duration(
+                            subtitles, actual_video_duration, adjust_ratio
+                        )
+                        voiceover_audio = adjusted_vo
+
                 voiced_path = output_dir / "voiced.mp4"
                 add_bgm_ffmpeg(merged_path, voiceover_audio, voiced_path, volume=1.0)
                 merged_path = voiced_path

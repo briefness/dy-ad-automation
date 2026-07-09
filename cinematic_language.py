@@ -25,12 +25,12 @@ from typing import List, Dict, Any, Optional
 
 SHOT_SIZES = {
     "extreme_close_up": "extreme close-up, macro detail shot",
-    "close_up": "close-up shot",
-    "medium_close_up": "medium close-up",
-    "medium": "medium shot",
-    "medium_long": "medium long shot",
-    "long": "long shot, wide angle",
-    "extreme_long": "extreme long shot, vast landscape",
+    "close_up": "close-up shot, chest-up framing",
+    "medium_close_up": "medium close-up, waist-up framing, subject filling 50-60% of frame",
+    "medium": "medium shot, full body visible from head to knees, subject filling 40-50% of frame, with environment context",
+    "medium_long": "medium long shot, full body visible, subject filling 30-40% of frame, more environment space",
+    "long": "long shot, wide angle, subject small in frame, environment as main subject",
+    "extreme_long": "extreme long shot, vast landscape, human figure tiny in frame",
 }
 
 # ============================================================
@@ -123,7 +123,7 @@ FILM_LOOKS = {
 SEGMENT_CINEMATIC_PROFILE = {
     "hook": {
         "description": "Hook 段：视觉冲击力最强，抓注意力",
-        "shot_size": "close_up",
+        "shot_size": "medium_close_up",
         "camera_movement": "push_in",
         "camera_angle": "eye_level",
         "lighting": "chiaroscuro",
@@ -132,8 +132,8 @@ SEGMENT_CINEMATIC_PROFILE = {
         "intensity": 10,
     },
     "turning_point": {
-        "description": "痛点段：相对平实，真实感",
-        "shot_size": "medium",
+        "description": "痛点段：相对平实，真实感，环境空间充足",
+        "shot_size": "medium_long",
         "camera_movement": "static",
         "camera_angle": "eye_level",
         "lighting": "natural_window",
@@ -142,8 +142,8 @@ SEGMENT_CINEMATIC_PROFILE = {
         "intensity": 5,
     },
     "showcase": {
-        "description": "展示段：最精致，产品质感",
-        "shot_size": "medium_close_up",
+        "description": "展示段：最精致，产品质感，人物+产品互动",
+        "shot_size": "medium",
         "camera_movement": "orbit_left",
         "camera_angle": "eye_level",
         "lighting": "studio_soft",
@@ -152,13 +152,13 @@ SEGMENT_CINEMATIC_PROFILE = {
         "intensity": 8,
     },
     "result": {
-        "description": "效果段：情绪最强，情绪高潮",
-        "shot_size": "close_up",
-        "camera_movement": "push_in",
+        "description": "效果段：情绪最强，情绪高潮，环境开阔",
+        "shot_size": "medium_long",
+        "camera_movement": "pull_out",
         "camera_angle": "eye_level",
         "lighting": "backlit",
         "composition": "rule_of_thirds",
-        "dof": "shallow",
+        "dof": "medium",
         "intensity": 9,
     },
     "cta": {
@@ -1041,10 +1041,10 @@ def build_cinematic_prompt_elements(
     # 策略：若段落值在风格偏好列表中则优先用段落值，否则用风格偏好中的第一项
     intensity = seg_profile.get("intensity", 5)  # P1 修复：使用 intensity 字段
 
-    # - 景别：段落景别优先，不在风格偏好中则用风格第一偏好
+    # - 景别：完全由叙事功能决定，不受风格偏好影响
+    # 风格影响的是"质感"（光影、色调、运镜、构图），景别是叙事语言，应该服务于剧情
+    # 广告视频的景别应该由段落功能决定：hook 抓注意力、turning 铺陈、showcase 展示、result 情绪、cta 收束
     shot_size_key = seg_profile["shot_size"]
-    if shot_size_key not in style.get("shot_size_preference", []):
-        shot_size_key = style["shot_size_preference"][0]
 
     # - 运镜：段落运镜优先，不在风格偏好中则用风格第一偏好
     movement_key = seg_profile["camera_movement"]

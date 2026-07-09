@@ -17,6 +17,7 @@ AI 口播配音模块
 """
 
 import subprocess
+import re
 import shutil
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -91,36 +92,36 @@ DEFAULT_VOICEOVER_STYLE = "standard"
 VOICE_PRESETS = {
     "female_young": {
         "name": "年轻女声",
-        "voice": "Tingting",              # macOS fallback
-        "volc_voice_type": "zh_female_wanwanxiaohe_moon_bigtts",  # 火山：暖暖小荷
+        "voice": "Tingting",
+        "volc_voice_type": "zh_female_shuangkuaisisi_uranus_bigtts",
         "rate": 180,
         "pitch": 1.0,
     },
     "female_warm": {
         "name": "温暖女声",
-        "voice": "Meijia",                # macOS fallback
-        "volc_voice_type": "zh_female_qingxin_emo_bigtts",        # 火山：清新情感女声
+        "voice": "Meijia",
+        "volc_voice_type": "zh_female_wenroushunv_uranus_bigtts",
         "rate": 160,
         "pitch": 1.0,
     },
     "male_pro": {
         "name": "专业男声",
-        "voice": "Yunyang",               # macOS fallback
-        "volc_voice_type": "zh_male_chunhou_bigtts",              # 火山：醇厚男声
+        "voice": "Yunyang",
+        "volc_voice_type": "zh_male_ruyaqingnian_uranus_bigtts",
         "rate": 170,
         "pitch": 1.0,
     },
     "male_magnetic": {
         "name": "磁性男声",
-        "voice": "Tingting",              # macOS fallback
-        "volc_voice_type": "zh_male_jingqiangkanye_moon_bigtts",  # 火山：精强侃爷
+        "voice": "Tingting",
+        "volc_voice_type": "zh_male_qingcang_uranus_bigtts",
         "rate": 150,
         "pitch": 0.95,
     },
     "energetic_female": {
         "name": "活力女声",
-        "voice": "Tingting",              # macOS fallback
-        "volc_voice_type": "zh_female_lively_bigtts",             # 火山：活力女声
+        "voice": "Tingting",
+        "volc_voice_type": "zh_female_tianmeixiaoyuan_uranus_bigtts",
         "rate": 200,
         "pitch": 1.05,
     },
@@ -265,7 +266,7 @@ def generate_tts_audio(
             return _generate_tts_volcengine(
                 text=text,
                 output_path=output_path,
-                speaker=voice_config.get("volc_voice_type", "zh_female_wanwanxiaohe_moon_bigtts"),
+                speaker=voice_config.get("volc_voice_type", "zh_female_shuangkuaisisi_uranus_bigtts"),
                 api_key=volc_api_key,
                 resource_id=volc_resource_id,
                 # speech_rate: V3 范围 -50~100，映射自 wpm
@@ -298,21 +299,22 @@ def _generate_tts_volcengine(
     api_key: str,
     resource_id: str = _VOLC_RESOURCE_ID_DEFAULT,
     speech_rate: int = 0,
-    pitch_rate: int = 0,  # P1 修复：新增 pitch_rate 参数
+    pitch_rate: int = 0,
 ) -> Path:
     """
     使用火山引擎豆包大模型 TTS V3 单向流式接口生成音频。
 
     接口：POST https://openspeech.bytedance.com/api/v3/tts/unidirectional
-    协议：HTTP Chunked 流式，音频数据在响应体中分块返回。
+    协议：NDJSON 行格式，每行一个 JSON，data 字段为 base64 编码的音频，code=20000000 表示结束。
 
     Args:
         text: 合成文本
         output_path: 输出路径（.mp3 或 .m4a）
-        speaker: 豆包音色 ID，详见控制台音色库
+        speaker: 豆包音色 ID（TTS 2.0 音色以 _uranus_bigtts 结尾）
         api_key: 火山引擎 API Key（X-Api-Key 头）
         resource_id: 模型版本，默认 seed-tts-2.0
         speech_rate: 语速，范围 -50~100（0 为正常速，100 为 2x，-50 为 0.5x）
+        pitch_rate: 音调，范围 -50~100
 
     Returns:
         输出文件路径
@@ -321,15 +323,32 @@ def _generate_tts_volcengine(
         RuntimeError: API 调用失败或返回非 2xx 状态码
     """
     import uuid
+    import base64
     try:
         import requests as _requests
     except ImportError:
         raise RuntimeError("火山 TTS 需要 requests 库：pip install requests")
 
+    # 前置校验：确保文本有可读内容，避免 No readable text! 错误
+    import re as _re
+    _clean_text = text.strip()
+    # 去掉所有常见中英文标点和空白，看是否还有文字内容
+    _punct_pattern = (
+        r'[。！？；，、：\u201c\u201d\u2018\u2019\uff08\uff09'
+        r'\u3010\u3011\u300a\u300b\u2026\u2014'
+        r' \t\n\r,.!?;:\'\"()\[\]<>]'
+    )
+    _only_punct = _re.sub(_punct_pattern, '', _clean_text)
+    if not _only_punct:
+        raise RuntimeError(f"火山 TTS V3 合成失败：文本无可读内容（仅标点或空）：{repr(text[:50])}")
+
     speech_rate = max(-50, min(speech_rate, 100))
-    pitch_rate = max(-50, min(pitch_rate, 100))  # P1 修复：范围裁剪
+    pitch_rate = max(-50, min(pitch_rate, 100))
 
     payload = {
+        "user": {
+            "uid": "kling_ad_automation",
+        },
         "req_params": {
             "text": text,
             "speaker": speaker,
@@ -338,9 +357,9 @@ def _generate_tts_volcengine(
                 "sample_rate": 24000,
                 "bit_rate": 128000,
                 "speech_rate": speech_rate,
-                "pitch_rate": pitch_rate,  # P1 修复：将 pitch 传入 API
+                "pitch_rate": pitch_rate,
             },
-        }
+        },
     }
 
     mp3_path = output_path.with_suffix(".mp3")
@@ -357,7 +376,7 @@ def _generate_tts_volcengine(
                 _VOLC_API_URL,
                 json=payload,
                 headers=headers,
-                stream=True,   # Chunked 流式响应
+                stream=True,
                 timeout=60,
             ) as resp:
                 if resp.status_code != 200:
@@ -376,15 +395,57 @@ def _generate_tts_volcengine(
                     time.sleep(wait)
                     continue
 
-                # 消费流式响应，拼接音频数据
-                with mp3_path.open("wb") as f:
-                    for chunk in resp.iter_content(chunk_size=4096):
-                        if chunk:
-                            f.write(chunk)
+                # 解析 NDJSON 行格式响应，拼接 base64 音频数据
+                audio_bytes = bytearray()
+                final_code = None
+                final_msg = ""
+                for line in resp.iter_lines(decode_unicode=True):
+                    if not line:
+                        continue
+                    try:
+                        data = _parse_json_line(line)
+                    except Exception:
+                        continue
+                    code = data.get("code")
+                    if code == 20000000:
+                        final_code = code
+                        break
+                    if code is not None and code != 0:
+                        final_code = code
+                        final_msg = data.get("message", f"code={code}")
+                        break
+                    chunk_b64 = data.get("data")
+                    if chunk_b64:
+                        try:
+                            audio_bytes.extend(base64.b64decode(chunk_b64))
+                        except Exception:
+                            pass
 
-            if mp3_path.stat().st_size == 0:
-                mp3_path.unlink(missing_ok=True)
-                raise RuntimeError("火山 TTS V3 返回空音频，请检查 API Key 和音色 ID")
+                if final_code != 20000000:
+                    error = RuntimeError(
+                        f"火山 TTS V3 合成失败：{final_msg or f'code={final_code}'}"
+                    )
+                    if attempt == 3:
+                        raise error
+                    last_error = error
+                    wait = 2 ** attempt
+                    print(f"  ⚠️  火山 TTS 合成失败，{wait}s 后重试（{attempt}/3）")
+                    import time
+                    time.sleep(wait)
+                    continue
+
+                if len(audio_bytes) < 100:
+                    error = RuntimeError("火山 TTS V3 返回音频过小，请检查 API Key 和音色 ID")
+                    if attempt == 3:
+                        raise error
+                    last_error = error
+                    wait = 2 ** attempt
+                    print(f"  ⚠️  火山 TTS 音频异常，{wait}s 后重试（{attempt}/3）")
+                    import time
+                    time.sleep(wait)
+                    continue
+
+                mp3_path.write_bytes(audio_bytes)
             break
         except _requests.exceptions.RequestException as e:
             last_error = e
@@ -400,7 +461,6 @@ def _generate_tts_volcengine(
 
     _validate_audio_file(mp3_path)
 
-    # 按需转码为 m4a
     if output_path.suffix != ".mp3" and shutil.which("ffmpeg"):
         cmd = [
             "ffmpeg", "-y", "-i", str(mp3_path),
@@ -418,6 +478,25 @@ def _generate_tts_volcengine(
 
     _validate_audio_file(output_path)
     return output_path
+
+
+def _parse_json_line(line: str) -> dict:
+    """解析 V3 接口的 NDJSON 行，兼容可能的前缀/后缀字符。"""
+    line = line.strip()
+    if not line:
+        return {}
+    import json
+    try:
+        return json.loads(line)
+    except Exception:
+        start = line.find("{")
+        end = line.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(line[start : end + 1])
+            except Exception:
+                pass
+    return {}
 
 
 def _generate_tts_macos(
@@ -571,8 +650,22 @@ def split_sentences(text: str, max_chars: int = 20) -> List[str]:
             if sub_sent.strip():
                 result.append(sub_sent.strip())
 
-    # 过滤空句
-    return [s for s in result if s.strip()]
+    # 过滤空句和纯标点句子（火山 TTS 对纯标点文本报 No readable text!）
+    import re as _re
+    _punct_pattern_split = (
+        r'[。！？；，、：\u201c\u201d\u2018\u2019\uff08\uff09'
+        r'\u3010\u3011\u300a\u300b\u2026\u2014'
+        r' \t\n\r,.!?;:\'\"()\[\]<>]'
+    )
+    def _has_readable_content(s: str) -> bool:
+        stripped = s.strip()
+        if not stripped:
+            return False
+        # 去掉所有常见中英文标点和空白，看是否还有文字内容
+        cleaned = _re.sub(_punct_pattern_split, '', stripped)
+        return bool(cleaned)
+
+    return [s for s in result if _has_readable_content(s)]
 
 
 def generate_full_voiceover(
@@ -888,6 +981,120 @@ def align_subtitles_to_voiceover(
     matched.sort(key=lambda s: s.get("start", 0))
     return matched
 
+
+def adjust_voiceover_to_video_duration(
+    voiceover_audio: Path,
+    video_duration: float,
+    output_path: Optional[Path] = None,
+    max_speedup: float = 1.4,
+    max_slowdown: float = 0.9,
+) -> Tuple[Path, float, float]:
+    """
+    调整口播音频时长以匹配视频时长（音视频精确同步）。
+
+    策略：
+    1. 口播比视频短：尾部补静音，保证视频结束时口播已结束
+    2. 口播比视频长，但超出比例在 max_speedup 内：用 atempo 加速口播
+    3. 口播比视频长很多，加速也装不下：裁剪到视频时长，末尾加淡出
+    4. 口播比视频长一点点（< 0.5s）：直接裁剪，避免微小加速影响听感
+
+    Args:
+        voiceover_audio: 输入口播音频路径
+        video_duration: 目标视频时长（秒）
+        output_path: 输出路径，None 则自动生成
+        max_speedup: 最大加速倍率（默认 1.4x，超过则裁剪）
+        max_slowdown: 最大减速倍率（默认 0.9x，短于视频则补静音）
+
+    Returns:
+        (输出音频路径, 调整后时长, 调整倍率: >1表示加速, <1表示减速/裁剪)
+    """
+    import shutil
+
+    if output_path is None:
+        output_path = voiceover_audio.parent / f"{voiceover_audio.stem}_adjusted{voiceover_audio.suffix}"
+
+    if not voiceover_audio.exists():
+        return voiceover_audio, 0.0, 1.0
+
+    if shutil.which("ffmpeg") is None:
+        return voiceover_audio, 0.0, 1.0
+
+    vo_duration = _get_audio_duration(voiceover_audio)
+    if vo_duration <= 0:
+        return voiceover_audio, 0.0, 1.0
+
+    diff = vo_duration - video_duration
+
+    # 情况1：口播比视频短 → 补静音（直接返回原文件，混合时视频为主）
+    if diff <= 0.5:
+        return voiceover_audio, vo_duration, 1.0
+
+    speed_ratio = vo_duration / video_duration
+
+    # 情况2：超出在加速范围内 → 用 atempo 加速
+    if speed_ratio <= max_speedup:
+        try:
+            cmd = [
+                "ffmpeg", "-y", "-i", str(voiceover_audio),
+                "-filter:a", f"atempo={speed_ratio:.3f}",
+                "-vn", "-c:a", "aac", "-b:a", "128k",
+                str(output_path),
+            ]
+            subprocess.run(cmd, capture_output=True, timeout=30, check=True)
+            new_dur = _get_audio_duration(output_path)
+            if new_dur > 0:
+                return output_path, new_dur, speed_ratio
+        except Exception:
+            pass
+
+    # 情况3：加速也装不下 或 加速失败 → 裁剪到视频时长，末尾淡出
+    try:
+        fade_duration = min(0.3, video_duration * 0.1)
+        afade_start = max(0, video_duration - fade_duration)
+        cmd = [
+            "ffmpeg", "-y", "-i", str(voiceover_audio),
+            "-filter:a", f"atrim=0:{video_duration:.3f},asetpts=PTS-STARTPTS,afade=t=out:st={afade_start:.3f}:d={fade_duration:.3f}",
+            "-vn", "-c:a", "aac", "-b:a", "128k",
+            str(output_path),
+        ]
+        subprocess.run(cmd, capture_output=True, timeout=30, check=True)
+        new_dur = _get_audio_duration(output_path)
+        return output_path, new_dur if new_dur > 0 else video_duration, speed_ratio
+    except Exception:
+        return voiceover_audio, vo_duration, 1.0
+
+
+def adjust_subtitles_to_duration(
+    subtitles: List[Dict[str, Any]],
+    target_duration: float,
+    adjust_ratio: float = 1.0,
+) -> List[Dict[str, Any]]:
+    """
+    根据音频调整倍率同步调整字幕时间轴。
+
+    Args:
+        subtitles: 字幕列表（含 start/end）
+        target_duration: 目标总时长
+        adjust_ratio: 调整倍率（>1 表示加速了，字幕时间要压缩）
+
+    Returns:
+        调整后的字幕列表
+    """
+    if not subtitles or abs(adjust_ratio - 1.0) < 0.01:
+        return subtitles
+
+    adjusted = []
+    for sub in subtitles:
+        new_sub = dict(sub)
+        new_sub["start"] = sub.get("start", 0) / adjust_ratio
+        new_sub["end"] = sub.get("end", 0) / adjust_ratio
+        # 确保不超出目标时长
+        if new_sub["end"] > target_duration - 0.1:
+            new_sub["end"] = target_duration - 0.1
+        if new_sub["start"] < new_sub["end"]:
+            adjusted.append(new_sub)
+
+    return adjusted
 
 
 def list_available_voices() -> List[Dict[str, str]]:

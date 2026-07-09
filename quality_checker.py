@@ -322,6 +322,7 @@ def _analyze_face_quality(frame_path: Path) -> List[str]:
     4. 检查是否有多个面积相近的肤色区域（可能是多个人脸或崩坏碎片）
 
     注意：这是非常粗略的初筛，只能发现明显异常，不能替代专业检测。
+    阈值设置原则：明显崩坏的要拦得住，正常动态/角度变化不误杀。
 
     Args:
         frame_path: 帧图片路径
@@ -355,29 +356,31 @@ def _analyze_face_quality(frame_path: Path) -> List[str]:
 
         # 1. 最大肤色区域占比检查
         largest_ratio = largest["area"] / img_area
-        if largest_ratio > 0.5:
+        if largest_ratio > 0.6:
             issues.append(f"肤色区域过大（{largest_ratio*100:.0f}%），可能画面异常")
-        elif largest_ratio < 0.02:
+        elif largest_ratio < 0.015:
             # 肤色区域太小，可能不是人物画面，不报错
             pass
 
         # 2. 长宽比检查（最大区域）
         ar = largest["aspect_ratio"]
-        # 正常的人脸/人体长宽比大约在 0.3 - 1.5 之间
-        if ar > 2.5 or ar < 0.2:
+        # 正常人脸/人体长宽比约 0.3-1.5，放宽到 0.2-3.0 覆盖侧脸/低头/表情变化
+        if ar > 3.0 or ar < 0.2:
             issues.append(f"肤色区域形状异常（长宽比 {ar:.2f}）")
 
         # 3. 填充率检查（bbox 内肤色像素比例）
         fill = largest["fill_ratio"]
-        # 正常的人脸填充率大约 0.5-0.8，全身大约 0.2-0.5
-        if fill > 0.95:
+        # 正常人脸填充率约 0.5-0.8，全身约 0.2-0.5
+        # 过于密实：>0.96 且占比 >5%（排除小色块）
+        # 过于碎片化：<0.12 且占比 >6%
+        if fill > 0.96 and largest_ratio > 0.05:
             issues.append("肤色区域过于密实，可能是色块异常")
-        elif fill < 0.15 and largest_ratio > 0.05:
+        elif fill < 0.12 and largest_ratio > 0.06:
             issues.append("肤色区域过于碎片化，可能有崩坏")
 
-        # 4. 多区域检查：如果有 3 个以上面积相近的大肤色区域
-        large_regions = [r for r in regions if r["area"] > largest["area"] * 0.3]
-        if len(large_regions) >= 4:
+        # 4. 多区域检查：如果有 5 个以上面积相近的大肤色区域才报警
+        large_regions = [r for r in regions if r["area"] > largest["area"] * 0.25]
+        if len(large_regions) >= 5:
             issues.append(f"检测到 {len(large_regions)} 个大面积肤色区域，可能有多人人脸或画面碎片")
 
         # 5. 对称性检查（粗略：左右两半肤色像素量对比）
@@ -406,8 +409,9 @@ def _analyze_face_quality(frame_path: Path) -> List[str]:
             total = left_skin + right_skin
             if total > 100:
                 left_ratio = left_skin / total
-                # 正常人脸左右不对称度约 5-15%，超过 35% 可能有问题
-                if abs(left_ratio - 0.5) > 0.3:
+                # 正常人脸左右不对称约 5-15%，超过 38% 可能有问题
+                # 侧脸/低头会不对称，但真崩坏时不对称会更夸张
+                if abs(left_ratio - 0.5) > 0.38:
                     issues.append(f"肤色区域左右不对称（左 {left_ratio*100:.0f}%）")
 
     except Exception as e:

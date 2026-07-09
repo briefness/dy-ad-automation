@@ -355,6 +355,146 @@ def get_rhythm_template(
     return template
 
 
+def adapt_rhythm_template_to_segments(
+    template: Dict[str, Any],
+    target_segments: int,
+) -> Dict[str, Any]:
+    """
+    将节奏模板适配到目标段数（通过合并或拆分段落，保持叙事弧完整）。
+
+    核心原则：
+    - 保持 hook → turning → showcase → result → cta 的叙事弧完整性
+    - 段数不足时合并相邻功能，段数过多时拆分展示类段落
+    - 总时长和转场时长保持不变，重新分配各段时长比例
+
+    Args:
+        template: 原始节奏模板（5段）
+        target_segments: 目标段数（3-7）
+
+    Returns:
+        适配后的节奏模板（深拷贝）
+    """
+    if target_segments <= 0:
+        raise ValueError(f"target_segments 必须 > 0，收到：{target_segments}")
+
+    current_segs = len(template["segments"])
+    if current_segs == target_segments:
+        return copy.deepcopy(template)
+
+    result = copy.deepcopy(template)
+    segs = result["segments"]
+    transition = result.get("transition_duration", 0.3)
+
+    # 叙事功能优先级：hook(必须) → cta(必须) → showcase(重要) → turning(重要) → result(重要)
+    # 段数 < 5 时，按优先级从低到高合并
+
+    if target_segments < current_segs:
+        # 合并策略：从低优先级功能开始合并到相邻段
+        # 优先级从低到高：turning/pain (可合并到 hook) → result (可合并到 showcase)
+        while len(segs) > target_segments and len(segs) > 3:
+            # 找到可合并的最低优先级段
+            merge_candidates = []
+
+            # turning/pain 段可合并到前一段（hook）
+            _turning_keywords = ("turning", "turn", "pain", "pain_amplify", "problem", "conflict")
+            _result_keywords = ("result", "after", "effect", "outcome", "compare_result", "transformation")
+            for i, seg in enumerate(segs):
+                n = seg.get("narrative", seg.get("type", ""))
+                if any(k in n for k in _turning_keywords) and i > 0 and i < len(segs) - 1:
+                    merge_candidates.append((i, "turning"))  # 合并 turning 类到前一段
+                elif any(k in n for k in _result_keywords) and i > 0 and i < len(segs) - 1:
+                    merge_candidates.append((i, "result"))  # result 可合并到 showcase
+
+            if not merge_candidates:
+                break
+
+            # 选择最优先合并的（turning 优先于 result）
+            merge_candidates.sort(key=lambda x: 0 if x[1] == "turning" else 1)
+            merge_idx, _ = merge_candidates[0]
+
+            # 合并：前一段时长 += 当前段时长，当前段删除
+            if merge_idx > 0:
+                segs[merge_idx - 1]["duration"] = round(
+                    segs[merge_idx - 1]["duration"] + segs[merge_idx]["duration"], 2
+                )
+                # 合并叙事类型
+                prev_type = segs[merge_idx - 1].get("narrative", segs[merge_idx - 1].get("type", ""))
+                curr_type = segs[merge_idx].get("narrative", segs[merge_idx].get("type", ""))
+                segs[merge_idx - 1]["narrative"] = f"{prev_type}+{curr_type}"
+                segs[merge_idx - 1]["type"] = segs[merge_idx - 1].get("narrative", prev_type)
+                # purpose 合并
+                prev_purpose = segs[merge_idx - 1].get("purpose", "")
+                curr_purpose = segs[merge_idx].get("purpose", "")
+                segs[merge_idx - 1]["purpose"] = f"{prev_purpose} & {curr_purpose}"
+                del segs[merge_idx]
+
+    elif target_segments > current_segs:
+        # 拆分策略：优先拆分 showcase 段，其次 turning 段
+        # 在中间位置拆分成两段，时长比例约 1:1
+        while len(segs) < target_segments and len(segs) < 8:
+            # 找到可拆分的最高优先级段
+            split_idx = -1
+            for i, seg in enumerate(segs):
+                n = seg.get("narrative", seg.get("type", ""))
+                if "showcase" in n or n in ("showcase", "show", "demo"):
+                    split_idx = i
+                    break
+
+            if split_idx < 0:
+                # 没有 showcase 可拆，拆 turning
+                for i, seg in enumerate(segs):
+                    n = seg.get("narrative", seg.get("type", ""))
+                    if "turning" in n or n in ("turning", "turn"):
+                        split_idx = i
+                        break
+
+            if split_idx < 0 or split_idx >= len(segs) - 1:
+                break
+
+            # 拆分成两段，时长按 45:55 分配（前短后长，符合节奏递进）
+            orig_seg = segs[split_idx]
+            orig_dur = orig_seg["duration"]
+            dur1 = round(orig_dur * 0.45, 2)
+            dur2 = round(orig_dur - dur1, 2)
+
+            # 第一段
+            seg1 = copy.deepcopy(orig_seg)
+            seg1["duration"] = dur1
+            seg1["index"] = split_idx
+
+            # 第二段（加个后缀区分）
+            seg2 = copy.deepcopy(orig_seg)
+            seg2["duration"] = dur2
+            seg2["index"] = split_idx + 1
+
+            # 更新叙事类型
+            narrative = orig_seg.get("narrative", orig_seg.get("type", ""))
+            seg1["narrative"] = f"{narrative}_1"
+            seg2["narrative"] = f"{narrative}_2"
+            seg1["type"] = seg1["narrative"]
+            seg2["type"] = seg2["narrative"]
+
+            # 替换原位置
+            segs[split_idx] = seg1
+            segs.insert(split_idx + 1, seg2)
+
+    # 重新计算索引、比例和总时长
+    new_total = sum(s["duration"] for s in segs)
+    for i, seg in enumerate(segs):
+        seg["index"] = i
+        seg["ratio"] = round(seg["duration"] / new_total, 4)
+
+    result["total_duration"] = round(new_total, 2)
+    result["segments"] = segs
+
+    # 如果段数变化了，重新计算转场影响下的实际总时长
+    if len(segs) > 1:
+        actual_total = new_total - transition * (len(segs) - 1)
+        result["actual_total_duration"] = round(actual_total, 2)
+
+    return result
+
+
 def compute_segment_timeline(
     template: Dict[str, Any],
     seg_indices: Optional[list] = None,
@@ -510,10 +650,8 @@ def _extract_highlight_words(text: str) -> list[str]:
             found.append(kw)
 
     for kw in short_keywords:
-        # 短词匹配：后面必须跟形容词/副词开头，不能跟名词
-        # 简化：只在"太/最/超"后面是形容词或"了/好/棒/强"等字时才匹配
         pattern = re.compile(
-            rf"(?<=[{re.escape(boundary_chars)}]|^){re.escape(kw)}[好棒强绝快多厉害香]"
+            rf"(?:^|[{re.escape(boundary_chars)}]){re.escape(kw)}[好棒强绝快多厉害香]"
         )
         if pattern.search(text):
             found.append(kw)

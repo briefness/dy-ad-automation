@@ -157,73 +157,72 @@ SFX_CACHE_DIR = "output/sfx_cache"  # 音效本地缓存目录（相对于项目
 
 # 负面提示词（通用视频生成）
 # 注意：禁止加入 "multiple people" / "crowd" / "group shot"，与多角色功能矛盾
+# 优化原则：按权重排序（影响越大越靠前）、去冗余、去冲突（电影风格相关的词不加，交给风格系统控制）
 NEGATIVE_PROMPT = (
-    # 人物一致性问题
-    "different person, different face, different outfit, "
-    "face swap, identity change, inconsistent facial features, "
-    "changing hair color, changing hairstyle, changing clothes, "
-    # 质量基础问题
-    "blurry, low quality, distorted face, extra limbs, "
-    "ugly, deformed, malformed, poorly drawn, "
-    # 文字水印问题
+    # ── P0：人物/产品一致性（最影响可用性，放最前面）──
+    "different person, different face, identity change, inconsistent facial features, "
+    "changing hair color, changing hairstyle, changing clothes, different outfit, "
+    "face swap, morphing face, face morphing, "
+    # ── P0：时间一致性（AI 视频重灾区）──
+    "flickering, flicker, temporal inconsistency, jitter, jittering, "
+    "melting skin, warped body, shape shifting, object morphing, size changing, "
+    "ghosting, double exposure artifact, color banding, "
+    "sudden jump cut artifact, shaking artifacts, pixel noise, "
+    # ── P1：人体结构（Kling 重灾区：手/指/肢）──
+    "finger distortion, extra fingers, missing fingers, fused fingers, deformed hands, "
+    "extra hands, missing hands, extra limbs, missing limbs, extra arms, extra legs, "
+    "disconnected limbs, floating limbs, floating fingers, broken fingers, "
+    "bad anatomy, wrong proportions, unrealistic proportions, long neck, "
+    # ── P1：面部质量（人物镜头的核心）──
+    "distorted face, deformed, malformed, ugly, poorly drawn, "
+    "cross-eyed, asymmetric eyes, uneven eyes, lazy eye, "
+    "deformed mouth, crooked teeth, missing teeth, "
+    "plastic skin, smooth waxy skin, doll-like face, "
+    "dead eyes, glassy eyes, unrealistic eyes, "
+    # ── P1：文字水印（抖音广告硬伤）──
     "text watermark, unrelated logo, unrelated brand mark, "
     "Chinese text, watermark text, in-frame text overlay, embedded subtitles, "
     "sign text, poster text, newspaper text, "
-    # AI 视频特有时间一致性问题
-    "flickering, flicker, frame flicker, temporal inconsistency, "
-    "morphing face, face morphing, melting skin, warped body, "
-    "jitter, jittering, shaking artifacts, pixel noise, "
-    "ghosting, double exposure artifact, color banding, "
-    "sudden jump cut artifact, limb deformation, "
-    "shape shifting, object morphing, size changing, "
-    # 手部/手指精细问题（Kling 重灾区）
-    "finger distortion, extra fingers, missing fingers, fused fingers, "
-    "deformed hands, extra hands, missing hands, "
-    "abnormal finger count, malformed fingers, twisted fingers, "
-    "broken fingers, floating fingers, "
-    # 面部精细问题
-    "cross-eyed, lazy eye, asymmetric eyes, uneven eyes, "
-    "deformed mouth, crooked teeth, missing teeth, "
-    "plastic skin, smooth waxy skin, doll-like face, "
-    "unrealistic eyes, dead eyes, glassy eyes, "
-    # 肢体/人体结构问题
-    "long neck, extra arms, extra legs, missing limbs, "
-    "disconnected limbs, floating limbs, "
-    "bad anatomy, wrong proportions, unrealistic proportions, "
-    # 场景/物理问题
-    "floating objects, defying gravity, physics-defying, "
-    "transparent objects, see-through, clipping, "
-    "mirror artifact, reflection error, "
-    # 镜头质量问题
+    # ── P2：基础画质──
+    "blurry, low quality, out of focus, soft focus, "
+    "overexposed, underexposed, washed out, faded colors, "
+    "color cast, yellow tint, green tint, magenta tint, "
+    "motion blur artifacts, motion smear, "
+    # ── P2：镜头质量──
     "handheld camera shake, camera shake, shaky footage, "
     "lens distortion, barrel distortion, fisheye distortion, "
     "chromatic aberration, color fringing, purple fringing, "
-    "overexposed background, blown out highlights, washed out sky, "
-    "motion blur artifacts, motion smear, "
-    # 色彩/曝光问题
-    "overexposed, underexposed, washed out, faded colors, "
-    "color cast, yellow tint, green tint, magenta tint, "
-    "high contrast, flat lighting, "
-    # 构图问题
+    # ── P2：场景/物理──
+    "floating objects, defying gravity, physics-defying, "
+    "transparent objects, see-through, clipping, "
+    "mirror artifact, reflection error, "
+    # ── P2：构图问题──
     "cropped head, cut off head, cut off face, "
     "out of frame, partially visible, truncated subject"
 )
 
 # 角色定妆照负面提示词（图片生成专用，更强调肖像质量）
 CHARACTER_NEGATIVE_PROMPT = (
-    "different person, different face, different outfit, "
-    "blurry, low quality, distorted face, extra limbs, "
-    "ugly, deformed, malformed, poorly drawn, "
+    # P0：人物一致性
+    "different person, different face, identity change, different outfit, "
+    # P0：面部结构
+    "distorted face, deformed, malformed, ugly, poorly drawn, "
+    "cross-eyed, asymmetric eyes, uneven eyes, lazy eye, "
+    "deformed mouth, crooked teeth, missing teeth, "
+    "plastic skin, smooth waxy skin, doll-like face, "
+    "dead eyes, glassy eyes, unrealistic eyes, "
+    # P1：人体结构
+    "finger distortion, extra fingers, missing fingers, fused fingers, deformed hands, "
+    "extra hands, missing hands, extra limbs, missing limbs, "
+    "bad anatomy, wrong proportions, unrealistic proportions, "
+    # P1：文字水印
     "text watermark, unrelated logo, unrelated brand mark, "
     "Chinese text, watermark text, in-frame text overlay, "
-    "plastic skin, smooth waxy skin, doll-like face, "
-    "cross-eyed, lazy eye, asymmetric eyes, uneven eyes, "
-    "deformed mouth, crooked teeth, missing teeth, "
-    "finger distortion, extra fingers, missing fingers, fused fingers, "
-    "deformed hands, extra hands, missing hands, "
-    "bad anatomy, wrong proportions, unrealistic proportions, "
+    # P2：基础画质
+    "blurry, low quality, out of focus, "
     "overexposed, underexposed, washed out, "
     "chromatic aberration, color fringing, "
+    # P2：构图
     "cropped head, cut off head, cut off face, "
     "out of frame, partially visible"
 )
@@ -640,10 +639,10 @@ CLIP_STRUCTURE = [
         "camera": "push",
         "narrative": "hook",
         "base_prompt": (
-            "static shot, slow push in, {character} looking at phone with frustrated expression, "
-            "confused and stressed, {preset_scene} scene, {preset_lighting}, "
+            "close-up on face, slow push in, {character} looking at phone with frustrated expression, "
+            "confused and stressed, {preset_scene} scene visible in background, {preset_lighting}, "
             "realistic lifestyle style, tense mood, grab attention in first 3 seconds, "
-            "9:16 vertical, close-up on face, "
+            "9:16 vertical, "
             "{character_consistency}, {brand_consistency}"
         ),
     },
@@ -651,8 +650,9 @@ CLIP_STRUCTURE = [
         "camera": "push",
         "narrative": "turning_point",
         "base_prompt": (
-            "handheld tracking shot, {character} turns and picks up {name}, "
+            "medium shot, {character} turns and picks up {name}, "
             "eyes light up with surprise, {name} displayed in hand, "
+            "{preset_scene} environment around them, "
             "warm lighting, lifestyle photography style, emotional turning point, "
             "same person from reference image, 9:16 vertical"
         ),
@@ -671,16 +671,16 @@ CLIP_STRUCTURE = [
         "camera": "pull",
         "narrative": "result",
         "base_prompt": (
-            "slow pull back, {character} smiling with satisfaction, {name} placed beside, "
-            "{preset_result}, warm golden hour lighting, emotional climax, "
-            "close-up on happy expression, same person from reference image, 9:16 vertical"
+            "medium shot, slow pull back, {character} smiling with satisfaction, {name} placed beside, "
+            "{preset_result}, {preset_scene} environment becoming visible as camera pulls back, "
+            "warm golden hour lighting, emotional climax, "
+            "same person from reference image, 9:16 vertical"
         ),
     },
     {
         "camera": "push",
         "narrative": "cta",
         "base_prompt": (
-            # #10 修复：加行动引导和紧迫感，不再只放白背景产品图
             "{character} holding {name} and looking directly into camera with confident smile, "
             "pointing at {name} with one hand, enthusiastic and welcoming gesture, "
             "\"shop now\" energy, urgency and excitement, bright commercial lighting, "
@@ -950,7 +950,7 @@ CINEMATIC_STYLES = {
     },
 }
 
-DEFAULT_CINEMATIC_STYLE = "none"
+DEFAULT_CINEMATIC_STYLE = "auto"
 
 # ============================================================
 # 辅助函数
@@ -1269,6 +1269,24 @@ QUALITY_GATE_CONFIG = {
         "suggest_fixes": True,
         # 是否允许用户手动确认继续
         "allow_override": True,
+    },
+
+    # ── v2 新增：综合评分通过阈值 ──
+    "min_pass_score": 55,
+
+    # ── v2 新增：自进化机制 ──
+    "self_evolution": {
+        "enabled": True,
+        # 是否自动记录生成结果反馈
+        "auto_record_feedback": True,
+        # 反馈数据存储路径（相对 output 目录）
+        "feedback_db_path": "quality_feedback/feedback_records.json",
+        # 多少条数据后开始给出优化建议
+        "insight_min_records": 10,
+        # 误判率阈值（超过则建议放宽）
+        "false_positive_threshold": 0.20,
+        # 漏判率阈值（超过则建议收紧）
+        "false_negative_threshold": 0.10,
     },
 }
 
