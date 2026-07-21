@@ -1898,6 +1898,8 @@ def _merge_with_transitions(
     transitions: List[Dict[str, Any]],
     bgm: Optional[Path] = None,
     envelope_key_times: Optional[List[float]] = None,
+    music_contract: Optional[Dict[str, Any]] = None,
+    bgm_segment: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """
     使用 xfade 链实现多片段真正的交叉转场拼接
@@ -2073,6 +2075,8 @@ def _merge_with_transitions(
             input_label=f"[{bgm_input_index}:a]",
             num_clips=len(clips),
             envelope_key_times=envelope_key_times,
+            music_contract=music_contract,
+            bgm_segment=bgm_segment,
         )
         filter_parts.append(bgm_filter)
         if any_audio and current_alabel:
@@ -2136,6 +2140,8 @@ def _merge_simple_concat(
     output: Path,
     bgm: Optional[Path] = None,
     envelope_key_times: Optional[List[float]] = None,
+    music_contract: Optional[Dict[str, Any]] = None,
+    bgm_segment: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """简单拼接（无转场或回退方案）"""
     if not clips:
@@ -2154,6 +2160,8 @@ def _merge_simple_concat(
             transitions=[{"type": "fade", "duration": 0.0} for _ in range(len(clips) - 1)],
             bgm=bgm,
             envelope_key_times=envelope_key_times,
+            music_contract=music_contract,
+            bgm_segment=bgm_segment,
         )
 
     concat_file = output.parent / "concat_list.txt"
@@ -2177,6 +2185,8 @@ def _merge_simple_concat(
                 bgm_path=bgm,
                 num_clips=len(clips),
                 envelope_key_times=envelope_key_times,
+                music_contract=music_contract,
+                bgm_segment=bgm_segment,
             )
             if has_audio:
                 fcx = (
@@ -2471,6 +2481,8 @@ def merge_clips_ffmpeg(
     subtitles: Optional[List[Dict[str, Any]]] = None,
     envelope_key_times: Optional[List[float]] = None,
     strict_transitions: bool = False,
+    music_contract: Optional[Dict[str, Any]] = None,
+    bgm_segment: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """
     使用 ffmpeg 拼接多个视频片段，支持真正的交叉转场
@@ -2508,8 +2520,15 @@ def merge_clips_ffmpeg(
                 if strict_transitions
                 else [transitions[i % len(transitions)] for i in range(num_transitions_needed)]
             )
-            return _merge_with_transitions(clips, output, full_transitions, bgm,
-                                           envelope_key_times=envelope_key_times)
+            return _merge_with_transitions(
+                clips,
+                output,
+                full_transitions,
+                bgm,
+                envelope_key_times=envelope_key_times,
+                music_contract=music_contract,
+                bgm_segment=bgm_segment,
+            )
         except Exception as e:
             if strict_transitions:
                 raise RuntimeError(f"智能转场合成失败，已阻断输出：{e}") from e
@@ -2519,7 +2538,14 @@ def merge_clips_ffmpeg(
         raise RuntimeError("智能转场决策缺失，已阻断输出")
 
     # 简单拼接（无转场或转场失败时回退）
-    return _merge_simple_concat(clips, output, bgm, envelope_key_times=envelope_key_times)
+    return _merge_simple_concat(
+        clips,
+        output,
+        bgm,
+        envelope_key_times=envelope_key_times,
+        music_contract=music_contract,
+        bgm_segment=bgm_segment,
+    )
 
 
 def add_subtitles_ffmpeg(
@@ -3357,10 +3383,75 @@ def _pick_bgm_segment(
         - need_loop: 是否需要循环
         - segment_duration: 单次片段时长（秒，循环时用）
     """
+    selected = select_bgm_segment(bgm_duration, video_duration, bgm_path)
+    return (
+        float(selected["start_time"]),
+        bool(selected["need_loop"]),
+        float(selected["segment_duration"]),
+    )
+
+
+def select_bgm_segment(
+    bgm_duration: float,
+    video_duration: float,
+    bgm_path: Optional[Path] = None,
+    music_contract: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Select an auditable music window from actual audio and the AV contract."""
     if bgm_duration <= 0:
-        return 0.0, False, 0.0
+        return {
+            "start_time": 0.0,
+            "need_loop": False,
+            "segment_duration": 0.0,
+            "strategy": "empty_audio",
+            "average_loudness_db": None,
+        }
 
     ratio = bgm_duration / max(video_duration, 0.1)
+    material_driven = str((music_contract or {}).get("source") or "") in {
+        "local_asset_analysis",
+        "selected_local_assets",
+    }
+
+    if ratio > 1.2 and material_driven and bgm_path:
+        loudness = _analyze_loudness(bgm_path, 1.0)
+        window_size = max(1, min(len(loudness), math.ceil(video_duration)))
+        windows = [
+            {
+                "start_time": float(start),
+                "average_loudness_db": sum(loudness[start:start + window_size]) / window_size,
+                "loudness_range_db": max(loudness[start:start + window_size]) - min(loudness[start:start + window_size]),
+            }
+            for start in range(0, max(1, len(loudness) - window_size + 1))
+            if start + video_duration <= bgm_duration + 0.05
+        ]
+        if windows:
+            energy = str((music_contract or {}).get("energy") or "medium")
+            quantile = {"low": 0.25, "medium": 0.50, "high": 1.0}.get(energy, 0.50)
+            ordered_levels = sorted(item["average_loudness_db"] for item in windows)
+            target_index = round((len(ordered_levels) - 1) * quantile)
+            target_level = ordered_levels[target_index]
+            selected = min(
+                windows,
+                key=lambda item: (
+                    abs(item["average_loudness_db"] - target_level),
+                    item["loudness_range_db"],
+                    item["start_time"],
+                ),
+            )
+            start_time = selected["start_time"]
+            beats = _detect_beats(bgm_path)
+            if beats:
+                start_time = _align_to_beat(start_time, beats, max_offset=0.5)
+            return {
+                "start_time": round(start_time, 3),
+                "need_loop": False,
+                "segment_duration": video_duration,
+                "strategy": "contract_energy_window",
+                "average_loudness_db": round(selected["average_loudness_db"], 3),
+                "loudness_range_db": round(selected["loudness_range_db"], 3),
+                "contract_energy": energy,
+            }
 
     # 1. BGM 比视频长很多：选段使用
     if ratio > 1.2:
@@ -3373,17 +3464,35 @@ def _pick_bgm_segment(
                 if beats:
                     chorus_start = _align_to_beat(chorus_start, beats, max_offset=0.5)
                 print(f"  🎯 副歌定位：{chorus_start:.1f}s 处（已对齐节拍）")
-                return chorus_start, False, video_duration
+                return {
+                    "start_time": chorus_start,
+                    "need_loop": False,
+                    "segment_duration": video_duration,
+                    "strategy": "loudest_chorus",
+                    "average_loudness_db": None,
+                }
 
         # 回退：从 20% 处开始（大多数流行音乐 intro 占 10-15%，20% 处进入主歌/副歌）
         start_time = bgm_duration * 0.2
         if start_time + video_duration > bgm_duration:
             start_time = max(bgm_duration - video_duration, 0)
-        return start_time, False, video_duration
+        return {
+            "start_time": start_time,
+            "need_loop": False,
+            "segment_duration": video_duration,
+            "strategy": "structural_main_section",
+            "average_loudness_db": None,
+        }
 
     # 2. BGM 比视频略长或差不多：整首使用
     if ratio > 1.0:
-        return 0.0, False, bgm_duration
+        return {
+            "start_time": 0.0,
+            "need_loop": False,
+            "segment_duration": bgm_duration,
+            "strategy": "full_track",
+            "average_loudness_db": None,
+        }
 
     # 3. BGM 比视频短：循环使用
     # 优先用响度分析找最燃的循环起点（跳过 intro 的最响点）
@@ -3411,7 +3520,13 @@ def _pick_bgm_segment(
     if bgm_path and bgm_path.exists():
         _warn_bgm_bpm(bgm_path, loop_start, loop_duration)
 
-    return loop_start, True, loop_duration
+    return {
+        "start_time": loop_start,
+        "need_loop": True,
+        "segment_duration": loop_duration,
+        "strategy": "energy_loop",
+        "average_loudness_db": None,
+    }
 
 
 def _warn_bgm_bpm(
@@ -3598,6 +3713,8 @@ def _build_bgm_audio_filter(
     input_label: str = "[1:a]",
     num_clips: int = 5,
     envelope_key_times: Optional[List[float]] = None,
+    music_contract: Optional[Dict[str, Any]] = None,
+    bgm_segment: Optional[Dict[str, Any]] = None,
 ) -> str:
     # Bug #4 修复：新增 input_label 参数，调用方直接传入正确的输入流标签，
     # 消除之前用 string replace 修改 [1:a] 的脆弱做法（多处引用时会漏替换）
@@ -3626,9 +3743,15 @@ def _build_bgm_audio_filter(
     bgm_duration = _get_audio_duration(bgm_path) if bgm_path else 0.0
 
     if bgm_duration > 0:
-        start_time, need_loop, segment_duration = _pick_bgm_segment(
-            bgm_duration, video_duration, bgm_path
+        selected_segment = bgm_segment or select_bgm_segment(
+            bgm_duration,
+            video_duration,
+            bgm_path,
+            music_contract=music_contract,
         )
+        start_time = float(selected_segment["start_time"])
+        need_loop = bool(selected_segment["need_loop"])
+        segment_duration = float(selected_segment["segment_duration"])
     else:
         start_time, need_loop, segment_duration = 0.0, True, 0.0
 

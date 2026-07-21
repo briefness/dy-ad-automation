@@ -4947,6 +4947,31 @@ class TestMaterialDrivenPostProduction:
         assert voice == "female_young"
         assert "素材" in reason
 
+    def test_initial_local_asset_profile_also_uses_material_driven_voice_selection(self):
+        from tts_client import recommend_voice_for_narration
+
+        voice, reason = recommend_voice_for_narration(
+            {"type": "食品"},
+            [{"text": "先用成品抓住注意力再自然带到茉莉花茶原料"}],
+            requested_voice="female_warm",
+            creative_profile={
+                "source": "local_asset_analysis",
+                "energy": "medium",
+                "story_role_counts": {"ingredient": 2, "finished_product": 7},
+            },
+        )
+
+        assert voice == "female_young"
+        assert "素材" in reason
+
+    def test_unspecified_pipeline_and_batch_voice_defaults_remain_auto(self):
+        import inspect
+        from batch import create_task_args
+        from one_click_create import run_generation_pipeline
+
+        assert inspect.signature(run_generation_pipeline).parameters["voice"].default == "auto"
+        assert create_task_args({"product_name": "茶咖"}, {})["voice"] == "auto"
+
     def test_bgm_metadata_ranking_prefers_natural_acoustic_over_playful_track(self):
         from bgm_client import rank_tracks_for_contract
 
@@ -4963,6 +4988,32 @@ class TestMaterialDrivenPostProduction:
         })
 
         assert ranked[0]["id"] == "natural"
+
+    def test_material_music_contract_selects_balanced_audio_not_loudest_chorus(self):
+        from video_merger import select_bgm_segment
+
+        loudness = [
+            -20.0, -19.8, -20.1, -19.9, -20.0,
+            -18.2, -18.0, -18.1, -18.3, -18.0,
+            -13.0, -12.8, -13.2, -12.9, -13.1,
+        ]
+        with patch("video_merger._analyze_loudness", return_value=loudness), \
+             patch("video_merger._detect_beats", return_value=[]):
+            selected = select_bgm_segment(
+                bgm_duration=15.0,
+                video_duration=5.0,
+                bgm_path=Path("/tmp/music.mp3"),
+                music_contract={
+                    "source": "selected_local_assets",
+                    "energy": "medium",
+                    "semantic_tone": "natural_origin",
+                    "intro_type": "immediate",
+                },
+            )
+
+        assert selected["strategy"] == "contract_energy_window"
+        assert selected["start_time"] < 10.0
+        assert selected["average_loudness_db"] < -15.0
 
     def test_actual_timeline_preserves_zero_and_variable_transition_durations(self):
         from douyin_adapter import compute_segment_timeline
@@ -7686,6 +7737,95 @@ class TestGlobalMaterialDrivenScriptArchitecture:
 
 class TestLocalMultiClipPlanning:
     """One semantic cue may retrieve multiple evidence-backed edit clips."""
+
+    def test_planner_restores_source_tail_reserved_only_for_frame_analysis(self, tmp_path):
+        import copy
+        from local_asset_pipeline import plan_and_materialize_local_clips
+
+        source = tmp_path / "product.mp4"
+        asset_index = {
+            "asset_folder": str(tmp_path),
+            "sources": [{"path": str(source), "duration": 4.0}],
+            "windows": [{
+                "window_id": "product-tail-inset",
+                "source_video": source.name,
+                "source_path": str(source),
+                "start": 0.0,
+                "end": 3.95,
+                "duration": 3.95,
+                "analysis": {
+                    "usable_for_ad": True,
+                    "confidence": 1.0,
+                    "product_story_role": "finished_product",
+                    "product_visibility": 5,
+                    "product_relevance_prior": "high",
+                    "visible_subjects": ["product"],
+                    "visible_objects": ["瓶装茶咖"],
+                    "visible_text": ["茶咖"],
+                    "narrative_roles": ["product_showcase", "cta"],
+                    "evidence": "清晰展示瓶装茶咖成品",
+                },
+                "motion": {"motion_class": "semi_dynamic"},
+                "frame_quality": {"passed": True},
+            }],
+            "coverage": {},
+        }
+        original_index = copy.deepcopy(asset_index)
+
+        result = plan_and_materialize_local_clips(
+            asset_index=asset_index,
+            ad_script={"segments": [{
+                "segment": 0,
+                "narrative": "cta",
+                "visual_story_role": "finished_product",
+                "visual_query": ["瓶装茶咖"],
+                "voiceover": "喜欢就试试这瓶茶咖",
+                "subtitle": "喜欢就试试这瓶茶咖",
+                "claims": [],
+            }]},
+            rhythm_template={"segments": [{"index": 0, "duration": 4.0}]},
+            clips_dir=tmp_path / "clips",
+            final_dir=tmp_path / "final",
+            output_name="source-tail-capacity",
+            product_info={"name": "茶咖", "type": "食品"},
+            plan_only=True,
+            record_failure=False,
+        )
+
+        assert result["selected_segments"][0]["source_end"] == pytest.approx(4.0)
+        assert sum(item["target_duration"] for item in result["selected_segments"]) == pytest.approx(4.0)
+        assert asset_index == original_index
+
+    def test_visual_story_role_is_the_semantic_boundary_for_every_fill_clip(self):
+        from local_asset_pipeline import _desired_product_story_role, _story_role_supported
+
+        segment = {
+            "product_story_role": "",
+            "desired_product_story_role": "",
+            "visual_story_role": "finished_product",
+            "visual_query": ["拿起瓶装饮品", "指向茶咖标签"],
+        }
+
+        assert _desired_product_story_role(segment) == "finished_product"
+        assert _story_role_supported(segment, {
+            "product_story_role": "finished_product",
+            "product_relevance_prior": "high",
+        }) is True
+        assert _story_role_supported(segment, {
+            "product_story_role": "origin",
+            "product_relevance_prior": "high",
+        }) is False
+
+        source_segment = {**segment, "visual_story_role": "ingredient"}
+        assert _story_role_supported(source_segment, {
+            "product_story_role": "finished_product",
+            "product_relevance_prior": "high",
+            "product_visibility": 5,
+        }) is True
+        assert _story_role_supported(source_segment, {
+            "product_story_role": "origin",
+            "product_relevance_prior": "high",
+        }) is False
 
     def test_planning_is_idempotent_and_never_rewrites_script_constraints(self, tmp_path):
         import copy

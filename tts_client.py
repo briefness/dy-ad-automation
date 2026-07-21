@@ -140,7 +140,10 @@ def recommend_voice_for_narration(
     creative_profile: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
     """Select a stable commercial voice from product type and final spoken copy."""
-    material_driven = str((creative_profile or {}).get("source") or "") == "selected_local_assets"
+    material_driven = str((creative_profile or {}).get("source") or "") in {
+        "local_asset_analysis",
+        "selected_local_assets",
+    }
     if requested_voice in VOICE_PRESETS and not material_driven:
         return requested_voice, "用户显式指定音色"
     category = str(product_info.get("type") or product_info.get("category") or "default")

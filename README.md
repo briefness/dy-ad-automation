@@ -424,7 +424,7 @@ python one_click_create.py --ab-versions 2 --product-image product.jpg --style k
 |------|--------|------|
 | `--voiceover` | - | 启用 AI 口播配音（豆包 TTS 优先，降级 macOS say） |
 | `--voiceover-style` | `standard` | 口播风格：standard / emotional / energetic / professional / storytelling |
-| `--voice` | `energetic_female` | 音色：female_young / female_warm / male_pro / male_magnetic / energetic_female |
+| `--voice` | `auto` | 音色：auto / female_young / female_warm / male_pro / male_magnetic / energetic_female |
 | `--list-voices` | - | 列出所有音色预设 |
 
 ### 生成质量控制

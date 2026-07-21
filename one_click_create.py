@@ -4948,7 +4948,7 @@ def save_template(product_info: dict, args: argparse.Namespace, output_path: Pat
             "hook_type": getattr(args, "hook", DEFAULT_HOOK_TYPE),
             "script_style": getattr(args, "script_style", DEFAULT_SCRIPT_STYLE),
             "use_voiceover": getattr(args, "voiceover", False),
-            "voice": getattr(args, "voice", DEFAULT_VOICE),
+            "voice": getattr(args, "voice", "auto"),
             "rhythm_style": getattr(args, "rhythm_style", "moderate"),
             "target_duration": getattr(args, "target_duration", None),
             "preview": getattr(args, "preview", False),
@@ -5207,7 +5207,7 @@ def run_generation_pipeline(
     hook_type: str = DEFAULT_HOOK_TYPE,
     use_voiceover: bool = False,
     voiceover_style: str = DEFAULT_VOICEOVER_STYLE,
-    voice: str = DEFAULT_VOICE,
+    voice: str = "auto",
     script_style: str = DEFAULT_SCRIPT_STYLE,
     strict_mode: bool = True,
     force: bool = False,
@@ -7413,8 +7413,19 @@ def run_generation_pipeline(
             final_dir / f"{output_name}_transition_decision_report.json",
         )
         if postproduction_contract:
-            from video_merger import _detect_beats as _bgm_detect_beats, _estimate_bpm as _bgm_estimate_bpm
+            from video_merger import (
+                _detect_beats as _bgm_detect_beats,
+                _estimate_bpm as _bgm_estimate_bpm,
+                _get_audio_duration as _bgm_audio_duration,
+                select_bgm_segment,
+            )
             _selected_bgm_bpm = _bgm_estimate_bpm(_bgm_detect_beats(Path(bgm_file)))
+            _selected_bgm_segment = select_bgm_segment(
+                _bgm_audio_duration(Path(bgm_file)),
+                total_video_duration,
+                Path(bgm_file),
+                music_contract=music_contract if local_asset_mode else None,
+            )
             postproduction_contract["transition"]["decisions"] = scene_transitions
             postproduction_contract["timeline"] = {
                 "basis": "ffprobe_clip_durations_and_rendered_transitions",
@@ -7428,6 +7439,7 @@ def run_generation_pipeline(
                 "detected_bpm": _selected_bgm_bpm,
                 "pace": pace,
                 "target_duration": total_video_duration,
+                "segment_selection": _selected_bgm_segment,
             })
 
         print()
@@ -7452,6 +7464,12 @@ def run_generation_pipeline(
             bgm=bgm_file,
             envelope_key_times=_bgm_key_times,
             strict_transitions=True,
+            music_contract=music_contract if local_asset_mode else None,
+            bgm_segment=(
+                _selected_bgm_segment
+                if "_selected_bgm_segment" in locals()
+                else None
+            ),
         )
         from intelligent_transition import validate_merged_transition_boundaries
 
@@ -8581,7 +8599,7 @@ def run_one_click_create(
     hook_type = getattr(args, "hook", DEFAULT_HOOK_TYPE)
     use_voiceover = getattr(args, "voiceover", False)
     voiceover_style = getattr(args, "voiceover_style", DEFAULT_VOICEOVER_STYLE)
-    voice = getattr(args, "voice", DEFAULT_VOICE)
+    voice = getattr(args, "voice", "auto")
     script_style = getattr(args, "script_style", DEFAULT_SCRIPT_STYLE)
 
     if voiceover_style in ("auto", "standard"):

@@ -807,12 +807,15 @@ def _unsupported_action_claims(segment: Dict[str, Any], analysis: Dict[str, Any]
 
 def _desired_product_story_role(segment: Dict[str, Any]) -> str:
     """Return the semantic role requested by copy, never a prior match result."""
-    role_field = (
-        "desired_product_story_role"
-        if "desired_product_story_role" in segment
-        else "product_story_role"
-    )
-    return str(segment.get(role_field) or "").strip().lower()
+    desired = str(segment.get("desired_product_story_role") or "").strip().lower()
+    if desired:
+        return desired
+    visual = str(segment.get("visual_story_role") or "").strip().lower()
+    if visual:
+        return visual
+    if "desired_product_story_role" in segment:
+        return ""
+    return str(segment.get("product_story_role") or "").strip().lower()
 
 
 def _story_role_supported(segment: Dict[str, Any], analysis: Dict[str, Any]) -> bool:
@@ -824,9 +827,16 @@ def _story_role_supported(segment: Dict[str, Any], analysis: Dict[str, Any]) -> 
         return False
     if required == actual:
         return True
+    product_roles = {"finished_product", "usage", "result"}
+    if required in product_roles and actual in product_roles:
+        return str(analysis.get("product_relevance_prior") or "").lower() == "high"
     if required in {"ingredient", "origin", "production"}:
-        return False
-    return str(analysis.get("product_relevance_prior") or "").lower() == "high"
+        return (
+            actual == "finished_product"
+            and str(analysis.get("product_relevance_prior") or "").lower() == "high"
+            and int(analysis.get("product_visibility") or 0) >= 3
+        )
+    return False
 
 
 def _apply_product_relationships_to_windows(
@@ -4025,6 +4035,40 @@ def _materialize_clip(source: Path, start: float, end: float, output: Path) -> P
     return output
 
 
+def _planning_windows_with_source_capacity(asset_index: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Restore the tiny source tail reserved by frame analysis for physical editing."""
+    windows = copy.deepcopy(asset_index.get("windows") or [])
+    source_durations = {
+        str(source.get("path") or ""): float(source.get("duration") or 0.0)
+        for source in asset_index.get("sources") or []
+        if source.get("path") and float(source.get("duration") or 0.0) > 0.0
+    }
+    last_window_end: Dict[str, float] = {}
+    for window in windows:
+        source_path = str(window.get("source_path") or "")
+        if source_path in source_durations:
+            last_window_end[source_path] = max(
+                last_window_end.get(source_path, 0.0),
+                float(window.get("end") or 0.0),
+            )
+
+    for window in windows:
+        source_path = str(window.get("source_path") or "")
+        source_duration = source_durations.get(source_path)
+        final_analysis_end = last_window_end.get(source_path)
+        window_end = float(window.get("end") or 0.0)
+        if source_duration is None or final_analysis_end is None:
+            continue
+        tail_inset = source_duration - final_analysis_end
+        if abs(window_end - final_analysis_end) <= 0.001 and 0.0 < tail_inset <= 0.1:
+            window["end"] = source_duration
+            window["duration"] = round(
+                source_duration - float(window.get("start") or 0.0),
+                3,
+            )
+    return windows
+
+
 def plan_and_materialize_local_clips(
     asset_index: Dict[str, Any],
     ad_script: Dict[str, Any],
@@ -4040,15 +4084,15 @@ def plan_and_materialize_local_clips(
     final_dir.mkdir(parents=True, exist_ok=True)
 
     segments = copy.deepcopy(ad_script.get("segments") or [])
-    windows = asset_index.get("windows") or []
+    planning_asset_index = copy.deepcopy(asset_index)
+    _apply_product_relationships_to_windows(planning_asset_index, product_info or {})
+    windows = _planning_windows_with_source_capacity(planning_asset_index)
     selected: List[Dict[str, Any]] = []
     selected_segments: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
 
     if not segments:
         raise LocalAssetError("素材约束脚本没有可用段落")
-
-    _apply_product_relationships_to_windows(asset_index, product_info or {})
 
     def compatible_capacity(segment: Dict[str, Any]) -> float:
         capacity = 0.0
