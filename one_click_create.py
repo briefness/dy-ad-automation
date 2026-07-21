@@ -1681,6 +1681,101 @@ def apply_low_cost_generation_policy(
     return changes
 
 
+class GenerationSourcePlan(TypedDict):
+    """CLI preflight contract for one mutually exclusive visual source workflow."""
+    source: str
+    label: str
+    policy_changes: List[str]
+    kling_cost_info: Optional[Dict[str, Any]]
+    estimated_output_size: Optional[Dict[str, Any]]
+
+
+def _prepare_generation_source_plan(
+    args: argparse.Namespace,
+    product_info: Dict[str, Any],
+    *,
+    ab_versions: int,
+) -> GenerationSourcePlan:
+    """Build either a local-edit plan or a Kling-generation plan, never a hybrid."""
+    if getattr(args, "local_assets", None):
+        return {
+            "source": "local_assets",
+            "label": "本地视频混剪",
+            "policy_changes": [],
+            "kling_cost_info": None,
+            "estimated_output_size": None,
+        }
+
+    preview = bool(getattr(args, "preview", False))
+    estimated_clips = 1 if preview else 5
+    resolved_characters = build_cast_plan(product_info).get("core_characters", [])
+    policy_changes = apply_low_cost_generation_policy(
+        args,
+        num_clips=estimated_clips,
+        num_characters=len(resolved_characters) or 1,
+        ab_versions=ab_versions,
+    )
+    estimated_mode = "std" if preview else args.mode
+    cost_info = estimate_cost(
+        mode=estimated_mode,
+        duration_per_clip=args.duration,
+        num_clips=estimated_clips,
+        num_characters=len(resolved_characters) or 1,
+        ab_versions=ab_versions,
+        best_of=getattr(args, "best_of", 1),
+        image_first_segments=_estimate_image_first_segment_count(
+            estimated_clips,
+            getattr(args, "image_first_mode", "standard"),
+            enabled=getattr(args, "image_first", True)
+            and getattr(args, "preflight_keyframe", True)
+            and getattr(args, "strict", True)
+            and not preview,
+        ),
+        image_first_variants=max(1, int(getattr(args, "image_first_variants", 2) or 1)),
+    )
+    from douyin_adapter import DOUYIN_CONFIG
+    estimated_size = estimate_file_size(
+        duration=getattr(args, "target_duration", None) or 25,
+        bitrate=DOUYIN_CONFIG["bitrate"],
+        audio_bitrate=DOUYIN_CONFIG.get("audio_bitrate", "160k"),
+    )
+    return {
+        "source": "kling_generation",
+        "label": "可灵 AI 视频生成",
+        "policy_changes": policy_changes,
+        "kling_cost_info": cost_info,
+        "estimated_output_size": estimated_size,
+    }
+
+
+def _print_generation_source_plan(
+    plan: GenerationSourcePlan,
+    args: argparse.Namespace,
+) -> None:
+    if plan["source"] == "local_assets":
+        print("🎞️ 本地视频混剪计划")
+        print(f"   素材目录：{Path(args.local_assets).expanduser()}")
+        print("   处理链路：素材理解 → 带货脚本与单条口播 → 智能选片 → 后期合成")
+        if getattr(args, "target_duration", None):
+            print(f"   时长偏好：{args.target_duration}s（最终时长由素材自然叙事决定）")
+        else:
+            print("   最终时长：由素材分析后的自然叙事决定")
+        print("   可灵图片/视频生成：不调用")
+        return
+
+    if plan["policy_changes"]:
+        print("💸 已应用低成本策略：")
+        for change in plan["policy_changes"]:
+            print(f"   - {change}")
+    if getattr(args, "preview", False):
+        print("⚡ 预览模式：使用 std 模式，仅生成 1 段快速试错")
+    print_cost_estimate(plan["kling_cost_info"] or {})
+    estimated_size = plan["estimated_output_size"] or {}
+    print(f"📦 预估文件大小：约 {estimated_size.get('total_size_mb', 0):.1f} MB")
+    if estimated_size.get("warning"):
+        print(f"   ⚠️  {estimated_size['warning']}")
+
+
 def _run_pre_generation_smart_decision(
     quality_gate_result: Any,
     product_info: dict,
@@ -5301,8 +5396,8 @@ def run_generation_pipeline(
     local_one_take_master: Optional[Path] = None
     local_edit_semantic_indices: List[int] = []
     if local_asset_mode:
-        print(f"🎞️ 本地素材模式：{Path(local_assets).expanduser()}")
-        print("   跳过可灵视频生成，先分析素材再生成素材约束脚本")
+        print(f"🎞️ 本地视频混剪：{Path(local_assets).expanduser()}")
+        print("   素材理解驱动脚本、口播、选片与后期配置")
     reference_profile = None
     if reference_video:
         from local_asset_pipeline import analyze_reference_ad, bind_reference_profile_to_product
@@ -5378,9 +5473,7 @@ def run_generation_pipeline(
     product_info["characters"] = core_characters
     product_info["supporting_characters"] = cast_plan.get("supporting_characters", [])
     product_info["ambient_entities"] = cast_plan.get("ambient_entities", [])
-    if local_asset_mode:
-        print("🎞️ 本地素材模式：跳过人物角色计划与角色一致性链路")
-    else:
+    if not local_asset_mode:
         print(
             f"🎭 角色计划：核心 {len(core_characters)}，"
             f"配角 {len(product_info['supporting_characters'])}，"
@@ -5395,12 +5488,13 @@ def run_generation_pipeline(
 
     # ── 构建角色圣经和商品圣经（标准化资产描述）──
     character_bibles = build_character_bibles(product_info, core_characters)
-    product_bible = build_product_bible(product_info)
+    product_bible = build_product_bible(product_info) if not local_asset_mode else None
     if not local_asset_mode:
         print(f"📖 角色圣经：{len(character_bibles)} 个角色")
         for bible in character_bibles:
             print(f"    [{bible['id']}] {bible['name']}: {character_bible_to_prompt(bible)[:60]}...")
-    print(f"📦 商品圣经：{product_bible_to_prompt(product_bible)[:60]}...")
+    if product_bible:
+        print(f"📦 商品圣经：{product_bible_to_prompt(product_bible)[:60]}...")
 
     # 生成所有角色多角度定妆照（性价比策略：多花几毛钱买一致性）
     # 每个核心角色：正面 + 全身（2张）
@@ -5410,7 +5504,7 @@ def run_generation_pipeline(
     # 之前的 bug：用户没传 characters 时，characters=None，导致只生成 1 个默认角色
     _gen_chars = core_characters if core_characters else []
     if local_asset_mode:
-        print("🎭 本地素材模式：跳过角色定妆照生成")
+        pass
     elif _gen_chars and len(_gen_chars) > 0:
         for idx, char in enumerate(_gen_chars):
             char_name = char.get("name", f"Character {chr(65 + idx)}")
@@ -5457,8 +5551,9 @@ def run_generation_pipeline(
         except Exception as e:
             raise RuntimeError(f"默认角色参考图生成失败：{e}") from e
 
-    total_char_images = sum(len(c.get("images", [c["image_path"]])) for c in char_refs)
-    print(f"\n✅ 共加载 {len(char_refs)} 个角色，{total_char_images} 张参考图")
+    if not local_asset_mode:
+        total_char_images = sum(len(c.get("images", [c["image_path"]])) for c in char_refs)
+        print(f"\n✅ 共加载 {len(char_refs)} 个角色，{total_char_images} 张参考图")
 
     # 读取商品参考图（如果提供）
     product_img_b64 = None
@@ -5783,7 +5878,7 @@ def run_generation_pipeline(
     # ── 故事板预可视化验证：生成分镜结构并校验质量 ──
     storyboard = None
     if local_asset_mode:
-        print("🎞️ 本地素材模式：跳过 AI 生成故事板与人物角色推断")
+        pass
     else:
         try:
             from storyboard_generator import StoryboardGenerator
@@ -5884,7 +5979,7 @@ def run_generation_pipeline(
             for seg in ad_script.get("segments", [])
         ]
         storyboard = None
-        print(f"📦 本地素材约束 Prompt 已生成（{len(clip_prompts)} 段）")
+        print(f"🎯 本地选片查询已生成（{len(clip_prompts)} 段）")
 
     if style != DEFAULT_CINEMATIC_STYLE:
         style_name = CINEMATIC_STYLES.get(style, {}).get("name", style)
@@ -5938,9 +6033,7 @@ def run_generation_pipeline(
         print(f"   含字幕/口播/BGM，快速预览整体效果")
         print(f"   确认效果 OK 后，去掉 --preview 重新生成完整 5 段 pro 版本")
 
-    if local_asset_mode:
-        print("🧪 本地素材模式：跳过可灵生成前置合约校验")
-    else:
+    if not local_asset_mode:
         _preflight_generation_contract(
             product_info=product_info,
             ad_script=ad_script,
@@ -5950,21 +6043,22 @@ def run_generation_pipeline(
             strict_mode=strict_mode and not preview,
         )
 
-    # ── 成本预估 ──
-    _cost_info = estimate_cost(
-        mode=mode,
-        duration_per_clip=duration,
-        num_clips=len(clip_prompts),
-        num_characters=0 if local_asset_mode else len(char_refs) if char_refs else 1,
-        best_of=best_of,
-        image_first_segments=_estimate_image_first_segment_count(
-            len(clip_prompts),
-            image_first_mode,
-            enabled=image_first and preflight_keyframe and strict_mode and not preview,
-        ),
-        image_first_variants=max(1, int(image_first_variants or 1)),
-    )
-    print_cost_estimate(_cost_info)
+    _cost_info = None
+    if not local_asset_mode:
+        _cost_info = estimate_cost(
+            mode=mode,
+            duration_per_clip=duration,
+            num_clips=len(clip_prompts),
+            num_characters=len(char_refs) if char_refs else 1,
+            best_of=best_of,
+            image_first_segments=_estimate_image_first_segment_count(
+                len(clip_prompts),
+                image_first_mode,
+                enabled=image_first and preflight_keyframe and strict_mode and not preview,
+            ),
+            image_first_variants=max(1, int(image_first_variants or 1)),
+        )
+        print_cost_estimate(_cost_info)
 
     # ── 质量前置控制（Quality Gate）──
     # 在生成视频前进行全面预检，消除质量隐患，避免成本浪费
@@ -5981,7 +6075,7 @@ def run_generation_pipeline(
             reference_sort_notes=[],
             passed=True,
         )
-        print("🔍 本地素材模式：跳过 AI 生成质量门，改用素材匹配置信度门槛")
+        print("🔍 本地选片按素材语义证据与匹配置信度执行")
     else:
         quality_gate_result = run_quality_gate(
             ad_script=ad_script,
@@ -6119,7 +6213,7 @@ def run_generation_pipeline(
             raise RuntimeError("图片先行验证未通过，已阻止进入高成本视频生成")
         approved_keyframes = dict(image_first_result.best_keyframes)
     elif local_asset_mode:
-        print("🖼️ 本地素材模式：跳过图片先行与首帧预检")
+        pass
     elif preview:
         print("⚡ 预览模式：跳过图片先行验证，直接进入视频生成")
 
@@ -6130,7 +6224,7 @@ def run_generation_pipeline(
             quality_gate_result,
             product_info,
             style=style,
-            budget=_cost_info.get("estimated_cost", _get_cost_budget_limit()),
+            budget=(_cost_info or {}).get("estimated_cost", _get_cost_budget_limit()),
             image_first_result=image_first_result,
             preview=preview,
         )
@@ -7113,9 +7207,7 @@ def run_generation_pipeline(
                     except Exception:
                         pass
 
-            if local_asset_mode:
-                print("   🎞️ 本地素材模式：跳过人物肤色一致性检测")
-            elif not _consistency_warnings:
+            if not local_asset_mode and not _consistency_warnings:
                 print("   ✅ P0-B 跨片段一致性校验通过")
         except Exception as _cc_err:
             _consistency_warnings = []
@@ -8622,14 +8714,17 @@ def run_one_click_create(
     product_info["supporting_characters"] = resolved_cast_plan.get("supporting_characters", [])
     product_info["ambient_entities"] = resolved_cast_plan.get("ambient_entities", [])
 
+    local_asset_mode = bool(getattr(args, "local_assets", None))
     # 目标总时长适配：通过节奏模板动态调整每段时长
     target_duration = getattr(args, "target_duration", None)
     rhythm_style = getattr(args, "rhythm_style", "moderate")
-    # 传给可灵 API 的基础生成时长（统一生成 5s，后期裁切到节奏目标时长）
     actual_duration = args.duration
     if target_duration:
         print(f"⏱️  目标总时长：{target_duration}s，节奏风格：{rhythm_style}")
-        print(f"   生成策略：可灵生成 {actual_duration}s 片段，后期裁切适配节奏模板")
+        if local_asset_mode:
+            print("   混剪策略：目标时长作为偏好，最终时间轴服从素材理解与自然叙事")
+        else:
+            print(f"   生成策略：可灵生成 {actual_duration}s 片段，后期裁切适配节奏模板")
 
     try:
         result = run_generation_pipeline(
@@ -8854,7 +8949,7 @@ args:
 def main():
     """主函数：一键成片"""
     args = parse_args()
-    low_cost_policy_applied = False
+    source_plan: Optional[GenerationSourcePlan] = None
 
     # --no-llm：禁用 LLM，强制走模板模式
     if args.no_llm:
@@ -8966,7 +9061,7 @@ def main():
             sys.exit(1)
 
         print("=" * 60)
-        print("🎬 可灵 AI 抖音广告视频 - 一键成片（模板模式）")
+        print("🎬 抖音广告视频 - 一键成片（模板模式）")
         print("=" * 60)
         print(f"📄 加载模板：{template_path}")
         print()
@@ -9045,23 +9140,33 @@ def main():
         for k, v in product_info.items():
             print(f"  {k}: {v}")
         print()
-        print(f"🎥 电影风格：{args.style}")
-        print(f"⏱️ 片段时长：{args.duration}s")
-        print(f"🎞️ 生成模式：{args.mode}")
-        if args.seed is not None:
-            print(f"🌱 随机种子：{args.seed}")
-        if args.product_image:
-            print(f"🖼️ 商品参考图：{args.product_image}")
         if getattr(args, "local_assets", None):
-            print(f"🎞️ 本地素材：{args.local_assets}")
+            print("🎞️ 生成来源：本地视频混剪")
+            print(f"📁 本地素材：{args.local_assets}")
+        else:
+            print("🎬 生成来源：可灵 AI 视频生成")
+            print(f"🎥 电影风格：{args.style}")
+            print(f"⏱️ 片段时长：{args.duration}s")
+            print(f"🎞️ 生成模式：{args.mode}")
+            if args.seed is not None:
+                print(f"🌱 随机种子：{args.seed}")
+            if args.product_image:
+                print(f"🖼️ 商品参考图：{args.product_image}")
         if getattr(args, "reference_video", None):
             print(f"🎯 参考广告：{args.reference_video}")
+        print()
+        source_plan = _prepare_generation_source_plan(
+            args,
+            product_info,
+            ab_versions=max(1, min(getattr(args, "ab_versions", 1), 3)),
+        )
+        _print_generation_source_plan(source_plan, args)
         print()
 
     else:
         # 交互式输入产品信息
         print("=" * 60)
-        print("🎬 可灵 AI 抖音广告视频 - 一键成片")
+        print("🎬 抖音广告视频 - 一键成片")
         print("=" * 60)
         print()
 
@@ -9081,7 +9186,10 @@ def main():
                     sys.exit(1)
                 args.local_assets = _local_path
                 args.allow_no_product_image = True
-                print(f"🎞️ 本地素材模式：{args.local_assets}")
+                print(f"🎞️ 已选择：本地视频混剪（{args.local_assets}）")
+                print()
+            else:
+                print("🎬 已选择：可灵 AI 视频生成")
                 print()
 
         # 检查环境
@@ -9140,11 +9248,12 @@ def main():
                     product_info.pop("characters", None)
                     product_info.pop("supporting_characters", None)
                     product_info.pop("ambient_entities", None)
-                    cast_plan = build_cast_plan(product_info)
-                    product_info["cast_plan"] = cast_plan
-                    product_info["characters"] = cast_plan.get("core_characters", [])
-                    product_info["supporting_characters"] = cast_plan.get("supporting_characters", [])
-                    product_info["ambient_entities"] = cast_plan.get("ambient_entities", [])
+                    if not getattr(args, "local_assets", None):
+                        cast_plan = build_cast_plan(product_info)
+                        product_info["cast_plan"] = cast_plan
+                        product_info["characters"] = cast_plan.get("core_characters", [])
+                        product_info["supporting_characters"] = cast_plan.get("supporting_characters", [])
+                        product_info["ambient_entities"] = cast_plan.get("ambient_entities", [])
                     # 将 LLM 推荐的 args 参数回写到 args 对象
                     _llm_args = _expanded.get("args", {})
                     _VALID_STYLES = {
@@ -9181,13 +9290,13 @@ def main():
                     if _llm_args.get("voice") in _VALID_VOICES:
                         args.voice = _llm_args["voice"]
                     print("✅ AI 参数配置完成")
-                    # 主题模式下询问商品参考图（可选）
-                    print()
-                    _img_input = input("🖼️  商品参考图路径或 URL（直接回车跳过）：").strip()
-                    if _img_input:
-                        args.product_image = _img_input
-                    else:
-                        args.allow_no_product_image = True
+                    if not getattr(args, "local_assets", None):
+                        print()
+                        _img_input = input("🖼️  商品参考图路径或 URL（直接回车跳过）：").strip()
+                        if _img_input:
+                            args.product_image = _img_input
+                        else:
+                            args.allow_no_product_image = True
 
         if _use_manual:
             print("请输入产品信息（直接回车使用默认值）：")
@@ -9201,9 +9310,6 @@ def main():
             verified_claims = input("已核验卖点（可选，多个用逗号分隔，不确定请留空）：").strip()
             audience = input_with_default("目标人群", "18-35岁")
             style = input_with_default("广告风格", "现代简约")
-            character_age = input_with_default("角色年龄", "25")
-            character_gender = input_with_default("角色性别（女/男）", "女")
-            outfit = input_with_default("服装描述", "casual everyday clothes")
             product_info = {
                 "name": product_name,
                 "type": product_type,
@@ -9214,15 +9320,18 @@ def main():
                 "verified_claims": [value.strip() for value in re.split(r"[,，]", verified_claims) if value.strip()],
                 "audience": audience,
                 "style": style,
-                "age": character_age,
-                "gender": character_gender,
-                "outfit": outfit,
             }
-            cast_plan = build_cast_plan(product_info)
-            product_info["cast_plan"] = cast_plan
-            product_info["characters"] = cast_plan.get("core_characters", [])
-            product_info["supporting_characters"] = cast_plan.get("supporting_characters", [])
-            product_info["ambient_entities"] = cast_plan.get("ambient_entities", [])
+            if not getattr(args, "local_assets", None):
+                product_info.update({
+                    "age": input_with_default("角色年龄", "25"),
+                    "gender": input_with_default("角色性别（女/男）", "女"),
+                    "outfit": input_with_default("服装描述", "casual everyday clothes"),
+                })
+                cast_plan = build_cast_plan(product_info)
+                product_info["cast_plan"] = cast_plan
+                product_info["characters"] = cast_plan.get("core_characters", [])
+                product_info["supporting_characters"] = cast_plan.get("supporting_characters", [])
+                product_info["ambient_entities"] = cast_plan.get("ambient_entities", [])
 
             print()
             print("=" * 60)
@@ -9252,88 +9361,28 @@ def main():
                     print(f"  {k}: {v}")
             print()
 
-        # 成本估算提示
         ab_count = max(1, min(getattr(args, "ab_versions", 1), 3))
-        _preview_mode = getattr(args, "preview", False)
-        _est_mode = "std" if _preview_mode else args.mode
-        _est_clips = 1 if _preview_mode else 5
-        _resolved_characters = [] if getattr(args, "local_assets", None) else build_cast_plan(product_info).get("core_characters", [])
-        _est_num_chars = len(_resolved_characters) if getattr(args, "local_assets", None) else len(_resolved_characters) or 1
-        _policy_changes = apply_low_cost_generation_policy(
+        source_plan = _prepare_generation_source_plan(
             args,
-            num_clips=_est_clips,
-            num_characters=_est_num_chars,
+            product_info,
             ab_versions=ab_count,
         )
-        low_cost_policy_applied = True
-        if _policy_changes:
-            print("💸 已应用低成本策略：")
-            for change in _policy_changes:
-                print(f"   - {change}")
-            _est_mode = "std" if _preview_mode else args.mode
-        cost_info = estimate_cost(
-            mode=_est_mode,
-            duration_per_clip=args.duration,
-            num_clips=_est_clips,
-            num_characters=_est_num_chars,
-            ab_versions=ab_count,
-            best_of=getattr(args, "best_of", 1),
-            image_first_segments=_estimate_image_first_segment_count(
-                _est_clips,
-                getattr(args, "image_first_mode", "standard"),
-                enabled=getattr(args, "image_first", True)
-                and getattr(args, "preflight_keyframe", True)
-                and getattr(args, "strict", True)
-                and not _preview_mode,
-            ),
-            image_first_variants=max(1, int(getattr(args, "image_first_variants", 2) or 1)),
-        )
-        if _preview_mode:
-            print("⚡ 预览模式：使用 std 模式，仅生成 1 段快速试错")
-        print_cost_estimate(cost_info)
-
-        # 文件大小预估
-        from douyin_adapter import DOUYIN_CONFIG
-        est_size = estimate_file_size(
-            duration=getattr(args, "target_duration", None) or 25,
-            bitrate=DOUYIN_CONFIG["bitrate"],
-            audio_bitrate=DOUYIN_CONFIG.get("audio_bitrate", "160k"),
-        )
-        print(f"📦 预估文件大小：约 {est_size['total_size_mb']:.1f} MB")
-        if est_size["warning"]:
-            print(f"   ⚠️  {est_size['warning']}")
+        _print_generation_source_plan(source_plan, args)
         print()
 
-        confirm = input("确认开始生成？(y/n) [y]：").strip().lower()
+        confirm_label = "混剪" if source_plan["source"] == "local_assets" else "生成"
+        confirm = input(f"确认开始{confirm_label}？(y/n) [y]：").strip().lower()
         if confirm and confirm != "y":
             print("已取消")
             sys.exit(0)
 
-        # ── 公共参数校验（交互模式 + 模板模式共用）──────────────────────
-        if not low_cost_policy_applied:
-            ab_count = max(1, min(getattr(args, "ab_versions", 1), 3))
-            _preview_mode = getattr(args, "preview", False)
-            _est_clips = 1 if _preview_mode else 5
-            _resolved_characters = [] if getattr(args, "local_assets", None) else build_cast_plan(product_info).get("core_characters", [])
-            _est_num_chars = len(_resolved_characters) if getattr(args, "local_assets", None) else len(_resolved_characters) or 1
-        _policy_changes = apply_low_cost_generation_policy(
-            args,
-            num_clips=_est_clips,
-            num_characters=_est_num_chars,
-            ab_versions=ab_count,
-        )
-        if _policy_changes:
-            print("💸 已应用低成本策略：")
-            for change in _policy_changes:
-                print(f"   - {change}")
-
     if not product_info.get("name", "").strip():
         print("❌ 错误：产品名称不能为空")
         sys.exit(1)
-    if not (3 <= args.duration <= 10):
+    if not getattr(args, "local_assets", None) and not (3 <= args.duration <= 10):
         print(f"❌ 错误：--duration 必须在 3-10 秒之间（当前：{args.duration}）")
         sys.exit(1)
-    if getattr(args, "best_of", 1) < 1:
+    if not getattr(args, "local_assets", None) and getattr(args, "best_of", 1) < 1:
         print(f"❌ 错误：--best-of 必须 ≥ 1（当前：{args.best_of}）")
         sys.exit(1)
     # ───────────────────────────────────────────────────────────────

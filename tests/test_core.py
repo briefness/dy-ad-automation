@@ -230,6 +230,8 @@ from one_click_create import (
     _preflight_keyframe_check,
     _estimate_image_first_segment_count,
     apply_low_cost_generation_policy,
+    _prepare_generation_source_plan,
+    _print_generation_source_plan,
     _record_production_workflow_completion,
     build_character_bibles,
     build_product_bible,
@@ -593,6 +595,53 @@ class TestEstimateCost:
         assert _estimate_image_first_segment_count(5, "standard") == 2
         assert _estimate_image_first_segment_count(5, "full") == 5
         assert _estimate_image_first_segment_count(5, "standard", enabled=False) == 0
+
+    def test_local_source_plan_has_no_kling_cost_or_parameter_downgrade(self, tmp_path):
+        import argparse
+
+        args = argparse.Namespace(
+            local_assets=str(tmp_path),
+            mode="4k",
+            duration=10,
+            best_of=3,
+            preview=False,
+            target_duration=15,
+        )
+        with patch("one_click_create.estimate_cost", side_effect=AssertionError("local must not estimate Kling cost")), \
+             patch("one_click_create.apply_low_cost_generation_policy", side_effect=AssertionError("local must not downgrade Kling params")):
+            plan = _prepare_generation_source_plan(
+                args,
+                {"name": "茶咖", "type": "食品"},
+                ab_versions=1,
+            )
+
+        assert plan == {
+            "source": "local_assets",
+            "label": "本地视频混剪",
+            "policy_changes": [],
+            "kling_cost_info": None,
+            "estimated_output_size": None,
+        }
+        assert (args.mode, args.duration, args.best_of) == ("4k", 10, 3)
+
+    def test_local_source_plan_output_contains_no_ai_generation_steps(self, tmp_path, capsys):
+        import argparse
+
+        args = argparse.Namespace(local_assets=str(tmp_path), target_duration=15)
+        _print_generation_source_plan({
+            "source": "local_assets",
+            "label": "本地视频混剪",
+            "policy_changes": [],
+            "kling_cost_info": None,
+            "estimated_output_size": None,
+        }, args)
+        output = capsys.readouterr().out
+
+        assert "本地视频混剪计划" in output
+        assert "可灵图片/视频生成：不调用" in output
+        assert "视频片段：" not in output
+        assert "图片先行预检" not in output
+        assert "角色定妆照" not in output
 
 
 class TestParallelGeneration:
@@ -6644,11 +6693,39 @@ class TestReferenceAdAnalysis:
         source = Path("one_click_create.py").read_text(encoding="utf-8")
 
         assert '"rationale": "local_asset_mode"' in source
-        assert "本地素材模式：跳过人物角色计划与角色一致性链路" in source
         assert "enumerate([] if local_asset_mode else clip_paths)" in source
-        assert "本地素材模式：跳过人物肤色一致性检测" in source
-        assert "本地素材模式：跳过 AI 生成故事板与人物角色推断" in source
-        assert "num_characters=0 if local_asset_mode" in source
+        assert '"kling_cost_info": None' in source
+        assert "本地选片按素材语义证据与匹配置信度执行" in source
+        assert "本地视频混剪" in source
+        assert "本地素材模式：跳过人物角色计划" not in source
+        assert "本地素材模式：跳过 AI 生成故事板" not in source
+
+    def test_ai_source_plan_keeps_kling_cost_and_low_cost_policy(self):
+        import argparse
+
+        args = argparse.Namespace(
+            local_assets=None,
+            mode="pro",
+            duration=5,
+            best_of=1,
+            preview=False,
+            target_duration=25,
+            image_first=True,
+            preflight_keyframe=True,
+            strict=True,
+            image_first_mode="standard",
+            image_first_variants=2,
+        )
+        plan = _prepare_generation_source_plan(
+            args,
+            {"name": "茶咖", "type": "食品"},
+            ab_versions=1,
+        )
+
+        assert plan["source"] == "kling_generation"
+        assert plan["kling_cost_info"]["video_seconds"] == 25
+        assert plan["kling_cost_info"]["image_count"] >= 4
+        assert plan["estimated_output_size"]["total_size_mb"] > 0
 
     def test_template_mode_restores_reference_video_argument(self):
         source = Path("one_click_create.py").read_text(encoding="utf-8")
