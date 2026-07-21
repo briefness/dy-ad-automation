@@ -28,6 +28,7 @@ import subprocess
 import math
 import shutil
 import hashlib
+import copy
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -108,9 +109,13 @@ from ad_script import (
     DEFAULT_SCRIPT_STYLE,
 )
 from tts_client import (
+    generate_tts_audio,
     generate_voiceover_script,
     generate_full_voiceover,
     align_subtitles_to_voiceover,
+    recommend_voice_for_narration,
+    build_tts_synthesis_contract,
+    align_voiceover_lines_to_audio_pauses,
     VOICEOVER_TEMPLATES,
     VOICE_PRESETS,
     DEFAULT_VOICEOVER_STYLE,
@@ -118,8 +123,11 @@ from tts_client import (
 )
 from video_merger import (
     merge_clips_ffmpeg,
-    add_subtitles_ffmpeg,
+    normalize_transition_decisions,
     add_fancy_subtitles,
+    prepare_single_line_subtitles,
+    assign_intelligent_subtitle_colors,
+    choose_subtitle_animation,
     add_bgm_ffmpeg,
     add_sfx_to_video,
     generate_sfx_timings,
@@ -144,7 +152,6 @@ from video_merger import (
     _get_clip_duration,
     _has_audio_stream,
     adjust_clip_duration,
-    generate_transition_sequence,
 )
 from quality_checker import (
     check_video_quality,
@@ -573,6 +580,55 @@ def _check_segment_semantic_quality(
         raise RuntimeError(f"分段语义质检未通过，已阻断不可发布成片：{detail}")
 
 
+def _collapse_edit_timeline_by_semantic(
+    edit_timeline: List[Dict[str, Any]],
+    semantic_indices: List[int],
+) -> List[Dict[str, Any]]:
+    """Collapse adjacent edit clips into one subtitle/voiceover interval per semantic cue."""
+    if len(edit_timeline) != len(semantic_indices):
+        raise ValueError(
+            f"镜头时间轴与语义映射数量不一致：{len(edit_timeline)} / {len(semantic_indices)}"
+        )
+    semantic_timeline: List[Dict[str, Any]] = []
+    closed: set[int] = set()
+    for edit, semantic_segment in zip(edit_timeline, semantic_indices):
+        semantic_segment = int(semantic_segment)
+        if semantic_timeline and semantic_timeline[-1]["index"] == semantic_segment:
+            semantic_timeline[-1]["end"] = float(edit["end"])
+            semantic_timeline[-1]["duration"] = round(
+                semantic_timeline[-1]["end"] - semantic_timeline[-1]["start"],
+                3,
+            )
+            semantic_timeline[-1]["edit_indices"].append(int(edit["index"]))
+            continue
+        if semantic_segment in closed:
+            raise ValueError(f"语义段 {semantic_segment} 的镜头不连续，无法形成单一口播 cue")
+        if semantic_timeline:
+            closed.add(int(semantic_timeline[-1]["index"]))
+        semantic_timeline.append({
+            "index": semantic_segment,
+            "start": float(edit["start"]),
+            "end": float(edit["end"]),
+            "duration": float(edit["duration"]),
+            "type": edit.get("type", ""),
+            "purpose": edit.get("purpose", ""),
+            "edit_indices": [int(edit["index"])],
+        })
+    return semantic_timeline
+
+
+def _single_line_subtitle_capacity(
+    video_width: int,
+    font_size: int,
+    horizontal_margin_ratio: float = 0.15,
+    minimum_font_scale: float = 0.8,
+) -> int:
+    """Return readable single-line units from the renderer's real width contract."""
+    safe_width = max(1.0, float(video_width) * (1.0 - 2.0 * horizontal_margin_ratio))
+    readable_font_size = max(1.0, float(font_size) * minimum_font_scale)
+    return max(1, int(safe_width // readable_font_size))
+
+
 def _build_character_manifest(
     *,
     product_info: dict,
@@ -775,6 +831,12 @@ def cleanup_output(output_name: str, output_dir: Path = OUTPUT_DIR):
         print(f"🧹 已清理 {len(cleaned)} 个文件")
 
 
+def _cleanup_cover_candidates(paths: List[Path]) -> None:
+    """Delete temporary scoring frames as soon as the final cover is rendered."""
+    for path in paths:
+        Path(path).unlink(missing_ok=True)
+
+
 
 def _cleanup_intermediate_files(
     final_dir: Path,
@@ -788,6 +850,7 @@ def _cleanup_intermediate_files(
     - {output_name}_16x9_final.mp4（横版，如有）
     - {output_name}_cover.jpg（封面图，如有）
     - {output_name}_发布文案.txt（发布文案）
+    - {output_name}_transition_decision_report.json（智能转场决策证据）
 
     中间文件后缀：_merged / _subtitled / _voiced / _sfx /
                   _graded / _watermarked / _trimmed / _cover_base
@@ -1116,6 +1179,264 @@ def _validate_voiceover_audio(audio_path: Path) -> float:
     if duration < 0.5:
         raise RuntimeError(f"口播时长异常（{duration:.2f}s）")
     return duration
+
+
+def _prepare_local_one_take_master(
+    ad_script: Dict[str, Any],
+    asset_index: Dict[str, Any],
+    product_info: Dict[str, Any],
+    requested_voice: str,
+    creative_profile: Optional[Dict[str, Any]],
+    reference_profile: Optional[Dict[str, Any]],
+    transition_duration: float,
+    output_path: Path,
+) -> Dict[str, Any]:
+    """Generate the only TTS request, then derive the edit timeline from its real duration."""
+    from local_asset_pipeline import build_one_take_timeline
+
+    provisional_lines = [
+        {
+            "text": str(segment.get("voiceover") or ""),
+            "start": float(index),
+            "end": float(index + 1),
+            "segment": int(segment.get("segment", index)),
+        }
+        for index, segment in enumerate(ad_script.get("segments") or [])
+    ]
+    voice, voice_reason = recommend_voice_for_narration(
+        product_info,
+        provisional_lines,
+        requested_voice=requested_voice,
+        creative_profile=creative_profile,
+    )
+    full_text = str(ad_script.get("voiceover_full") or "").strip()
+    if not full_text:
+        raise RuntimeError("本地素材单条口播缺少 voiceover_full")
+    synthesis_contract = build_tts_synthesis_contract(full_text, voice)
+    cache_dir = output_path.parent.parent / "tts_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_key = synthesis_contract["sha256"][:24]
+    cached_audio = cache_dir / f"{cache_key}.m4a"
+    cached_manifest = cache_dir / f"{cache_key}.json"
+    cache_hit = False
+    if cached_audio.is_file() and cached_manifest.is_file():
+        try:
+            manifest = json.loads(cached_manifest.read_text(encoding="utf-8"))
+            cache_hit = (
+                manifest == synthesis_contract
+                and _validate_voiceover_audio(cached_audio) > 0.5
+            )
+        except (OSError, ValueError, RuntimeError):
+            cache_hit = False
+    print(
+        f"🎤 {'复用' if cache_hit else '前置生成'}全视频唯一 TTS 母带"
+        f"（音色：{voice}，{voice_reason}）"
+    )
+    if not cache_hit:
+        temporary_audio = cache_dir / f".{cache_key}.tmp.m4a"
+        generate_tts_audio(full_text, temporary_audio, voice=voice)
+        _validate_voiceover_audio(temporary_audio)
+        temporary_audio.replace(cached_audio)
+        cached_manifest.write_text(
+            json.dumps(synthesis_contract, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    shutil.copy2(cached_audio, output_path)
+    audio_duration = _validate_voiceover_audio(output_path)
+    return _build_local_one_take_timeline_from_audio(
+        ad_script=ad_script,
+        asset_index=asset_index,
+        reference_profile=reference_profile,
+        transition_duration=transition_duration,
+        output_path=output_path,
+        audio_duration=audio_duration,
+        voice=voice,
+        voice_reason=voice_reason,
+        source_audio_path=cached_audio,
+        tts_cache_hit=cache_hit,
+    )
+
+
+def _build_local_one_take_timeline_from_audio(
+    ad_script: Dict[str, Any],
+    asset_index: Dict[str, Any],
+    reference_profile: Optional[Dict[str, Any]],
+    transition_duration: float,
+    output_path: Path,
+    audio_duration: float,
+    voice: str,
+    voice_reason: str,
+    source_audio_path: Optional[Path] = None,
+    tts_cache_hit: bool = False,
+) -> Dict[str, Any]:
+    """Derive the edit timeline from one already-generated continuous TTS master."""
+    from local_asset_pipeline import build_one_take_timeline
+
+    reference_outro_duration = float((reference_profile or {}).get("outro_duration") or 0.0)
+    main_text = "".join(str(item.get("voiceover") or "") for item in ad_script.get("segments") or [])
+    outro_text = str(ad_script.get("voiceover_outro_cue") or "")
+    main_units = max(1, len(re.findall(r"[\w\u4e00-\u9fff]", main_text)))
+    outro_units = len(re.findall(r"[\w\u4e00-\u9fff]", outro_text))
+    estimated_outro_duration = (
+        audio_duration * outro_units / max(main_units + outro_units, 1)
+        if outro_units else 0.0
+    )
+    outro_duration = (
+        min(reference_outro_duration, max(0.5, estimated_outro_duration))
+        if reference_outro_duration > 0 and outro_units else 0.0
+    )
+    main_duration = audio_duration - outro_duration
+    if main_duration <= 0.5:
+        raise RuntimeError(
+            f"单条口播母带 {audio_duration:.2f}s 无法覆盖 CTA {outro_duration:.2f}s 之外的主内容"
+        )
+    windows = (asset_index or {}).get("windows") or []
+    segments = ad_script.get("segments") or []
+    role_capacities: Dict[str, float] = {}
+    for role in {str(segment.get("product_story_role") or "").strip() for segment in segments}:
+        by_source: Dict[str, List[Tuple[float, float]]] = {}
+        for window in windows:
+            analysis = window.get("analysis") or {}
+            if not analysis.get("usable_for_ad"):
+                continue
+            if role and str(analysis.get("product_story_role") or "unknown") != role:
+                continue
+            by_source.setdefault(str(window.get("source_path") or ""), []).append((
+                float(window.get("start") or 0.0),
+                float(window.get("end") or 0.0),
+            ))
+        capacity = 0.0
+        for intervals in by_source.values():
+            merged: List[List[float]] = []
+            for start, end in sorted(intervals):
+                if end <= start:
+                    continue
+                if not merged or start > merged[-1][1]:
+                    merged.append([start, end])
+                else:
+                    merged[-1][1] = max(merged[-1][1], end)
+            capacity += sum(end - start for start, end in merged)
+        role_capacities[role] = capacity
+    cue_weights = {
+        int(segment.get("segment", index)): max(
+            1,
+            len(re.findall(r"[\w\u4e00-\u9fff]", str(segment.get("voiceover") or ""))),
+        )
+        for index, segment in enumerate(segments)
+    }
+    role_weight_totals: Dict[str, int] = {}
+    for index, segment in enumerate(segments):
+        role = str(segment.get("product_story_role") or "").strip()
+        role_weight_totals[role] = role_weight_totals.get(role, 0) + cue_weights[int(segment.get("segment", index))]
+    max_clip_durations: Dict[int, float] = {}
+    for index, segment in enumerate(segments):
+        segment_index = int(segment.get("segment", index))
+        role = str(segment.get("product_story_role") or "").strip()
+        max_clip_durations[segment_index] = (
+            role_capacities.get(role, 0.0)
+            * cue_weights[segment_index]
+            / max(role_weight_totals.get(role, 1), 1)
+        )
+    timeline = build_one_take_timeline(
+        ad_script,
+        main_duration=main_duration,
+        outro_duration=outro_duration,
+        transition_duration=transition_duration,
+        max_clip_durations=max_clip_durations,
+    )
+    aligned_lines = align_voiceover_lines_to_audio_pauses(
+        timeline["voiceover_lines"],
+        output_path,
+        audio_duration,
+        preserve_container_edges=True,
+    )
+    timeline["voiceover_lines"] = aligned_lines
+    main_lines = [line for line in aligned_lines if not line.get("is_outro")]
+    timeline["clip_durations"] = {
+        int(line["segment"]): round(float(line["end"]) - float(line["start"]), 3)
+        for line in main_lines
+    }
+    if main_lines:
+        timeline["main_duration"] = round(float(main_lines[-1]["end"]), 3)
+    outro_lines = [line for line in aligned_lines if line.get("is_outro")]
+    timeline["outro_duration"] = round(
+        sum(float(line["end"]) - float(line["start"]) for line in outro_lines),
+        3,
+    )
+    timeline["alignment_precision"] = (
+        "measured_audio_pauses"
+        if any(line.get("alignment_precision") == "measured_audio_pause" for line in aligned_lines)
+        else "speech_weight_estimate"
+    )
+    timeline.update({
+        "audio_path": str(output_path),
+        "source_audio_path": str(source_audio_path or output_path),
+        "audio_duration": round(audio_duration, 3),
+        "voice": voice,
+        "voice_reason": voice_reason,
+        "mode": "single_take",
+        "tts_requests": 1,
+        "tts_external_requests": 0 if tts_cache_hit else 1,
+        "tts_cache_hit": tts_cache_hit,
+        "tempo_multiplier": 1.0,
+    })
+    return timeline
+
+
+def _audio_waveform_similarity(
+    left: Path,
+    right: Path,
+    sample_rate: int = 4000,
+    max_lag_ms: int = 100,
+) -> float:
+    """Return peak mono correlation while tolerating normal codec/filter latency."""
+    import numpy as np
+
+    def _decode(path: Path) -> Any:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-v", "error", "-i", str(path), "-vn", "-ac", "1",
+                "-ar", str(sample_rate), "-f", "s16le", "-",
+            ],
+            capture_output=True,
+            timeout=60,
+            check=True,
+        )
+        return np.frombuffer(result.stdout, dtype=np.int16).astype(np.float64)
+
+    left_values = _decode(left)
+    right_values = _decode(right)
+    count = min(len(left_values), len(right_values))
+    if count < sample_rate // 2:
+        return 0.0
+    left_centered = left_values[:count] - np.mean(left_values[:count])
+    right_centered = right_values[:count] - np.mean(right_values[:count])
+    max_lag = max(0, int(sample_rate * max_lag_ms / 1000))
+    step = max(1, sample_rate // 1000)
+    best = 0.0
+    for lag in range(-max_lag, max_lag + 1, step):
+        if lag >= 0:
+            left_slice = left_centered[lag:]
+            right_slice = right_centered[:len(left_slice)]
+        else:
+            right_slice = right_centered[-lag:]
+            left_slice = left_centered[:len(right_slice)]
+        if len(left_slice) < sample_rate // 2:
+            continue
+        numerator = float(np.dot(left_slice, right_slice))
+        denominator = float(np.linalg.norm(left_slice) * np.linalg.norm(right_slice))
+        if denominator:
+            best = max(best, abs(numerator / denominator))
+    return best
+
+
+def _validate_voiceover_in_mix(mixed_video: Path, voiceover: Path, minimum_similarity: float = 0.15) -> float:
+    similarity = _audio_waveform_similarity(mixed_video, voiceover)
+    if similarity < minimum_similarity:
+        raise RuntimeError(
+            f"最终混音未检出口播波形（相似度 {similarity:.3f} < {minimum_similarity:.2f}）"
+        )
+    return similarity
 
 
 def _build_scene_anchor(
@@ -1466,12 +1787,18 @@ def _record_production_workflow_completion(
     """
     summary: Dict[str, Any] = {
         "registered_assets": [],
+        "automatic_observation_recorded": False,
         "feedback_collected": False,
         "experiment_tracked": False,
         "warnings": [],
     }
 
-    video_id = f"video_{output_name}"
+    artifact_digest = hashlib.sha256()
+    with final_path.open("rb") as artifact_file:
+        for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
+            artifact_digest.update(chunk)
+    artifact_id = artifact_digest.hexdigest()[:12]
+    video_id = f"video_{output_name}_{artifact_id}"
     quality_score = _result_quality_score(quality_result)
     quality_issues = _result_issues(quality_result)
     rating = 5 if quality_score >= 90 else 4 if quality_score >= 80 else 3 if quality_score >= 60 else 2
@@ -1514,7 +1841,7 @@ def _record_production_workflow_completion(
             from feedback_loop import FeedbackLoop
             feedback_loop = FeedbackLoop()
 
-        summary["feedback_collected"] = bool(feedback_loop.collect_feedback(
+        summary["automatic_observation_recorded"] = bool(feedback_loop.collect_feedback(
             video_id=video_id,
             generation_params={
                 **generation_params,
@@ -1535,10 +1862,10 @@ def _record_production_workflow_completion(
             from experiment_tracker import ExperimentTracker
             experiment_tracker = ExperimentTracker()
 
-        experiment_id = f"exp_{output_name}"
+        experiment_id = f"exp_{output_name}_{artifact_id}"
         strategy = getattr(decision_result, "recommended_strategy", None) or generation_params.get("strategy", "standard")
         estimated_success_rate = getattr(decision_result, "estimated_success_rate", None)
-        experiment_tracker.start_experiment(
+        experiment_started = experiment_tracker.start_experiment(
             experiment_id=experiment_id,
             hypothesis=f"{product_info.get('type', 'default')} 视频生成质量闭环验证",
             params={
@@ -1549,12 +1876,17 @@ def _record_production_workflow_completion(
             },
             video_id=video_id,
         )
-        summary["experiment_tracked"] = bool(experiment_tracker.complete_experiment(
-            experiment_id=experiment_id,
-            rating=rating,
-            quality_score=quality_score,
-        ))
-        summary["experiment_id"] = experiment_id
+        if experiment_started:
+            summary["experiment_tracked"] = bool(experiment_tracker.complete_experiment(
+                experiment_id=experiment_id,
+                rating=rating,
+                quality_score=quality_score,
+            ))
+            summary["experiment_id"] = experiment_id
+        else:
+            summary["warnings"].append(
+                f"实验创建失败，未完成或覆盖已有实验：{experiment_id}"
+            )
     except Exception as e:
         summary["warnings"].append(f"实验追踪失败：{e}")
 
@@ -1664,6 +1996,27 @@ def calc_duration_for_target(target_duration: int) -> tuple:
     num_segs = 5
     per_clip = max(2, (target_duration + transition_total(num_segs)) / num_segs)
     return num_segs, round(per_clip, 1), f"自定义 {target_duration}s（5段）"
+
+
+def _fit_rhythm_template_to_net_duration(template: dict, net_duration: float) -> dict:
+    """Scale segments so the post-transition timeline matches a reference duration."""
+    fitted = copy.deepcopy(template)
+    segments = fitted.get("segments") or []
+    if not segments or net_duration <= 0:
+        return fitted
+    transition = float(fitted.get("transition_duration") or 0.0)
+    desired_sum = net_duration + transition * max(0, len(segments) - 1)
+    current_sum = sum(float(segment.get("duration") or 0.0) for segment in segments)
+    if current_sum <= 0:
+        return fitted
+    scale = desired_sum / current_sum
+    for segment in segments:
+        segment["duration"] = round(float(segment.get("duration") or 0.0) * scale, 3)
+    residual = desired_sum - sum(float(segment["duration"]) for segment in segments)
+    segments[-1]["duration"] = round(float(segments[-1]["duration"]) + residual, 3)
+    fitted["total_duration"] = round(sum(float(segment["duration"]) for segment in segments), 3)
+    fitted["actual_total_duration"] = round(net_duration, 3)
+    return fitted
 
 
 # ============================================================
@@ -2846,11 +3199,119 @@ def _generate_multi_angle_character_refs(
     }
 
 
+def _measure_mean_volume_db(path: Path) -> Optional[float]:
+    """Measure mean audio level for adaptive voice/BGM balance."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", str(path), "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        match = re.search(r"mean_volume:\s*(-?[\d.]+) dB", result.stderr)
+        return float(match.group(1)) if match else None
+    except Exception:
+        return None
+
+
+def _compute_bgm_mix_profile(bgm_mean_db: float, voice_mean_db: float) -> Dict[str, float]:
+    """Keep music audible while maintaining a speech-first loudness gap."""
+    target_gap_db = 6.0
+    normalized_voice_db = -16.0
+    desired_bgm_db = normalized_voice_db - target_gap_db
+    gain_db = desired_bgm_db - bgm_mean_db
+    base_volume = max(0.45, min(1.0, 10 ** (gain_db / 20.0)))
+    return {
+        "base_volume": round(base_volume, 3),
+        "sidechain_ratio": 2.5,
+        "target_gap_db": target_gap_db,
+    }
+
+
+def _probe_media_duration(path: Path, stream_selector: Optional[str] = None) -> float:
+    cmd = ["ffprobe", "-v", "error"]
+    if stream_selector:
+        cmd += ["-select_streams", stream_selector, "-show_entries", "stream=duration"]
+    else:
+        cmd += ["-show_entries", "format=duration"]
+    cmd += ["-of", "default=noprint_wrappers=1:nokey=1", str(path)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=True)
+        return float(result.stdout.strip().splitlines()[0])
+    except Exception:
+        return 0.0
+
+
+def _validate_cta_voiceover_contract(
+    reference_profile: Dict[str, Any],
+    voiceover_enabled: bool,
+    cta_audio: Optional[Path],
+) -> None:
+    """Voiceover-enabled reference outros must contain a real CTA performance."""
+    if not voiceover_enabled or not reference_profile.get("cta_text"):
+        return
+    if not cta_audio or not Path(cta_audio).exists():
+        raise RuntimeError("启用口播的参考尾卡缺少 CTA 口播音频")
+    duration = _probe_media_duration(Path(cta_audio), "a:0") or _probe_media_duration(Path(cta_audio))
+    if duration < 0.25:
+        raise RuntimeError("CTA 口播音频过短或不可解码")
+
+
+def _validate_audio_covers_video(video: Path, maximum_gap: float = 0.35) -> None:
+    video_duration = _probe_media_duration(video)
+    audio_duration = _probe_media_duration(video, "a:0")
+    if video_duration <= 0 or audio_duration <= 0 or video_duration - audio_duration > maximum_gap:
+        raise RuntimeError(
+            f"最终音轨未覆盖完整视频：视频 {video_duration:.2f}s，音频 {audio_duration:.2f}s"
+        )
+
+
+def _resolve_local_cta_background(
+    *,
+    local_asset_mode: bool,
+    postproduction_contract: Optional[Dict[str, Any]],
+    clean_video: Path,
+) -> Optional[Path]:
+    """Use the pre-subtitle picture layer so the tail card cannot freeze burned captions."""
+    if (
+        local_asset_mode
+        and (postproduction_contract or {}).get("cta", {}).get("visual_mode")
+        == "closing_frame_tail_card"
+    ):
+        return clean_video
+    return None
+
+
+def _append_outro_timing_to_voiceover_script(
+    script_lines: List[Dict[str, Any]],
+    outro_cue: str,
+    main_duration: float,
+    outro_duration: float,
+) -> List[Dict[str, Any]]:
+    """Add timing metadata for the CTA already authored inside voiceover_full."""
+    combined = [dict(line) for line in script_lines]
+    text = str(outro_cue or "").strip()
+    if not text:
+        return combined
+    next_segment = max(
+        (int(line.get("segment", index)) for index, line in enumerate(combined)),
+        default=-1,
+    ) + 1
+    combined.append({
+        "text": text,
+        "start": float(main_duration),
+        "end": float(main_duration) + float(outro_duration),
+        "segment": next_segment,
+        "is_outro": True,
+    })
+    return combined
+
+
 def _mix_voiceover_with_bgm(
     video: Path,
     voiceover: Path,
     output: Path,
-    bgm_ducking_volume: float = 0.3,
+    bgm_ducking_volume: Optional[float] = None,
 ) -> Path:
     """
     将口播与视频中的 BGM 混合（#16 修复：真正的 sidechain ducking）
@@ -2900,17 +3361,30 @@ def _mix_voiceover_with_bgm(
         run_ffmpeg(cmd, timeout=120)
         return output
 
+    bgm_mean_db = _measure_mean_volume_db(video)
+    voice_mean_db = _measure_mean_volume_db(voiceover)
+    mix_profile = _compute_bgm_mix_profile(
+        bgm_mean_db if bgm_mean_db is not None else -22.0,
+        voice_mean_db if voice_mean_db is not None else -16.0,
+    )
+    base_volume = float(bgm_ducking_volume) if bgm_ducking_volume is not None else mix_profile["base_volume"]
+    sidechain_ratio = mix_profile["sidechain_ratio"]
+    print(
+        f"  🎚️ 智能混音：BGM {base_volume:.2f}，sidechain {sidechain_ratio:.1f}:1，"
+        f"目标人声领先 {mix_profile['target_gap_db']:.1f}dB"
+    )
+
     # P0 修复：真正的 sidechain ducking
     # [0:a] = 视频原音轨（BGM），[1:a] = 口播音频
     # sidechaincompress: 人声触发时 BGM 强力压低（ratio=12, threshold≈-26dBFS）
     # attack=5ms 快速响应，release=250ms 平滑恢复，knee=2 软拐点更自然
     # amix 后追加 alimiter 防止 BGM+口播叠加爆音
     filter_complex = (
-        f"[0:a]volume={bgm_ducking_volume}[bgm_pre];"
-        f"[1:a]volume=1.0[voice];"
-        f"[bgm_pre][voice]sidechaincompress="
-        f"threshold=0.05:ratio=12:attack=5:release=250:knee=2:makeup=1[bgm_duck];"
-        f"[bgm_duck][voice]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[amixed];"
+        f"[0:a]volume={base_volume}[bgm_pre];"
+        f"[1:a]loudnorm=I=-16:LRA=7:TP=-1.5,asplit=2[voice_sc][voice_mix];"
+        f"[bgm_pre][voice_sc]sidechaincompress="
+        f"threshold=0.08:ratio={sidechain_ratio}:attack=8:release=350:knee=3:makeup=1[bgm_duck];"
+        f"[bgm_duck][voice_mix]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[amixed];"
         f"[amixed]alimiter=level_in=1:level_out=1:limit=-1dB:attack=5:release=10[aout]"
     )
 
@@ -4298,9 +4772,9 @@ def parse_args():
     )
     parser.add_argument(
         "--voice",
-        default=DEFAULT_VOICE,
-        choices=list(VOICE_PRESETS.keys()),
-        help=f"音色（默认：{DEFAULT_VOICE}）",
+        default="auto",
+        choices=["auto", *VOICE_PRESETS.keys()],
+        help="音色（默认 auto：根据品类与最终口播智能选择）",
     )
     parser.add_argument(
         "--list-voices",
@@ -4441,6 +4915,18 @@ def parse_args():
         action="store_true",
         help="手动模式：逐字段填写产品信息（默认为主题模式，输入一句话自动展开）",
     )
+    parser.add_argument(
+        "--local-assets",
+        metavar="FOLDER",
+        default=None,
+        help="使用本地视频素材文件夹生成成片；跳过可灵视频生成，先分析素材再剪辑",
+    )
+    parser.add_argument(
+        "--reference-video",
+        metavar="PATH",
+        default=None,
+        help="同产品参考广告视频；提取带货结构、可见事实、连续口播节奏和尾卡形式",
+    )
     return parser.parse_args()
 
 
@@ -4485,6 +4971,8 @@ def save_template(product_info: dict, args: argparse.Namespace, output_path: Pat
             "no_llm": getattr(args, "no_llm", False),
             "output_name": getattr(args, "output_name", None),
             "resume": getattr(args, "resume", True),
+            "local_assets": getattr(args, "local_assets", None),
+            "reference_video": getattr(args, "reference_video", None),
         },
         "created_at": datetime.now().isoformat(),
     }
@@ -4517,7 +5005,7 @@ def load_template(template_path: Path) -> tuple:
     args_dict.setdefault("hook_type", DEFAULT_HOOK_TYPE)
     args_dict.setdefault("script_style", DEFAULT_SCRIPT_STYLE)
     args_dict.setdefault("use_voiceover", False)
-    args_dict.setdefault("voice", DEFAULT_VOICE)
+    args_dict.setdefault("voice", "auto")
     args_dict.setdefault("rhythm_style", "moderate")
     args_dict.setdefault("target_duration", None)
     args_dict.setdefault("preview", False)
@@ -4540,6 +5028,8 @@ def load_template(template_path: Path) -> tuple:
     args_dict.setdefault("no_llm", False)
     args_dict.setdefault("output_name", None)
     args_dict.setdefault("resume", True)
+    args_dict.setdefault("local_assets", None)
+    args_dict.setdefault("reference_video", None)
 
     return product_info, args_dict
 
@@ -4553,9 +5043,20 @@ class MusicContract(TypedDict):
     energy: str      # high, medium, low
     recommended_pace: str  # fast, moderate, cinematic
     intro_type: str  # immediate, buildup, fade_in
+    source: str
+    visual_brightness: str
+    visual_contrast: str
+    transition_base_duration: float
+    sfx_intensity: str
+    semantic_tone: str
+    story_role_counts: Dict[str, int]
 
 
-def build_music_contract(product_info: dict, cinematic_style: str = "none") -> MusicContract:
+def build_music_contract(
+    product_info: dict,
+    cinematic_style: str = "none",
+    asset_creative_profile: Optional[Dict[str, Any]] = None,
+) -> MusicContract:
     """
     从产品类型、受众和电影风格构建音乐合同。
     在脚本阶段就确定音乐策略，让分镜、口播、BGM 三方对齐。
@@ -4589,8 +5090,12 @@ def build_music_contract(product_info: dict, cinematic_style: str = "none") -> M
 
     mood = style_override.get("mood", base["mood"])
     genre = style_override.get("genre", base["genre"])
-    energy = base["energy"]
-    intro_type = style_override.get("intro_type", "immediate")
+    energy = str((asset_creative_profile or {}).get("energy") or base["energy"])
+    intro_type = str(
+        style_override.get("intro_type")
+        or (asset_creative_profile or {}).get("intro_type")
+        or "immediate"
+    )
 
     # ── 受众年龄 → BPM 范围 ──
     _AUDIENCE_BPM = {
@@ -4603,10 +5108,15 @@ def build_music_contract(product_info: dict, cinematic_style: str = "none") -> M
 
     # energy 影响 pace 和 BPM
     _ENERGY_PACE = {"high": "fast", "medium": "moderate", "low": "cinematic"}
-    recommended_pace = _ENERGY_PACE.get(energy, "moderate")
+    recommended_pace = str(
+        (asset_creative_profile or {}).get("recommended_pace")
+        or _ENERGY_PACE.get(energy, "moderate")
+    )
 
-    # energy 高时 BPM 上调一档
-    if energy == "high":
+    if asset_creative_profile:
+        bpm_min = int(asset_creative_profile.get("bpm_min") or bpm_min)
+        bpm_max = int(asset_creative_profile.get("bpm_max") or bpm_max)
+    elif energy == "high":
         bpm_min = min(140, bpm_min + 10)
         bpm_max = min(150, bpm_max + 10)
     elif energy == "low":
@@ -4621,6 +5131,15 @@ def build_music_contract(product_info: dict, cinematic_style: str = "none") -> M
         energy=energy,
         recommended_pace=recommended_pace,
         intro_type=intro_type,
+        source=str((asset_creative_profile or {}).get("source") or "product_profile"),
+        visual_brightness=str((asset_creative_profile or {}).get("brightness") or "unknown"),
+        visual_contrast=str((asset_creative_profile or {}).get("contrast") or "unknown"),
+        transition_base_duration=float(
+            (asset_creative_profile or {}).get("transition_base_duration") or 0.4
+        ),
+        sfx_intensity=str((asset_creative_profile or {}).get("sfx_intensity") or "moderate"),
+        semantic_tone=str((asset_creative_profile or {}).get("semantic_tone") or "product_demo"),
+        story_role_counts=dict((asset_creative_profile or {}).get("story_role_counts") or {}),
     )
 
 
@@ -4709,6 +5228,8 @@ def run_generation_pipeline(
     image_first: bool = True,
     image_first_mode: str = "standard",
     image_first_variants: int = 2,
+    local_assets: Optional[Path] = None,
+    reference_video: Optional[Path] = None,
 ) -> dict:
     """
     核心生成流水线（无交互逻辑）
@@ -4767,7 +5288,40 @@ def run_generation_pipeline(
     clips_dir = output_dir / "clips"
     final_dir = output_dir / "final"
 
-    client = KlingClient()
+    local_asset_mode = local_assets is not None
+    client = None if local_asset_mode else KlingClient()
+    local_asset_index = None
+    local_asset_edit_report = None
+    local_asset_frame_evidence_report = None
+    asset_creative_profile = None
+    local_story_contract = None
+    postproduction_contract = None
+    postproduction_contract_path = None
+    local_one_take_timeline = None
+    local_one_take_master: Optional[Path] = None
+    local_edit_semantic_indices: List[int] = []
+    if local_asset_mode:
+        print(f"🎞️ 本地素材模式：{Path(local_assets).expanduser()}")
+        print("   跳过可灵视频生成，先分析素材再生成素材约束脚本")
+    reference_profile = None
+    if reference_video:
+        from local_asset_pipeline import analyze_reference_ad, bind_reference_profile_to_product
+        print(f"🎯 分析同产品参考广告：{Path(reference_video).expanduser()}")
+        reference_profile = bind_reference_profile_to_product(
+            analyze_reference_ad(Path(reference_video)),
+            product_info,
+        )
+        product_info["reference_ad_profile"] = reference_profile
+        rejected_reference_claims = reference_profile.get("rejected_reference_claims") or []
+        if rejected_reference_claims:
+            print(f"🛡️  参考片事实交叉核验：拒绝 {len(rejected_reference_claims)} 条无独立产品证据的文字")
+        if local_asset_mode and target_duration is None:
+            target_duration = max(15, round(float(reference_profile.get("recommended_main_duration") or 16.0)))
+        print(
+            f"✅ 参考广告合同：主内容约 {reference_profile.get('recommended_main_duration', 0):.1f}s，"
+            f"素材段 {reference_profile.get('recommended_material_segments', 5)}，"
+            f"尾卡约 {reference_profile.get('outro_duration', 0):.1f}s"
+        )
 
     # ── 智能电影风格匹配（零配置自动选择，自我进化）──
     # 当 style 为默认值或 auto 时，根据品类+历史成功率智能推荐
@@ -4814,18 +5368,25 @@ def run_generation_pipeline(
         mode = "std"
     effective_kling_model = kling_model or KLING_VIDEO_MODEL
 
-    cast_plan = build_cast_plan({**product_info, "characters": characters} if characters else product_info)
+    cast_plan = (
+        {"core_characters": [], "supporting_characters": [], "ambient_entities": [], "rationale": "local_asset_mode"}
+        if local_asset_mode
+        else build_cast_plan({**product_info, "characters": characters} if characters else product_info)
+    )
     core_characters = cast_plan.get("core_characters", [])
     product_info["cast_plan"] = cast_plan
     product_info["characters"] = core_characters
     product_info["supporting_characters"] = cast_plan.get("supporting_characters", [])
     product_info["ambient_entities"] = cast_plan.get("ambient_entities", [])
-    print(
-        f"🎭 角色计划：核心 {len(core_characters)}，"
-        f"配角 {len(product_info['supporting_characters'])}，"
-        f"环境实体 {len(product_info['ambient_entities'])}"
-    )
-    print(f"    推断依据：{cast_plan.get('rationale', 'n/a')}")
+    if local_asset_mode:
+        print("🎞️ 本地素材模式：跳过人物角色计划与角色一致性链路")
+    else:
+        print(
+            f"🎭 角色计划：核心 {len(core_characters)}，"
+            f"配角 {len(product_info['supporting_characters'])}，"
+            f"环境实体 {len(product_info['ambient_entities'])}"
+        )
+        print(f"    推断依据：{cast_plan.get('rationale', 'n/a')}")
 
     # ============================================================
     # 第一步：生成所有角色定妆照（多角度，提升视频一致性）
@@ -4835,9 +5396,10 @@ def run_generation_pipeline(
     # ── 构建角色圣经和商品圣经（标准化资产描述）──
     character_bibles = build_character_bibles(product_info, core_characters)
     product_bible = build_product_bible(product_info)
-    print(f"📖 角色圣经：{len(character_bibles)} 个角色")
-    for bible in character_bibles:
-        print(f"    [{bible['id']}] {bible['name']}: {character_bible_to_prompt(bible)[:60]}...")
+    if not local_asset_mode:
+        print(f"📖 角色圣经：{len(character_bibles)} 个角色")
+        for bible in character_bibles:
+            print(f"    [{bible['id']}] {bible['name']}: {character_bible_to_prompt(bible)[:60]}...")
     print(f"📦 商品圣经：{product_bible_to_prompt(product_bible)[:60]}...")
 
     # 生成所有角色多角度定妆照（性价比策略：多花几毛钱买一致性）
@@ -4847,7 +5409,9 @@ def run_generation_pipeline(
     # Q-Final 修复：用 core_characters（动态分析结果）而非 characters（用户原始传入）
     # 之前的 bug：用户没传 characters 时，characters=None，导致只生成 1 个默认角色
     _gen_chars = core_characters if core_characters else []
-    if _gen_chars and len(_gen_chars) > 0:
+    if local_asset_mode:
+        print("🎭 本地素材模式：跳过角色定妆照生成")
+    elif _gen_chars and len(_gen_chars) > 0:
         for idx, char in enumerate(_gen_chars):
             char_name = char.get("name", f"Character {chr(65 + idx)}")
             char_desc = char.get("description", "")
@@ -4908,18 +5472,67 @@ def run_generation_pipeline(
             product_image_path = Path(product_image)
         _validate_product_image_file(product_image_path)
         product_img_b64 = base64.b64encode(product_image_path.read_bytes()).decode("utf-8")
-    elif not preview and not allow_no_product_image:
+    elif not local_asset_mode and not preview and not allow_no_product_image:
         raise RuntimeError(
             "发布级成片必须提供 --product-image，以便约束生成和质检产品露出。"
             "如仅调试或非商品视频，请显式传入 --allow-no-product-image。"
         )
+
+    if local_asset_mode:
+        print("🔎 开始分析本地素材覆盖度与视听特征...")
+        from local_asset_pipeline import (
+            build_local_asset_creative_profile,
+            build_local_asset_index,
+            build_local_asset_story_contract,
+            build_material_constrained_script,
+        )
+        local_asset_index = build_local_asset_index(Path(local_assets))
+        coverage = local_asset_index.get("coverage", {})
+        asset_creative_profile = build_local_asset_creative_profile(local_asset_index)
+        local_story_contract = build_local_asset_story_contract(
+            local_asset_index,
+            product_info,
+            requested_duration=target_duration,
+            preview=preview,
+        )
+        print(f"✅ 本地素材分析完成：可用窗口 {coverage.get('usable_windows', 0)}/{coverage.get('total_windows', 0)}")
+        story_role_scores = coverage.get("story_role_scores", {})
+        if story_role_scores:
+            visible_story_roles = {
+                key: value
+                for key, value in story_role_scores.items()
+                if float(value or 0) > 0
+            }
+            print(
+                "   画面语义覆盖："
+                + " / ".join(f"{key}={value:.2f}" for key, value in visible_story_roles.items())
+            )
+        print(
+            f"   视听合同：motion={asset_creative_profile['energy']} "
+            f"({asset_creative_profile['motion_score']:.2f}) / "
+            f"brightness={asset_creative_profile['brightness']} / "
+            f"contrast={asset_creative_profile['contrast']}"
+        )
+        print(
+            f"   素材自然时长：{local_story_contract['natural_main_duration']:.2f}s / "
+            f"{local_story_contract['recommended_segments']} 段"
+        )
+        if target_duration is not None and not local_story_contract["requested_duration_applied"]:
+            print(
+                f"   时长偏好 {target_duration}s 未强制应用："
+                "保留完整素材叙事且不拉伸镜头"
+            )
 
     # ============================================================
     # 第二步：生成广告脚本 + 分镜片段
     # ============================================================
 
     # ── 音乐合同：脚本阶段确定音乐策略，让分镜、口播、BGM 三方对齐 ──
-    music_contract = build_music_contract(product_info, cinematic_style=style)
+    music_contract = build_music_contract(
+        product_info,
+        cinematic_style=style,
+        asset_creative_profile=asset_creative_profile,
+    )
     print(f"🎵 音乐合同：{music_contract['mood']} {music_contract['genre']}")
     print(f"    BPM：{music_contract['bpm_min']}-{music_contract['bpm_max']}，energy：{music_contract['energy']}")
     print(f"    推荐 pace：{music_contract['recommended_pace']}，intro：{music_contract['intro_type']}")
@@ -4929,32 +5542,69 @@ def run_generation_pipeline(
     # 原则：剧情完整性优先，段数服务于内容，不为凑段数而凑段数
     _selling_points_raw = product_info.get("selling_point", "")
     _selling_points = [sp.strip() for sp in _selling_points_raw.replace("，", ",").split(",") if sp.strip()]
-    _recommended_segs = recommend_segment_count(
-        product_type=product_info.get("type", "default"),
-        selling_points=_selling_points,
-        target_duration=target_duration,
-    )
+    if local_asset_mode:
+        _recommended_segs = int(local_story_contract["recommended_segments"])
+    else:
+        _recommended_segs = recommend_segment_count(
+            product_type=product_info.get("type", "default"),
+            selling_points=_selling_points,
+            target_duration=target_duration,
+        )
+        if reference_profile:
+            _recommended_segs = int(reference_profile.get("recommended_material_segments") or _recommended_segs)
     # 预览模式强制 1 段
     _num_segs = 1 if preview else _recommended_segs
-    print(f"📐 智能段数推荐：{_num_segs} 段（基于{product_info.get('type', 'default')}品类、{len(_selling_points)}个卖点、目标时长{target_duration or '默认'}s）")
+    if local_asset_mode:
+        print(f"📐 素材理解决定段数：{_num_segs} 段")
+    else:
+        print(f"📐 智能段数推荐：{_num_segs} 段（基于{product_info.get('type', 'default')}品类、{len(_selling_points)}个卖点、目标时长{target_duration or '默认'}s）")
 
     # ── 节奏模板初始化（先选5段基准模板，再适配到目标段数）──
     # 用 5 段的总时长估算来选最接近的基准模板
-    _est_total_5seg = target_duration if target_duration is not None else duration * 5
-    _effective_rhythm_style = rhythm_style
-    if rhythm_style == "moderate" and music_contract["recommended_pace"] != "moderate":
-        _effective_rhythm_style = music_contract["recommended_pace"]
-        print(f"    节奏风格由 moderate 自动调整为 {_effective_rhythm_style}（音乐合同推荐）")
-    # 先选 5 段基准模板
-    _base_template = get_rhythm_template(
-        _est_total_5seg, style=_effective_rhythm_style, product_type=product_info.get("type", "default")
-    )
-    # 适配到目标段数（预览模式不用适配，后续只取第1段）
-    if not preview and _num_segs != len(_base_template["segments"]):
-        rhythm_template = adapt_rhythm_template_to_segments(_base_template, _num_segs)
-        print(f"🔄 节奏模板适配：从 {len(_base_template['segments'])} 段 → {_num_segs} 段")
+    if local_asset_mode:
+        _natural_total = float(local_story_contract["natural_main_duration"])
+        rhythm_template = {
+            "name": "本地素材自然时间轴",
+            "total_duration": _natural_total,
+            "actual_total_duration": _natural_total,
+            "transition_duration": float(asset_creative_profile["transition_base_duration"]),
+            "pace_style": str(asset_creative_profile["recommended_pace"]),
+            "duration_source": "selected_local_asset_windows",
+            "segments": [
+                {
+                    "index": int(item["segment"]),
+                    "type": str(item["narrative"]),
+                    "narrative": str(item["narrative"]),
+                    "purpose": str(item["marketing_intent"]),
+                    "duration": float(local_story_contract["segment_durations"][int(item["segment"])]),
+                    "ratio": round(
+                        float(local_story_contract["segment_durations"][int(item["segment"])])
+                        / max(_natural_total, 0.001),
+                        4,
+                    ),
+                }
+                for item in local_story_contract["narrative_plan"]
+            ],
+        }
     else:
-        rhythm_template = _base_template
+        _est_total_5seg = target_duration if target_duration is not None else duration * 5
+        _effective_rhythm_style = rhythm_style
+        if rhythm_style == "moderate" and music_contract["recommended_pace"] != "moderate":
+            _effective_rhythm_style = music_contract["recommended_pace"]
+            print(f"    节奏风格由 moderate 自动调整为 {_effective_rhythm_style}（音乐合同推荐）")
+        _base_template = get_rhythm_template(
+            _est_total_5seg, style=_effective_rhythm_style, product_type=product_info.get("type", "default")
+        )
+        if not preview and _num_segs != len(_base_template["segments"]):
+            rhythm_template = adapt_rhythm_template_to_segments(_base_template, _num_segs)
+            print(f"🔄 节奏模板适配：从 {len(_base_template['segments'])} 段 → {_num_segs} 段")
+        else:
+            rhythm_template = _base_template
+        if reference_profile:
+            rhythm_template = _fit_rhythm_template_to_net_duration(
+                rhythm_template,
+                float(reference_profile.get("recommended_main_duration") or 0.0),
+            )
     _rhythm_name = rhythm_template["name"]
     _rhythm_transition = rhythm_template["transition_duration"]
     _rhythm_pace = rhythm_template["pace_style"]
@@ -4969,7 +5619,7 @@ def run_generation_pipeline(
     _over_limit_segs = [
         seg for seg in rhythm_template["segments"]
         if seg["duration"] > _kling_max_seg_dur
-    ]
+    ] if not local_asset_mode else []
     if _over_limit_segs:
         print("\n⚠️  [P1-2] 节奏模板时长警告：")
         print(f"   可灵生成时长：{duration}s，变速下限 0.5x，单段最多延长至 {_kling_max_seg_dur:.1f}s")
@@ -5007,12 +5657,53 @@ def run_generation_pipeline(
             "Do not invent additional named characters. "
             "Ambient entities may appear only as background detail."
         ).strip()
-    ad_script = generate_ad_script(
-        product_info,
-        style=script_style,
-        hook_type=hook_type,
-        num_segments=_num_segs,
-    )
+    if local_asset_mode:
+        voice, _script_voice_reason = recommend_voice_for_narration(
+            product_info,
+            [],
+            requested_voice=voice,
+            creative_profile=asset_creative_profile,
+        )
+        _script_voice_rate = int(VOICE_PRESETS[voice]["rate"])
+        ad_script = build_material_constrained_script(
+            product_info=product_info,
+            coverage=local_asset_index.get("coverage", {}) if local_asset_index else {},
+            num_segments=_num_segs,
+            script_style=script_style,
+            asset_index=local_asset_index,
+            segment_durations={
+                int(segment["index"]): float(segment["duration"])
+                for segment in rhythm_template["segments"]
+            },
+            narration_contract={
+                "voice": voice,
+                "rate": _script_voice_rate,
+                "max_units_per_second": _script_voice_rate / 50.0,
+                "transition_duration": float(rhythm_template["transition_duration"]),
+            },
+        )
+    else:
+        ad_script = generate_ad_script(
+            product_info,
+            style=script_style,
+            hook_type=hook_type,
+            num_segments=_num_segs,
+        )
+    if local_asset_mode:
+        for rhythm_segment, script_segment in zip(
+            rhythm_template["segments"],
+            ad_script.get("segments", []),
+        ):
+            rhythm_segment["type"] = str(script_segment.get("narrative") or "product_showcase")
+            rhythm_segment["purpose"] = str(
+                script_segment.get("marketing_intent") or "value"
+            )
+        print("🧭 素材驱动叙事重规划：")
+        for segment in rhythm_template["segments"]:
+            print(
+                f"    [{segment['index']}] {segment['duration']:>5.2f}s  "
+                f"{segment['type']:<18s}  {segment['purpose']}"
+            )
     # 将音乐合同注入 story_world，供 build_story_driven_prompts 使用
     if isinstance(ad_script, dict):
         _sw = ad_script.setdefault("story_world", {})
@@ -5066,7 +5757,7 @@ def run_generation_pipeline(
     if _story_check["warnings"]:
         for _w in _story_check["warnings"]:
             print(f"    ⚠️  {_w}")
-    if not _story_check["passed"] and strict_mode and not preview:
+    if not _story_check["passed"] and strict_mode and not preview and not local_asset_mode:
         raise RuntimeError(
             f"剧情完整性校验失败（{_story_score_pct}%）：缺失叙事节拍 {_story_check['missing_beats']}。"
             "请优化脚本后重新生成，或使用 --no-strict 跳过校验。"
@@ -5091,45 +5782,48 @@ def run_generation_pipeline(
 
     # ── 故事板预可视化验证：生成分镜结构并校验质量 ──
     storyboard = None
-    try:
-        from storyboard_generator import StoryboardGenerator
-        _sb_gen = StoryboardGenerator()
-        _sb_segments = ad_script.get("segments", []) if isinstance(ad_script, dict) else []
-        if _sb_segments:
-            _char_roles_for_sb = []
-            if character_bibles:
-                from character_analyzer import CharacterRole, CharacterType
-                for i, cb in enumerate(character_bibles):
-                    _ctype = CharacterType.PROTAGONIST if i == 0 else CharacterType.SUPPORTING
-                    _char_roles_for_sb.append(CharacterRole(
-                        role_id=cb.get("id", f"char_{i+1:02d}"),
-                        name=cb.get("name", f"角色{i+1}"),
-                        character_type=_ctype,
-                        description=cb.get("outfit", "") or cb.get("appearance", ""),
-                        gender=cb.get("gender", "person"),
-                        age_range=cb.get("age", "adult"),
-                        relationship_to_protagonist="self" if i == 0 else "supporting",
-                        appearance_requirements=cb.get("appearance", "") or character_bible_to_prompt(cb),
-                        consistency_level=0.9 if i == 0 else 0.7,
-                    ))
-            _prod_bible_for_sb = product_bible if product_bible else {}
-            storyboard = _sb_gen.generate_from_script(
-                ad_script=ad_script,
-                character_roles=_char_roles_for_sb if _char_roles_for_sb else None,
-                product_bible=_prod_bible_for_sb,
-                style=style if style != DEFAULT_CINEMATIC_STYLE else "cinematic",
-                character_bibles=character_bibles,
-            )
-            if storyboard and storyboard.shots:
-                _sb_issues = _validate_storyboard_quality(storyboard, product_info)
-                if _sb_issues:
-                    print(f"📋 故事板质量预警（{len(_sb_issues)} 项）：")
-                    for _sbi in _sb_issues[:5]:
-                        print(f"    ⚠️  {_sbi}")
-                else:
-                    print(f"📋 故事板预验证通过：{len(storyboard.shots)} 个分镜，总时长 {storyboard.total_duration:.1f}s")
-    except Exception as _sb_err:
-        print(f"⚠️  故事板预验证跳过：{_sb_err}")
+    if local_asset_mode:
+        print("🎞️ 本地素材模式：跳过 AI 生成故事板与人物角色推断")
+    else:
+        try:
+            from storyboard_generator import StoryboardGenerator
+            _sb_gen = StoryboardGenerator()
+            _sb_segments = ad_script.get("segments", []) if isinstance(ad_script, dict) else []
+            if _sb_segments:
+                _char_roles_for_sb = []
+                if character_bibles:
+                    from character_analyzer import CharacterRole, CharacterType
+                    for i, cb in enumerate(character_bibles):
+                        _ctype = CharacterType.PROTAGONIST if i == 0 else CharacterType.SUPPORTING
+                        _char_roles_for_sb.append(CharacterRole(
+                            role_id=cb.get("id", f"char_{i+1:02d}"),
+                            name=cb.get("name", f"角色{i+1}"),
+                            character_type=_ctype,
+                            description=cb.get("outfit", "") or cb.get("appearance", ""),
+                            gender=cb.get("gender", "person"),
+                            age_range=cb.get("age", "adult"),
+                            relationship_to_protagonist="self" if i == 0 else "supporting",
+                            appearance_requirements=cb.get("appearance", "") or character_bible_to_prompt(cb),
+                            consistency_level=0.9 if i == 0 else 0.7,
+                        ))
+                _prod_bible_for_sb = product_bible if product_bible else {}
+                storyboard = _sb_gen.generate_from_script(
+                    ad_script=ad_script,
+                    character_roles=_char_roles_for_sb if _char_roles_for_sb else None,
+                    product_bible=_prod_bible_for_sb,
+                    style=style if style != DEFAULT_CINEMATIC_STYLE else "cinematic",
+                    character_bibles=character_bibles,
+                )
+                if storyboard and storyboard.shots:
+                    _sb_issues = _validate_storyboard_quality(storyboard, product_info)
+                    if _sb_issues:
+                        print(f"📋 故事板质量预警（{len(_sb_issues)} 项）：")
+                        for _sbi in _sb_issues[:5]:
+                            print(f"    ⚠️  {_sbi}")
+                    else:
+                        print(f"📋 故事板预验证通过：{len(storyboard.shots)} 个分镜，总时长 {storyboard.total_duration:.1f}s")
+        except Exception as _sb_err:
+            print(f"⚠️  故事板预验证跳过：{_sb_err}")
 
     # 从脚本生成分镜 Prompts
     # 改动2：优先使用故事驱动 prompt 组装（build_story_driven_prompts）
@@ -5184,6 +5878,14 @@ def run_generation_pipeline(
             else:
                 clip_prompts.append(styled)
 
+    if local_asset_mode:
+        clip_prompts = [
+            seg.get("visual_requirement") or seg.get("scene_prompt") or seg.get("subtitle") or "local product ad material"
+            for seg in ad_script.get("segments", [])
+        ]
+        storyboard = None
+        print(f"📦 本地素材约束 Prompt 已生成（{len(clip_prompts)} 段）")
+
     if style != DEFAULT_CINEMATIC_STYLE:
         style_name = CINEMATIC_STYLES.get(style, {}).get("name", style)
         print(f"🎬 电影风格注入：{style_name}（影响 {len(clip_prompts)} 个片段的运镜与光影）")
@@ -5236,21 +5938,24 @@ def run_generation_pipeline(
         print(f"   含字幕/口播/BGM，快速预览整体效果")
         print(f"   确认效果 OK 后，去掉 --preview 重新生成完整 5 段 pro 版本")
 
-    _preflight_generation_contract(
-        product_info=product_info,
-        ad_script=ad_script,
-        clip_prompts=clip_prompts,
-        product_image_path=product_image_path,
-        char_refs=char_refs,
-        strict_mode=strict_mode and not preview,
-    )
+    if local_asset_mode:
+        print("🧪 本地素材模式：跳过可灵生成前置合约校验")
+    else:
+        _preflight_generation_contract(
+            product_info=product_info,
+            ad_script=ad_script,
+            clip_prompts=clip_prompts,
+            product_image_path=product_image_path,
+            char_refs=char_refs,
+            strict_mode=strict_mode and not preview,
+        )
 
     # ── 成本预估 ──
     _cost_info = estimate_cost(
         mode=mode,
         duration_per_clip=duration,
         num_clips=len(clip_prompts),
-        num_characters=len(char_refs) if char_refs else 1,
+        num_characters=0 if local_asset_mode else len(char_refs) if char_refs else 1,
         best_of=best_of,
         image_first_segments=_estimate_image_first_segment_count(
             len(clip_prompts),
@@ -5265,20 +5970,33 @@ def run_generation_pipeline(
     # 在生成视频前进行全面预检，消除质量隐患，避免成本浪费
     char_image_paths = [Path(c["image_path"]) for c in char_refs if c.get("image_path")] if char_refs else []
 
-    quality_gate_result = run_quality_gate(
-        ad_script=ad_script,
-        product_image_path=product_image_path,
-        character_image_paths=char_image_paths,
-        prompts=clip_prompts,
-        character_bible=character_bibles[0] if character_bibles else None,
-        product_bible=product_bible,
-        scene_continuity_config=SCENE_CONTINUITY_CONFIG,
-        num_clips=len(clip_prompts),
-        duration_per_clip=duration,
-        mode=mode,
-    )
+    if local_asset_mode:
+        from types import SimpleNamespace
+        quality_gate_result = SimpleNamespace(
+            optimized_prompts=[],
+            optimized_negative_prompt=None,
+            preprocessed_reference_images=[],
+            reference_checks=[],
+            reference_dedup_removed=[],
+            reference_sort_notes=[],
+            passed=True,
+        )
+        print("🔍 本地素材模式：跳过 AI 生成质量门，改用素材匹配置信度门槛")
+    else:
+        quality_gate_result = run_quality_gate(
+            ad_script=ad_script,
+            product_image_path=product_image_path,
+            character_image_paths=char_image_paths,
+            prompts=clip_prompts,
+            character_bible=character_bibles[0] if character_bibles else None,
+            product_bible=product_bible,
+            scene_continuity_config=SCENE_CONTINUITY_CONFIG,
+            num_clips=len(clip_prompts),
+            duration_per_clip=duration,
+            mode=mode,
+        )
 
-    print_quality_gate_report(quality_gate_result)
+        print_quality_gate_report(quality_gate_result)
 
     # ── 自动应用 Prompt 优化 ──
     # 质量门检测出的 prompt 问题，能自动修的直接修，修完替换原始 prompt
@@ -5374,7 +6092,7 @@ def run_generation_pipeline(
     approved_keyframes: Dict[int, Path] = {}
     image_first_result = None
 
-    if image_first and preflight_keyframe and strict_mode and not preview:
+    if image_first and preflight_keyframe and strict_mode and not preview and not local_asset_mode:
         try:
             image_first_mode_enum = ImageFirstMode((image_first_mode or "standard").lower())
         except ValueError:
@@ -5400,17 +6118,22 @@ def run_generation_pipeline(
         if not image_first_result.can_proceed_to_video:
             raise RuntimeError("图片先行验证未通过，已阻止进入高成本视频生成")
         approved_keyframes = dict(image_first_result.best_keyframes)
+    elif local_asset_mode:
+        print("🖼️ 本地素材模式：跳过图片先行与首帧预检")
     elif preview:
         print("⚡ 预览模式：跳过图片先行验证，直接进入视频生成")
 
-    workflow_decision_result = _run_pre_generation_smart_decision(
-        quality_gate_result,
-        product_info,
-        style=style,
-        budget=_cost_info.get("estimated_cost", _get_cost_budget_limit()),
-        image_first_result=image_first_result,
-        preview=preview,
-    )
+    if local_asset_mode:
+        workflow_decision_result = None
+    else:
+        workflow_decision_result = _run_pre_generation_smart_decision(
+            quality_gate_result,
+            product_info,
+            style=style,
+            budget=_cost_info.get("estimated_cost", _get_cost_budget_limit()),
+            image_first_result=image_first_result,
+            preview=preview,
+        )
 
     clip_paths = []
     scene_anchor_frames = []  # 全局场景锚点（从第 1 段提取，所有后续段都参考）
@@ -6055,142 +6778,278 @@ def run_generation_pipeline(
 
         return clip_path
 
-    # ── 第 1 段：串行生成，用于提取全局场景锚点 ──
-    # P1 #2（v2）：用 1-based 的 i 追踪成功段，段索引 = i-1（0-based）
-    successful_clip_indices = [0]  # 第 1 段固定在此初始化；若失败则下方会抛异常
-    _sep = "=" * 50
-    print(f"\n{_sep}")
-    print(f"🎬 片段 1/{total_clips}（串行）：{clip_prompts[0][:60]}...")
-    print(_sep)
-    # 问题2修复：第1段失败时用清晰的 RuntimeError，而不是让异常向上抳潮成模糊的崩溃信息
-    try:
-        first_clip = _generate_one_clip(1, clip_prompts[0])
-    except Exception as e:
-        raise RuntimeError(
-            f"第 1 段视频生成失败（该段为场景锚点来源，不可跳过）：{e}"
-        ) from e
-    clip_paths.append(first_clip)
-    elapsed = time.time() - generation_start
-    print(f"  ✅ 片段 1/{total_clips} 完成 | 已用 {int(elapsed)}s")
+    if local_asset_mode:
+        if use_voiceover:
+            local_one_take_master = final_dir / f"{output_name}_voiceover_master.m4a"
+            local_one_take_timeline = _prepare_local_one_take_master(
+                ad_script=ad_script,
+                asset_index=local_asset_index or {},
+                product_info=product_info,
+                requested_voice=voice,
+                creative_profile=asset_creative_profile,
+                reference_profile=reference_profile,
+                transition_duration=float(scene_cfg.get("transition_duration") or 0.0),
+                output_path=local_one_take_master,
+            )
+            voice = str(local_one_take_timeline["voice"])
+            def _apply_one_take_timeline() -> None:
+                duration_by_segment = local_one_take_timeline["clip_durations"]
+                for rhythm_segment in rhythm_template["segments"]:
+                    segment_index = int(rhythm_segment["index"])
+                    rhythm_segment["duration"] = float(duration_by_segment[segment_index])
+                rhythm_template["total_duration"] = float(local_one_take_timeline["main_duration"])
+                rhythm_template["actual_total_duration"] = float(local_one_take_timeline["main_duration"])
+                rhythm_template["duration_source"] = "single_take_tts_timeline"
 
-    # 提取全局场景锚点
-    if scene_cfg.get("use_scene_anchor", True):
-        print("  🎬 提取全局场景锚点...")
-        scene_anchor_frames = _build_scene_anchor(
-            first_clip,
-            clips_dir,
-            num_keyframes=scene_cfg.get("anchor_keyframes", 2),
+            _apply_one_take_timeline()
+            print(
+                f"✅ 单条口播母带：{local_one_take_timeline['audio_duration']:.2f}s，"
+                f"主片 {local_one_take_timeline['main_duration']:.2f}s，"
+                f"CTA {local_one_take_timeline['outro_duration']:.2f}s"
+            )
+            for line in local_one_take_timeline["voiceover_lines"]:
+                print(
+                    f"    [{line['segment']}] {line['start']:.2f}-{line['end']:.2f}s  {line['text']}"
+                )
+        print("\n🎞️ 本地素材选片：根据素材约束脚本自动匹配片段")
+        from local_asset_pipeline import LocalAssetError, plan_and_materialize_local_clips
+
+        if local_one_take_timeline:
+            plan_and_materialize_local_clips(
+                asset_index=local_asset_index or {},
+                ad_script=ad_script,
+                rhythm_template=rhythm_template,
+                clips_dir=clips_dir / f"{output_name}_local_assets",
+                final_dir=final_dir,
+                output_name=output_name,
+                product_info=product_info,
+                plan_only=True,
+                record_failure=False,
+            )
+
+        local_asset_result = plan_and_materialize_local_clips(
+            asset_index=local_asset_index or {},
+            ad_script=ad_script,
+            rhythm_template=rhythm_template,
+            clips_dir=clips_dir / f"{output_name}_local_assets",
+            final_dir=final_dir,
+            output_name=output_name,
+            product_info=product_info,
         )
-        if scene_anchor_frames:
-            print(f"    ✅ 场景锚点已建立：{len(scene_anchor_frames)} 张关键帧")
+        clip_paths = local_asset_result["clip_paths"]
+        successful_clip_indices = local_asset_result.get(
+            "edit_indices",
+            list(range(len(clip_paths))),
+        )
+        local_edit_semantic_indices = local_asset_result.get(
+            "semantic_indices",
+            list(successful_clip_indices),
+        )
+        local_asset_edit_report = local_asset_result.get("edit_decision_report")
+        local_asset_frame_evidence_report = local_asset_result.get("frame_evidence_report")
+        selected_material_segments = local_asset_result.get("selected_segments") or []
+        asset_creative_profile = (
+            local_asset_result.get("creative_profile") or asset_creative_profile
+        )
+        music_contract = build_music_contract(
+            product_info,
+            cinematic_style=style,
+            asset_creative_profile=asset_creative_profile,
+        )
+        scene_cfg["transition_duration"] = float(
+            asset_creative_profile["transition_base_duration"]
+        )
+        from postproduction_contract import (
+            build_local_postproduction_contract,
+            write_postproduction_contract,
+        )
+        postproduction_contract = build_local_postproduction_contract(
+            selected_segments=selected_material_segments,
+            creative_profile=asset_creative_profile,
+            music_contract=music_contract,
+            reference_profile=reference_profile or {},
+        )
+        postproduction_contract["story_contract"] = local_story_contract
+        postproduction_contract_path = write_postproduction_contract(
+            postproduction_contract,
+            final_dir / f"{output_name}_postproduction_contract.json",
+        )
+        expected_segments = len(ad_script.get("segments", [])) if isinstance(ad_script, dict) else len(clip_paths)
+        total_clips = len(clip_paths)
+        seg_indices_for_subtitles = None
+        rhythm_template = {
+            **rhythm_template,
+            "segments": [
+                {
+                    "index": int(selected["edit_index"]),
+                    "duration": float(selected["target_duration"]),
+                    "type": str(selected.get("narrative") or "showcase"),
+                    "narrative": str(selected.get("narrative") or "showcase"),
+                    "purpose": str(selected.get("product_story_role") or ""),
+                    "semantic_segment": int(selected["semantic_segment"]),
+                }
+                for selected in selected_material_segments
+            ],
+            "total_duration": sum(
+                float(selected["target_duration"])
+                for selected in selected_material_segments
+            ),
+            "actual_total_duration": sum(
+                float(selected["target_duration"])
+                for selected in selected_material_segments
+            ),
+            "duration_source": "single_take_tts_edit_clip_timeline",
+        }
+        print(
+            f"✅ 本地素材选片完成：{expected_segments} 个语义段 / "
+            f"{len(clip_paths)} 个实际镜头"
+        )
+        print(
+            f"🎛️ 选片后视听合同：{music_contract['bpm_min']}-{music_contract['bpm_max']} BPM / "
+            f"{music_contract['energy']} / SFX {music_contract['sfx_intensity']}"
+        )
+        if local_asset_edit_report:
+            print(f"📄 剪辑决策报告：{Path(local_asset_edit_report).name}")
+        if local_asset_frame_evidence_report:
+            print(f"🔬 素材帧证据审计：{Path(local_asset_frame_evidence_report).name}")
+        print(f"🎛️ 素材驱动后期合同：{Path(postproduction_contract_path).name}")
+    else:
+        # ── 第 1 段：串行生成，用于提取全局场景锚点 ──
+        # P1 #2（v2）：用 1-based 的 i 追踪成功段，段索引 = i-1（0-based）
+        successful_clip_indices = [0]  # 第 1 段固定在此初始化；若失败则下方会抛异常
+        _sep = "=" * 50
+        print(f"\n{_sep}")
+        print(f"🎬 片段 1/{total_clips}（串行）：{clip_prompts[0][:60]}...")
+        print(_sep)
+        # 问题2修复：第1段失败时用清晰的 RuntimeError，而不是让异常向上抳潮成模糊的崩溃信息
+        try:
+            first_clip = _generate_one_clip(1, clip_prompts[0])
+        except Exception as e:
+            raise RuntimeError(
+                f"第 1 段视频生成失败（该段为场景锚点来源，不可跳过）：{e}"
+            ) from e
+        clip_paths.append(first_clip)
+        elapsed = time.time() - generation_start
+        print(f"  ✅ 片段 1/{total_clips} 完成 | 已用 {int(elapsed)}s")
 
-    # ── 第 2-N 段：并行或串行生成 ──
-    # 并行模式：只使用商品/人物参考图和场景锚点，不再把第 1 段尾帧当作所有后续段的上一帧。
-    # 串行模式：每段动态传前一段路径，极致一致性
-    remaining_prompts = clip_prompts[1:]
-    if remaining_prompts:
-        failed_indices = []
+        # 提取全局场景锚点
+        if scene_cfg.get("use_scene_anchor", True):
+            print("  🎬 提取全局场景锚点...")
+            scene_anchor_frames = _build_scene_anchor(
+                first_clip,
+                clips_dir,
+                num_keyframes=scene_cfg.get("anchor_keyframes", 2),
+            )
+            if scene_anchor_frames:
+                print(f"    ✅ 场景锚点已建立：{len(scene_anchor_frames)} 张关键帧")
 
-        if parallel:
-            print(f"\n🎬 并行生成剩余 {len(remaining_prompts)} 个片段（最大并发 {max_workers}）...")
-            print("   模式：商品/人物参考图 + 全局场景锚点（不使用伪上一帧，降低冲突）")
+        # ── 第 2-N 段：并行或串行生成 ──
+        # 并行模式：只使用商品/人物参考图和场景锚点，不再把第 1 段尾帧当作所有后续段的上一帧。
+        # 串行模式：每段动态传前一段路径，极致一致性
+        remaining_prompts = clip_prompts[1:]
+        if remaining_prompts:
+            failed_indices = []
 
-            # 构建并行任务参数（idx 是 1-based）
-            tasks = []
-            for i, prompt in enumerate(remaining_prompts, 2):
-                tasks.append({"idx": i, "prompt": prompt})
+            if parallel:
+                print(f"\n🎬 并行生成剩余 {len(remaining_prompts)} 个片段（最大并发 {max_workers}）...")
+                print("   模式：商品/人物参考图 + 全局场景锚点（不使用伪上一帧，降低冲突）")
 
-            # 线程安全的进度追踪
-            _status_lock = Lock()
-            _clip_status: Dict[int, str] = {t["idx"]: "排队中" for t in tasks}
-            _results: Dict[int, Optional[Path]] = {}
+                # 构建并行任务参数（idx 是 1-based）
+                tasks = []
+                for i, prompt in enumerate(remaining_prompts, 2):
+                    tasks.append({"idx": i, "prompt": prompt})
 
-            def _parallel_worker(task: dict) -> tuple:
-                idx = task["idx"]
-                prompt = task["prompt"]
-                with _status_lock:
-                    _clip_status[idx] = "生成中"
-                try:
-                    path = _generate_one_clip(idx, prompt, None, None)
+                # 线程安全的进度追踪
+                _status_lock = Lock()
+                _clip_status: Dict[int, str] = {t["idx"]: "排队中" for t in tasks}
+                _results: Dict[int, Optional[Path]] = {}
+
+                def _parallel_worker(task: dict) -> tuple:
+                    idx = task["idx"]
+                    prompt = task["prompt"]
                     with _status_lock:
-                        _clip_status[idx] = "完成"
-                        _results[idx] = path
-                    elapsed = time.time() - generation_start
-                    done = sum(1 for v in _results.values() if v is not None)
-                    total_remaining = len(tasks) - done
-                    # 打印单段完成进度
-                    print(f"  ✅ 片段 {idx}/{total_clips} 完成 | 已用 {int(elapsed)}s | 还剩 {total_remaining} 段")
-                    return (idx, path, None)
-                except Exception as e:
-                    with _status_lock:
-                        _clip_status[idx] = f"失败: {e}"
-                        _results[idx] = None
-                    print(f"  ❌ 片段 {idx} 失败：{e}")
-                    return (idx, None, e)
+                        _clip_status[idx] = "生成中"
+                    try:
+                        path = _generate_one_clip(idx, prompt, None, None)
+                        with _status_lock:
+                            _clip_status[idx] = "完成"
+                            _results[idx] = path
+                        elapsed = time.time() - generation_start
+                        done = sum(1 for v in _results.values() if v is not None)
+                        total_remaining = len(tasks) - done
+                        # 打印单段完成进度
+                        print(f"  ✅ 片段 {idx}/{total_clips} 完成 | 已用 {int(elapsed)}s | 还剩 {total_remaining} 段")
+                        return (idx, path, None)
+                    except Exception as e:
+                        with _status_lock:
+                            _clip_status[idx] = f"失败: {e}"
+                            _results[idx] = None
+                        print(f"  ❌ 片段 {idx} 失败：{e}")
+                        return (idx, None, e)
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [executor.submit(_parallel_worker, t) for t in tasks]
-                for future in as_completed(futures):
-                    idx, path, err = future.result()
-                    # 结果已在 worker 中写入 _results
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = [executor.submit(_parallel_worker, t) for t in tasks]
+                    for future in as_completed(futures):
+                        idx, path, err = future.result()
+                        # 结果已在 worker 中写入 _results
 
-            # 按索引顺序收集成功的片段
-            for i in range(2, total_clips + 1):
-                path = _results.get(i)
-                if path is not None:
-                    clip_paths.append(path)
-                    successful_clip_indices.append(i - 1)
-                else:
-                    failed_indices.append(i)
+                # 按索引顺序收集成功的片段
+                for i in range(2, total_clips + 1):
+                    path = _results.get(i)
+                    if path is not None:
+                        clip_paths.append(path)
+                        successful_clip_indices.append(i - 1)
+                    else:
+                        failed_indices.append(i)
 
-        else:
-            # ── 串行模式（极致一致性）──
-            print(f"\n🎬 串行生成剩余 {len(remaining_prompts)} 个片段（prev 动态更新）...")
-            for i, prompt in enumerate(remaining_prompts, 2):
-                prev = clip_paths[-1] if clip_paths else None
-                print(f"\n{_sep}")
-                print(f"🎬 片段 {i}/{total_clips}：{prompt[:60]}...")
-                print(_sep)
-                try:
-                    path = _generate_one_clip(i, prompt, prev)
-                    clip_paths.append(path)
-                    successful_clip_indices.append(i - 1)  # i 是 1-based，段索引 = i-1
-                    elapsed = time.time() - generation_start
-                    done = len(clip_paths)
-                    remaining_count = total_clips - done
-                    avg = elapsed / done if done > 0 else 0
-                    eta = avg * remaining_count
-                    eta_str = f"{int(eta//60)}分{int(eta%60)}秒" if eta > 60 else f"{int(eta)}秒"
-                    print(f"  ✅ 片段 {i}/{total_clips} 完成 | 已用 {int(elapsed)}s | 预计还需 {eta_str}")
-                except Exception as e:
-                    print(f"  ❌ 片段 {i} 失败：{e}")
-                    failed_indices.append(i)
-                    # 单段失败不立即崩溃，继续尝试后续片段
+            else:
+                # ── 串行模式（极致一致性）──
+                print(f"\n🎬 串行生成剩余 {len(remaining_prompts)} 个片段（prev 动态更新）...")
+                for i, prompt in enumerate(remaining_prompts, 2):
+                    prev = clip_paths[-1] if clip_paths else None
+                    print(f"\n{_sep}")
+                    print(f"🎬 片段 {i}/{total_clips}：{prompt[:60]}...")
+                    print(_sep)
+                    try:
+                        path = _generate_one_clip(i, prompt, prev)
+                        clip_paths.append(path)
+                        successful_clip_indices.append(i - 1)  # i 是 1-based，段索引 = i-1
+                        elapsed = time.time() - generation_start
+                        done = len(clip_paths)
+                        remaining_count = total_clips - done
+                        avg = elapsed / done if done > 0 else 0
+                        eta = avg * remaining_count
+                        eta_str = f"{int(eta//60)}分{int(eta%60)}秒" if eta > 60 else f"{int(eta)}秒"
+                        print(f"  ✅ 片段 {i}/{total_clips} 完成 | 已用 {int(elapsed)}s | 预计还需 {eta_str}")
+                    except Exception as e:
+                        print(f"  ❌ 片段 {i} 失败：{e}")
+                        failed_indices.append(i)
+                        # 单段失败不立即崩溃，继续尝试后续片段
 
-        if failed_indices:
-            success_count = len(clip_paths)
-            print(f"\n⚠️  {len(failed_indices)} 个片段生成失败：{failed_indices}")
-            print(f"   成功片段数：{success_count}/{total_clips}")
-            if strict_mode and not preview:
-                raise RuntimeError(
-                    f"发布级成片要求分镜完整，但片段 {failed_indices} 生成失败。"
-                    "已阻断缺段合成，避免丢失产品展示、效果证明或 CTA。"
-                )
-            # 最少成功段数（默认 3，即 60%）
-            min_required = max(2, min_clips)
-            if success_count < min_required:
-                raise RuntimeError(
-                    f"片段生成失败过多（成功 {success_count}/{total_clips}，需要 ≥{min_required} 段），无法继续合成"
-                )
-            print(f"   成功片段 ≥{min_required}，继续后续合成流程（将跳过失败片段）")
+            if failed_indices:
+                success_count = len(clip_paths)
+                print(f"\n⚠️  {len(failed_indices)} 个片段生成失败：{failed_indices}")
+                print(f"   成功片段数：{success_count}/{total_clips}")
+                if strict_mode and not preview:
+                    raise RuntimeError(
+                        f"发布级成片要求分镜完整，但片段 {failed_indices} 生成失败。"
+                        "已阻断缺段合成，避免丢失产品展示、效果证明或 CTA。"
+                    )
+                # 最少成功段数（默认 3，即 60%）
+                min_required = max(2, min_clips)
+                if success_count < min_required:
+                    raise RuntimeError(
+                        f"片段生成失败过多（成功 {success_count}/{total_clips}，需要 ≥{min_required} 段），无法继续合成"
+                    )
+                print(f"   成功片段 ≥{min_required}，继续后续合成流程（将跳过失败片段）")
 
-    # 部分成功时，seg_indices 记录实际成功的段索引（用于字幕/口播/音效对齐）
-    # 全部成功时设为 None，退化到原有逻辑，避免不必要的白名单过滤
-    seg_indices_for_subtitles = (
-        successful_clip_indices if len(successful_clip_indices) < total_clips else None
-    )
+        # 部分成功时，seg_indices 记录实际成功的段索引（用于字幕/口播/音效对齐）
+        # 全部成功时设为 None，退化到原有逻辑，避免不必要的白名单过滤
+        seg_indices_for_subtitles = (
+            successful_clip_indices if len(successful_clip_indices) < total_clips else None
+        )
 
-    print(f"\n✅ 成功生成 {len(clip_paths)}/{total_clips} 个片段")
+        print(f"\n✅ 成功生成 {len(clip_paths)}/{total_clips} 个片段")
 
     # 清理关键帧临时文件
     _cleanup_keyframes(clips_dir, output_name)
@@ -6199,7 +7058,7 @@ def run_generation_pipeline(
     # 片段色调一致性匹配
     # ============================================================
     # 以第一段为参考，匹配后续片段的亮度和色偏，减少跳切感
-    if len(clip_paths) > 1:
+    if len(clip_paths) > 1 and not local_asset_mode:
         print()
         print("🎨 片段色调一致性匹配...")
         color_match_dir = clips_dir / f"{output_name}_color_matched"
@@ -6221,7 +7080,7 @@ def run_generation_pipeline(
             _consistency_warnings: list = []
 
             with _cc_tmp.TemporaryDirectory(prefix="cc_qc_") as _cc_dir:
-                for _cc_i, _cc_clip in enumerate(clip_paths):
+                for _cc_i, _cc_clip in enumerate([] if local_asset_mode else clip_paths):
                     try:
                         _cc_dur = _get_clip_duration(_cc_clip)
                         _cc_t = _cc_dur * 0.5
@@ -6254,7 +7113,9 @@ def run_generation_pipeline(
                     except Exception:
                         pass
 
-            if not _consistency_warnings:
+            if local_asset_mode:
+                print("   🎞️ 本地素材模式：跳过人物肤色一致性检测")
+            elif not _consistency_warnings:
                 print("   ✅ P0-B 跨片段一致性校验通过")
         except Exception as _cc_err:
             _consistency_warnings = []
@@ -6322,6 +7183,8 @@ def run_generation_pipeline(
                 print(f"✅ 拼接前直方图均衡完成")
         except Exception as _f4_err:
             print(f"  ⚠️  F4 直方图均衡失败（{_f4_err}），跳过")
+    elif local_asset_mode:
+        print("🎨 本地素材保护：保留原始产地/原料/产品镜头色彩，不做跨场景强制匹配")
 
     # ============================================================
     # 片段时长适配节奏模板（裁切/变速到目标时长）
@@ -6356,7 +7219,14 @@ def run_generation_pipeline(
             # 检查是否需要调整（差异 > 0.2s 才调，避免不必要的重编码）
             try:
                 _orig_dur = _get_clip_duration(_clip_path)
-                if abs(_orig_dur - _target_dur) > 0.2:
+                if local_asset_mode:
+                    if _orig_dur + 0.08 < _target_dur:
+                        raise RuntimeError(
+                            f"本地素材镜头 {_orig_idx} 实测 {_orig_dur:.2f}s 短于规划 "
+                            f"{_target_dur:.2f}s；禁止通过变速或冻结补时"
+                        )
+                    _adjusted_paths.append(_clip_path)
+                elif abs(_orig_dur - _target_dur) > 0.2:
                     # Bug #3 修复：透传叙事类型，让 hook 段从头裁保留开头精华帧
                     _narrative = _target_seg.get("narrative", _target_seg.get("type", "showcase"))
                     adjust_clip_duration(
@@ -6406,7 +7276,9 @@ def run_generation_pipeline(
         print("🔍 开始分段语义质量检测...")
         _check_segment_semantic_quality(
             clip_paths=clip_paths,
-            successful_clip_indices=_seg_indices_list,
+            successful_clip_indices=(
+                local_edit_semantic_indices if local_asset_mode else _seg_indices_list
+            ),
             ad_script=ad_script,
             product_image_path=product_image_path,
             main_char_path=main_char_path,
@@ -6419,47 +7291,115 @@ def run_generation_pipeline(
     # ============================================================
     merged_path = final_dir / f"{output_name}_merged.mp4"
 
-    # 选择 BGM：优先从 freetouse 按品类+电影风格+节奏自动选曲，失败则 fallback 到本地文件
-    # 用节奏模板计算实际总时长（考虑转场重叠
-    _timeline_for_bgm = compute_segment_timeline(rhythm_template, seg_indices=seg_indices_for_subtitles)
-    total_video_duration = _timeline_for_bgm[-1]["end"] if _timeline_for_bgm else len(clip_paths) * duration
     product_type = product_info.get("type", "default")
 
-    # Bug4 修复：BGM pace 从节奏模板的 pace_style 推断，而非静态读 CLIP_STRUCTURE
-    # _rhythm_pace 已在 L1834 从 rhythm_template 中取出，与画面节奏保持一致
+    # 本地素材使用选中镜头的动态分析；生成素材使用节奏模板。
     _pace_map = {"fast": "fast", "moderate": "medium", "cinematic": "slow"}
-    _rhythm_pace_for_bgm = _pace_map.get(_rhythm_pace)
+    _rhythm_pace_for_bgm = _pace_map.get(
+        music_contract["recommended_pace"] if local_asset_mode else _rhythm_pace
+    )
     if _rhythm_pace_for_bgm:
         pace = _rhythm_pace_for_bgm
     else:
         from config import CLIP_STRUCTURE
         pace = _detect_pace_from_clips(CLIP_STRUCTURE)
 
-    # 改动4：cinematic_style 已传入，pick_bgm_for_product 内部按风格优先匹配 BGM
-    # _av_style bgm_keywords 已打印到日志供调试参考
-    bgm_file = pick_bgm_for_product(
-        product_type,
-        target_duration=total_video_duration,
-        cinematic_style=style,
-        pace=pace,
-        music_contract=music_contract,
-    )
-
-    if not bgm_file:
-        # fallback 到本地 BGM 文件
-        local_bgm = PROJECT_ROOT / BGM_PATH
-        if local_bgm.exists():
-            bgm_file = local_bgm
-            print(f"🎵 使用本地 BGM：{BGM_PATH}")
-        else:
-            print("⚠️  未找到 BGM，将生成无声视频")
-            bgm_file = None  # 明确设为 None
-
-    bgm_available = bgm_file is not None and Path(bgm_file).exists()
+    bgm_file = None
     fallback_audio_used = False
+    _actual_segment_timeline = []
 
-    # BGM 版权提示（B4 修复：加 try/except 防止 bgm_file 为 None 或文件不存在时 crash）
-    if bgm_available:
+    try:
+        # 智能转场：真实镜头特征 + 叙事节奏 + 候选实渲染质量验证。
+        _all_narratives = [
+            seg.get("narrative", "showcase")
+            for seg in ad_script.get("segments", [])
+        ]
+        # 按实际成功段过滤（对齐字幕/口播的 seg_indices 逻辑）
+        if local_asset_mode:
+            _success_narratives = [
+                _all_narratives[index] if 0 <= index < len(_all_narratives) else "showcase"
+                for index in local_edit_semantic_indices
+            ]
+        elif seg_indices_for_subtitles is not None:
+            _success_narratives = [
+                _all_narratives[i] if i < len(_all_narratives) else "showcase"
+                for i in sorted(seg_indices_for_subtitles)
+            ]
+        else:
+            _success_narratives = _all_narratives[:len(clip_paths)] if _all_narratives else ["showcase"] * len(clip_paths)
+
+        # 节奏风格：从节奏模板取；未知值归一为 moderate，不改变质量门槛。
+        _transition_style = _rhythm_pace if _rhythm_pace in ("fast", "moderate", "cinematic") else "moderate"
+        _base_transition_dur = scene_cfg.get("transition_duration", 0.3)
+        from intelligent_transition import (
+            TransitionLearningStore,
+            plan_intelligent_transitions,
+            write_transition_report,
+        )
+
+        _transition_learning_store = TransitionLearningStore(
+            PROJECT_ROOT / "data" / "transition_learning.db"
+        )
+        transition_decision_report = plan_intelligent_transitions(
+            clip_paths,
+            _success_narratives,
+            style=_transition_style,
+            base_duration=_base_transition_dur,
+            work_dir=clips_dir / f"{output_name}_transition_previews",
+            learning_store=_transition_learning_store,
+            verification_id=output_name,
+            max_total_overlap=(
+                max(
+                    0.0,
+                    sum(_get_clip_duration(path) for path in clip_paths)
+                    - float(local_one_take_timeline["main_duration"]),
+                )
+                if local_asset_mode and local_one_take_timeline else None
+            ),
+        )
+        scene_transitions = normalize_transition_decisions(
+            clip_paths,
+            transition_decision_report["transitions"],
+        )
+        transition_decision_report["transitions"] = scene_transitions
+        for _boundary, _decision in zip(
+            transition_decision_report.get("boundaries") or [],
+            scene_transitions,
+        ):
+            _boundary["selected"].update(_decision)
+
+        _actual_segment_timeline = compute_segment_timeline(
+            rhythm_template,
+            seg_indices=seg_indices_for_subtitles,
+            segment_durations=_seg_dur_map,
+            transitions=scene_transitions,
+        )
+        _semantic_segment_timeline = (
+            _collapse_edit_timeline_by_semantic(
+                _actual_segment_timeline,
+                local_edit_semantic_indices,
+            )
+            if local_asset_mode else _actual_segment_timeline
+        )
+        total_video_duration = (
+            _actual_segment_timeline[-1]["end"]
+            if _actual_segment_timeline
+            else len(clip_paths) * duration
+        )
+
+        # BGM 选曲必须等智能转场定稿后再执行，目标时长和节奏来自真实渲染时间轴。
+        bgm_file = pick_bgm_for_product(
+            product_type,
+            target_duration=total_video_duration,
+            cinematic_style=style,
+            pace=pace,
+            music_contract=music_contract,
+        )
+        bgm_available = bgm_file is not None and Path(bgm_file).exists()
+        if not bgm_available:
+            raise RuntimeError(
+                "BGM 不可用，已阻断不可发布成片；请配置可商用本地 BGM 或检查音乐下载服务"
+            )
         try:
             bgm_info = get_bgm_copyright_info(bgm_file)
             print(f"🎵 BGM：{bgm_info['title']}（{bgm_info['source']}）")
@@ -6468,95 +7408,42 @@ def run_generation_pipeline(
         except Exception as _bgm_info_err:
             print(f"🎵 BGM 已选定（版权信息读取失败：{_bgm_info_err}）")
 
-    # #5 修复：兜底音频必须在拼接之前生成，否则 merge_clips_ffmpeg 收到 bgm=None
-    if not bgm_available:
-        if not use_voiceover:
-            raise RuntimeError(
-                "BGM 不可用且未启用口播，无法生成可发布音频；请配置 assets/bgm.mp3 或启用 --voiceover"
-            )
+        transition_report_path = write_transition_report(
+            transition_decision_report,
+            final_dir / f"{output_name}_transition_decision_report.json",
+        )
+        if postproduction_contract:
+            from video_merger import _detect_beats as _bgm_detect_beats, _estimate_bpm as _bgm_estimate_bpm
+            _selected_bgm_bpm = _bgm_estimate_bpm(_bgm_detect_beats(Path(bgm_file)))
+            postproduction_contract["transition"]["decisions"] = scene_transitions
+            postproduction_contract["timeline"] = {
+                "basis": "ffprobe_clip_durations_and_rendered_transitions",
+                "edit_segments": _actual_segment_timeline,
+                "segments": _semantic_segment_timeline,
+                "main_duration": total_video_duration,
+            }
+            postproduction_contract["bgm"].update({
+                "selected_file": str(bgm_file),
+                "selected_title": bgm_info.get("title") if "bgm_info" in locals() else Path(bgm_file).stem,
+                "detected_bpm": _selected_bgm_bpm,
+                "pace": pace,
+                "target_duration": total_video_duration,
+            })
+
         print()
-        print("🚨 BGM 不可用，将生成极低音量占位音轨，仅用于后续口播混音")
-        try:
-            fallback_audio = final_dir / f"{output_name}_fallback_audio.m4a"
-            # 兜底音频时长按节奏模板计算（考虑转场重叠和不等长段）
-            _fb_timeline = compute_segment_timeline(rhythm_template, seg_indices=seg_indices_for_subtitles)
-            total_dur = _fb_timeline[-1]["end"] if _fb_timeline else len(clip_paths) * duration
-            generate_fallback_audio(fallback_audio, duration=total_dur)
-            bgm_file = fallback_audio
-            bgm_available = True
-            fallback_audio_used = True
-            print(f"✅ 口播混音占位音轨已生成（不可作为发布音频）")
-        except Exception as e:
-            print(f"❌ 兜底音频生成失败：{e}")
-            raise RuntimeError("BGM 不可用且口播混音占位音轨生成失败，已阻断不可发布成片") from e
-
-    try:
-        # 内容感知转场：根据脚本叙事类型序列 + 节奏风格，智能选择转场
-        # 从脚本中提取叙事类型序列
-        _all_narratives = [
-            seg.get("narrative", "showcase")
-            for seg in ad_script.get("segments", [])
-        ]
-        # 按实际成功段过滤（对齐字幕/口播的 seg_indices 逻辑）
-        if seg_indices_for_subtitles is not None:
-            _success_narratives = [
-                _all_narratives[i] if i < len(_all_narratives) else "showcase"
-                for i in sorted(seg_indices_for_subtitles)
-            ]
-        else:
-            _success_narratives = _all_narratives[:len(clip_paths)] if _all_narratives else ["showcase"] * len(clip_paths)
-
-        # 节奏风格：从节奏模板取，不认识则回退到 moderate
-        _transition_style = _rhythm_pace if _rhythm_pace in ("fast", "moderate", "cinematic") else "moderate"
-        _base_transition_dur = scene_cfg.get("transition_duration", 0.3)
-
-        try:
-            scene_transitions = generate_transition_sequence(
-                _success_narratives,
-                style=_transition_style,
-                base_duration=_base_transition_dur,
+        print(f"🎬 智能转场序列（{_transition_style} 风格，已通过实渲染质量门）：")
+        for i, boundary in enumerate(transition_decision_report["boundaries"]):
+            selected = boundary["selected"]
+            _from = _success_narratives[i] if i < len(_success_narratives) else "?"
+            _to = _success_narratives[i + 1] if i + 1 < len(_success_narratives) else "?"
+            print(
+                f"   {i}→{i+1} ({_from} → {_to}): {selected['type']} "
+                f"({selected['duration']:.2f}s，综合 {selected['combined_score']:.2f})"
             )
-            # 安全校验：转场数必须 = 片段数 - 1
-            expected_count = len(clip_paths) - 1
-            if len(scene_transitions) != expected_count:
-                print(f"⚠️  转场数量不匹配（预期 {expected_count}，实际 {len(scene_transitions)}），回退到固定转场")
-                raise ValueError("transition count mismatch")
+        print(f"📄 转场决策报告：{transition_report_path.name}")
+        print()
 
-            # P5 修复：转场时长溢出保护
-            # xfade 要求转场时长 < 片段时长，超短段（<0.5s）时直接崩溃或产生黑帧
-            # 对每个转场，限制其时长不超过相邻两段中较短者的 40%，且绝对值不超过 0.5s
-            # （防止短段如 2s 时 40%=0.8s 转场，内容展示时间极少）
-            _seg_dur_list = [_seg_dur_map.get(i, float(duration)) for i in sorted(_seg_indices_list)]
-            for _ti, _t in enumerate(scene_transitions):
-                _left_dur = _seg_dur_list[_ti] if _ti < len(_seg_dur_list) else float(duration)
-                _right_dur = _seg_dur_list[_ti + 1] if _ti + 1 < len(_seg_dur_list) else float(duration)
-                _max_trans = min(min(_left_dur, _right_dur) * 0.4, 0.5)  # 40% 且绝对不超 0.5s
-                if _t["duration"] > _max_trans:
-                    _t["duration"] = max(0.1, _max_trans)
-
-            # 打印转场信息，方便了解
-            print()
-            print(f"🎬 内容感知转场序列（{_transition_style} 风格）：")
-            for i, t in enumerate(scene_transitions):
-                _from = _success_narratives[i] if i < len(_success_narratives) else "?"
-                _to = _success_narratives[i + 1] if i + 1 < len(_success_narratives) else "?"
-                print(f"   {i}→{i+1} ({_from} → {_to}): {t['type']} ({t['duration']:.2f}s)")
-            print()
-        except Exception as _te:
-            # 兜底：回退到原来的固定转场列表
-            print(f"⚠️  内容感知转场生成失败（{_te}），回退到固定转场")
-            scene_transitions = []
-            for i in range(len(clip_paths) - 1):
-                scene_transitions.append({
-                    "type": scene_cfg.get("transition_type", "dissolve"),
-                    "duration": scene_cfg.get("transition_duration", 0.25),
-                })
-
-        # Q4 修复：计算节奏模板的实际段落边界时间点，传入 merge_clips_ffmpeg
-        # 这些时间点会透传到 _build_bgm_audio_filter → _build_volume_envelope，
-        # 让 BGM 音量包络精确跟随不等长段落，而非均分估算
-        _timeline_for_bgm = compute_segment_timeline(rhythm_template, seg_indices=seg_indices_for_subtitles)
-        _bgm_key_times = [s["start"] for s in _timeline_for_bgm] if _timeline_for_bgm else None
+        _bgm_key_times = [s["start"] for s in _actual_segment_timeline] or None
 
         merge_clips_ffmpeg(
             clips=clip_paths,
@@ -6564,7 +7451,25 @@ def run_generation_pipeline(
             transitions=scene_transitions,
             bgm=bgm_file,
             envelope_key_times=_bgm_key_times,
+            strict_transitions=True,
         )
+        from intelligent_transition import validate_merged_transition_boundaries
+
+        _merged_transition_result = validate_merged_transition_boundaries(
+            merged_path,
+            transition_decision_report,
+            store=_transition_learning_store,
+            verification_id=output_name,
+        )
+        transition_decision_report["merged_validation"] = _merged_transition_result
+        write_transition_report(transition_decision_report, transition_report_path)
+        if postproduction_contract:
+            postproduction_contract["transition"]["merged_validation"] = _merged_transition_result
+        if not _merged_transition_result["passed"]:
+            raise RuntimeError(
+                "合成后转场质量门未通过："
+                + ", ".join(_merged_transition_result["failed_boundaries"])
+            )
         print(f"✅ 视频拼接完成：{merged_path.name}")
     except Exception as e:
         print(f"❌ 视频拼接失败：{e}")
@@ -6579,14 +7484,14 @@ def run_generation_pipeline(
     graded_path = final_dir / f"{output_name}_graded.mp4"
 
     try:
-        color_preset = get_color_grading_for_style(style)
+        color_preset = "none" if local_asset_mode else get_color_grading_for_style(style)
         print(f"🎨 应用调色预设：{color_preset}（匹配电影风格：{style}）")
 
         apply_color_grading(
             video=merged_path,
             output=graded_path,
             preset=color_preset,
-            brand_color_tint=True,
+            brand_color_tint=not local_asset_mode,
         )
         print(f"✅ 调色完成：{graded_path.name}")
     except Exception as e:
@@ -6679,6 +7584,35 @@ def run_generation_pipeline(
         _trim_start = 0.0
         _trim_end_amt = 0.0
 
+    _rendered_main_duration = _get_clip_duration(graded_path)
+    _rendered_segment_timeline = []
+    _subtitle_timeline = (
+        _semantic_segment_timeline
+        if local_asset_mode and "_semantic_segment_timeline" in locals()
+        else _actual_segment_timeline
+    )
+    for _timeline_item in _subtitle_timeline:
+        _visible_start = max(0.0, float(_timeline_item["start"]) - _trim_start)
+        _visible_end = min(
+            _rendered_main_duration,
+            max(0.0, float(_timeline_item["end"]) - _trim_start),
+        )
+        if _visible_end <= _visible_start:
+            continue
+        _rendered_segment_timeline.append({
+            **_timeline_item,
+            "start": round(_visible_start, 3),
+            "end": round(_visible_end, 3),
+            "duration": round(_visible_end - _visible_start, 3),
+        })
+    if postproduction_contract:
+        postproduction_contract["timeline"].update({
+            "trim_start": _trim_start,
+            "trim_end": _trim_end_amt,
+            "rendered_main_duration": _rendered_main_duration,
+            "rendered_segments": _rendered_segment_timeline,
+        })
+
     # ============================================================
     # 第五步：添加字幕 + 口播配音
     # ============================================================
@@ -6701,13 +7635,8 @@ def run_generation_pipeline(
         num_clips=len(clip_paths),
         seg_indices=seg_indices_for_subtitles,
         segment_durations=_seg_dur_map,
+        segment_timeline=_rendered_segment_timeline,
     )
-
-    # P1 修复：预裁切后字幕/口播时间轴需要同步偏移（减去裁掉的片头时长）
-    if _trim_start > 0.001:
-        for sub in subtitles:
-            sub["start"] = max(0.0, sub["start"] - _trim_start)
-            sub["end"] = max(0.0, sub["end"] - _trim_start)
 
     # 字幕时间对齐 BGM 节拍（卡点效果）
     if bgm_file and bgm_file.exists():
@@ -6720,47 +7649,114 @@ def run_generation_pipeline(
     # 生成口播配音（如果启用）
     # P0-3：有口播时，用 voiceover 对齐的字幕直接替代 beat 对齐结果（只做一次对齐），
     # 原来两次对齐叠加会导致字幕时间轴整体偏移 0.1~0.3s
+    _reference_outro = bool(
+        reference_profile
+        and reference_profile.get("cta_text")
+        and float(reference_profile.get("outro_duration") or 0.0) > 0
+    )
+    _defer_full_voiceover_mix = False
+    _outro_voice_start: Optional[float] = None
     voiceover_enabled = False
     voiceover_audio = final_dir / f"{output_name}_voiceover.m4a"
+    voice_performance: Dict[str, Any] = {}
+    voiceover_subs: List[Dict[str, Any]] = []
     if use_voiceover:
         try:
-            print(f"🎤 生成 AI 口播（脚本风格：{script_style}，音色：{voice}）")
+            print(
+                f"🎤 {'复用全视频唯一 TTS 母带' if local_one_take_master else '生成 AI 口播'}"
+                f"（脚本风格：{script_style}，音色：{voice}）"
+            )
             # 从广告脚本生成口播文案（比模板更丰富）
             # P1 #2（v2）：透传实际成功段索引，处理中间段失败的情况
-            voiceover_script = script_to_voiceover(
-                ad_script,
-                clip_duration=duration,
-                transition_duration=actual_transition_dur,
-                num_clips=len(clip_paths),
-                seg_indices=seg_indices_for_subtitles,
-                segment_durations=_seg_dur_map,
-                voiceover_style=voiceover_style,
+            voiceover_script = (
+                list(local_one_take_timeline["voiceover_lines"])
+                if local_one_take_timeline else
+                script_to_voiceover(
+                    ad_script,
+                    clip_duration=duration,
+                    transition_duration=actual_transition_dur,
+                    num_clips=len(clip_paths),
+                    seg_indices=seg_indices_for_subtitles,
+                    segment_durations=_seg_dur_map,
+                    segment_timeline=_rendered_segment_timeline,
+                    voiceover_style=voiceover_style,
+                )
             )
-            # P1 修复：预裁切后口播时间轴同步偏移，并压缩总时长上限
-            if _trim_start > 0.001 or _trim_end_amt > 0.001:
-                for line in voiceover_script:
-                    line["start"] = max(0.0, line["start"] - _trim_start)
-                    line["end"] = max(0.0, line["end"] - _trim_start)
-            # 根因修复：口播总时长用实际视频时长，而非节奏模板预期时长
-            # 之前用 compute_segment_timeline(rhythm_template) 是估算值，
-            # 视频经过节奏适配/裁切/转场后实际时长可能有偏差，导致口播和视频不同步
-            _actual_video_dur = _get_clip_duration(graded_path) if graded_path.exists() else 0
+            if local_one_take_timeline:
+                _voice_reason = str(local_one_take_timeline["voice_reason"])
+            else:
+                voice, _voice_reason = recommend_voice_for_narration(
+                    product_info,
+                    voiceover_script,
+                    requested_voice=voice,
+                    creative_profile=asset_creative_profile if local_asset_mode else None,
+                )
+            print(f"  🎙️ 智能音色：{voice}（{_voice_reason}）")
+            _actual_video_dur = _rendered_main_duration
             if _actual_video_dur > 0:
                 total_duration = _actual_video_dur
             else:
-                _vo_timeline = compute_segment_timeline(rhythm_template, seg_indices=seg_indices_for_subtitles)
+                _vo_timeline = _rendered_segment_timeline
                 total_duration = _vo_timeline[-1]["end"] if _vo_timeline else len(clip_paths) * duration
-                total_duration = max(0.5, total_duration - _trim_start - _trim_end_amt)
+            if _reference_outro:
+                if not local_one_take_timeline:
+                    voiceover_script = _append_outro_timing_to_voiceover_script(
+                        voiceover_script,
+                        outro_cue=str(ad_script.get("voiceover_outro_cue") or ""),
+                        main_duration=total_duration,
+                        outro_duration=float(reference_profile["outro_duration"]),
+                    )
+                total_duration += float(reference_profile["outro_duration"])
+            continuous_voiceover_text = None
+            if local_asset_mode:
+                continuous_voiceover_text = str(ad_script.get("voiceover_full") or "").strip()
             voiceover_audio, voiceover_subs = generate_full_voiceover(
                 voiceover_script,
                 voiceover_audio,
                 voice=voice,
                 total_duration=total_duration,
+                continuous_narration=local_asset_mode,
+                continuous_text=continuous_voiceover_text,
+                performance_profile=voice_performance,
+                pre_generated_audio=local_one_take_master,
             )
+            if local_one_take_timeline:
+                voice_performance.update({
+                    "source_tempo_multiplier": float(
+                        local_one_take_timeline.get("tempo_multiplier") or 1.0
+                    ),
+                    "tts_external_requests": int(
+                        local_one_take_timeline.get("tts_external_requests") or 0
+                    ),
+                    "tts_cache_hit": bool(local_one_take_timeline.get("tts_cache_hit")),
+                })
             _validate_voiceover_audio(voiceover_audio)
             # 用口播对齐的字幕替换原字幕（更精准）
-            subtitles = align_subtitles_to_voiceover(subtitles, voiceover_subs)
+            main_voiceover_subs = [
+                item for item in voiceover_subs
+                if not item.get("is_outro")
+            ]
+            outro_voiceover_subs = [
+                item for item in voiceover_subs
+                if item.get("is_outro")
+            ]
+            if outro_voiceover_subs:
+                _outro_voice_start = float(outro_voiceover_subs[0]["start"])
+            subtitles = align_subtitles_to_voiceover(subtitles, main_voiceover_subs)
+            if local_asset_mode and local_one_take_timeline:
+                subtitles = [
+                    dict(item)
+                    for item in local_one_take_timeline["voiceover_lines"]
+                    if not item.get("is_outro")
+                ]
             voiceover_enabled = True
+            _defer_full_voiceover_mix = bool(_reference_outro)
+            if postproduction_contract:
+                postproduction_contract["voice"].update({
+                    "selected_voice": voice,
+                    "selection_reason": _voice_reason,
+                    "performance": voice_performance,
+                })
             print(f"✅ 口播生成完成：{voiceover_audio.name}")
         except Exception as e:
             print(f"⚠️  口播生成失败：{e}")
@@ -6775,70 +7771,61 @@ def run_generation_pipeline(
     if fallback_audio_used and not voiceover_enabled:
         raise RuntimeError("BGM 不可用且口播无效，fallback 底噪不能作为可发布音频")
 
-    # 抖音平台优化：大字幕 + 关键词高亮 + 安全区
-    # 按节奏模板计算实际总时长
-    _douyin_timeline = compute_segment_timeline(rhythm_template, seg_indices=seg_indices_for_subtitles)
-    _douyin_total_dur = _douyin_timeline[-1]["end"] if _douyin_timeline else len(clip_paths) * duration
+    # 抖音平台参数也以实际渲染主片时长为准。
+    _douyin_total_dur = _rendered_main_duration
     douyin_cfg = get_douyin_config(int(_douyin_total_dur))
     video_height = 1920  # 9:16 1080x1920
+    _font_size_ratio = float(
+        (postproduction_contract or {}).get("subtitle_style", {}).get("font_size_ratio")
+        or DOUYIN_CONFIG["subtitle"]["font_size_ratio"]
+    )
+    _subtitle_max_units = _single_line_subtitle_capacity(
+        video_width=1080,
+        font_size=int(video_height * _font_size_ratio),
+    )
     subtitles = optimize_subtitles_for_douyin(subtitles, video_height=video_height)
+    subtitles = prepare_single_line_subtitles(subtitles, max_units=_subtitle_max_units)
+    subtitles = assign_intelligent_subtitle_colors(
+        graded_path,
+        subtitles,
+        candidates=[
+            BRAND_CONFIG.get("primary_color", "#FF6B6B"),
+            BRAND_CONFIG.get("accent_color", "#4ECDC4"),
+            "#FFFFFF",
+        ],
+        fallback="#FFFFFF",
+    )
     bottom_margin_ratio = DOUYIN_CONFIG["subtitle"]["bottom_margin_ratio"]
-    print(f"📱 抖音优化：字号放大 + 关键词高亮 + 安全区（底部 {int(bottom_margin_ratio*100)}%）")
+    print(f"📱 抖音优化：单行无标点字幕 + 智能对比色 + 安全区（底部 {int(bottom_margin_ratio*100)}%）")
 
-    # Q5 修复：字幕动画按叙事类型自动选择，不再所有场景都用同一个动画
-    # 口播模式强制 typewriter（字幕与人声同步）
-    # 非口播：hook→pop（抓注意力）/ cta→slide（行动感）/ showcase→fade（稳重）
-    # 节奏增强：根据 BPM 和情绪强度动态调整字幕动画和字号
-    _font_size_ratio = DOUYIN_CONFIG["subtitle"]["font_size_ratio"]
-    if voiceover_enabled:
-        sub_animation = "typewriter"
-        print("📝 口播模式：启用打字机字幕动画（增强同步感）")
-    else:
-        _dominant_narrative = _success_narratives[0].lower() if _success_narratives else "showcase"
-        _hook_set = {"hook", "intro", "opening", "attention"}
-        _cta_set  = {"cta", "call_to_action", "outro"}
-        _fade_set = {"showcase", "result", "proof", "demo", "reveal", "highlight", "solution"}
-        if _dominant_narrative in _hook_set:
-            sub_animation = "pop"
-        elif _dominant_narrative in _cta_set:
-            sub_animation = "slide"
-        elif _dominant_narrative in _fade_set:
-            sub_animation = "fade"
-        else:
-            sub_animation = DOUYIN_CONFIG["subtitle"]["animation"]
-        
-        # 节奏驱动的字幕样式调整（BPM → 动画类型，情绪强度 → 字号比例）
-        if rhythm_curve:
-            _overall_bpm = getattr(rhythm_curve, "overall_bpm", 0)
-            _avg_intensity = 0.5
-            _segments = getattr(rhythm_curve, "segments", [])
-            if _segments:
-                _intensity_map = {"low": 0.3, "moderate": 0.5, "high": 0.7, "extreme": 0.9}
-                _total = 0.0
-                for s in _segments:
-                    _emo = getattr(s, "emotion_level", None)
-                    _emo_val = _emo.value if hasattr(_emo, 'value') else "moderate"
-                    _total += _intensity_map.get(_emo_val, 0.5)
-                _avg_intensity = _total / len(_segments)
-            
-            # BPM 驱动动画类型调整
-            if _overall_bpm > 120:
-                if sub_animation == "fade":
-                    sub_animation = "slide"
-                print(f"📝 节奏加速：BPM {_overall_bpm} → 动画升级为 {sub_animation}")
-            elif _overall_bpm < 80 and sub_animation == "pop":
-                sub_animation = "fade"
-                print(f"📝 节奏放缓：BPM {_overall_bpm} → 动画调整为 {sub_animation}")
-            
-            # 情绪强度驱动字号微调（±10%）
-            if _avg_intensity > 0.7:
-                _font_size_ratio = _font_size_ratio * 1.1
-                print(f"📝 高情绪强度 {_avg_intensity:.0%} → 字号 +10%")
-            elif _avg_intensity < 0.3:
-                _font_size_ratio = _font_size_ratio * 0.9
-                print(f"📝 低情绪强度 {_avg_intensity:.0%} → 字号 -10%")
-        
-        print(f"📝 字幕动画：{sub_animation}（叙事类型：{_dominant_narrative}）")
+    # 字幕动画按每条字幕所属叙事段选择；口播不再强制打字机。
+    sub_animation = "fade"
+    _post_segments = {
+        int(item["semantic_segment"]): {"subtitle": item}
+        for item in (postproduction_contract or {}).get("semantic_subtitles") or []
+    }
+    if not _post_segments:
+        _post_segments = {
+            int(item["segment"]): item
+            for item in (postproduction_contract or {}).get("segments") or []
+        }
+    for subtitle in subtitles:
+        segment_index = int(subtitle.get("segment", 0))
+        narrative = _all_narratives[segment_index] if segment_index < len(_all_narratives) else "showcase"
+        subtitle_contract = (_post_segments.get(segment_index) or {}).get("subtitle") or {}
+        subtitle["animation"] = (
+            subtitle_contract.get("animation")
+            or choose_subtitle_animation(narrative, has_voiceover=voiceover_enabled)
+        )
+    if postproduction_contract:
+        postproduction_contract["subtitles"] = [
+            {
+                key: subtitle.get(key)
+                for key in ("segment", "text", "start", "end", "color", "animation")
+            }
+            for subtitle in subtitles
+        ]
+    print("📝 字幕布局：动画按素材选择，位置固定在抖音底部安全区")
 
     try:
         add_fancy_subtitles(
@@ -6853,39 +7840,29 @@ def run_generation_pipeline(
         )
         print(f"✅ 花字字幕添加完成：{subtitled_path.name}")
     except Exception as e:
-        print(f"⚠️  花字字幕添加失败：{e}")
-        print("  回退到普通字幕...")
-        try:
-            add_subtitles_ffmpeg(
-                video=graded_path,
-                subtitles=subtitles,
-                output=subtitled_path,
-                bottom_margin=int(video_height * bottom_margin_ratio),
-            )
-            print(f"✅ 字幕添加完成：{subtitled_path.name}")
-        except Exception as e2:
-            if strict_mode:
-                raise RuntimeError(f"字幕添加失败：{e2}") from e2
-            print(f"⚠️  字幕添加失败：{e2}")
-            print("  将继续导出无字幕版本...")
-            subtitled_path = graded_path
+        raise RuntimeError(f"字幕渲染失败，已阻断不可发布成片：{e}") from e
 
     # 混合口播到视频音轨（BGM 自动闪避）；口播已在字幕烧录前完成严格校验
-    if voiceover_enabled:
+    if voiceover_enabled and not _defer_full_voiceover_mix:
         try:
             voiced_path = final_dir / f"{output_name}_voiced.mp4"
             _mix_voiceover_with_bgm(
                 video=subtitled_path,
                 voiceover=voiceover_audio,
                 output=voiced_path,
-                bgm_ducking_volume=BGM_VOLUME_VOICEOVER,
             )
+            _voice_similarity = _validate_voiceover_in_mix(voiced_path, voiceover_audio)
             subtitled_path = voiced_path
-            print(f"✅ 口播混合完成（BGM 基础音量 {BGM_VOLUME_VOICEOVER}，sidechain 闪避）")
+            print(
+                f"✅ 口播混合完成（相似度 {_voice_similarity:.3f}，"
+                "BGM 已按实测响度自适应，sidechain 闪避）"
+            )
         except Exception as e:
             if strict_mode:
                 raise RuntimeError(f"口播混合失败：{e}") from e
             print(f"⚠️  口播混合失败：{e}")
+    elif _defer_full_voiceover_mix:
+        print("  🎙️ CTA 已并入同一次连续口播，延后到尾卡完成后统一混音")
 
     # ============================================================
     # 第五步：添加音效（SFX）
@@ -6897,7 +7874,16 @@ def run_generation_pipeline(
         transition_dur = scene_cfg.get("transition_duration", 0.6)
         # 从 ad_script 提取叙事类型，按实际成功段过滤
         _all_narratives = [seg.get("narrative", "") for seg in ad_script.get("segments", [])]
-        if seg_indices_for_subtitles is not None:
+        if local_asset_mode:
+            _narratives = [
+                _all_narratives[index] if index < len(_all_narratives) else "showcase"
+                for index in local_edit_semantic_indices
+            ]
+            _sfx_seg_durs = [
+                _seg_dur_map.get(edit_index, float(duration))
+                for edit_index in _seg_indices_list
+            ]
+        elif seg_indices_for_subtitles is not None:
             _narratives = [_all_narratives[i] for i in sorted(seg_indices_for_subtitles) if i < len(_all_narratives)]
             # 按实际成功段顺序构建段时长列表
             _sfx_seg_durs = [_seg_dur_map.get(i, float(duration)) for i in sorted(seg_indices_for_subtitles) if i < len(_all_narratives)]
@@ -6911,28 +7897,59 @@ def run_generation_pipeline(
             transition_duration=transition_dur,
             narratives=_narratives if _narratives else None,
             segment_durations=_sfx_seg_durs,
+            transition_decisions=scene_transitions if local_asset_mode else None,
+            segment_timeline=(
+                [
+                    {
+                        **item,
+                        "start": round(max(0.0, float(item["start"]) - _trim_start), 3),
+                        "end": round(
+                            min(
+                                _rendered_main_duration,
+                                max(0.0, float(item["end"]) - _trim_start),
+                            ),
+                            3,
+                        ),
+                        "duration": round(
+                            min(
+                                _rendered_main_duration,
+                                max(0.0, float(item["end"]) - _trim_start),
+                            ) - max(0.0, float(item["start"]) - _trim_start),
+                            3,
+                        ),
+                    }
+                    for item in _actual_segment_timeline
+                ]
+                if local_asset_mode else None
+            ),
+            sfx_intensity=music_contract.get("sfx_intensity", "moderate"),
         )
 
         # P1-B：帧间差分补充音效（detect_scene_cuts）
         # 用实际合并视频的场景切换点补充 whoosh，比叙事模板更精准
-        try:
-            from video_merger import detect_scene_cuts as _dsc
-            _sc_cuts = _dsc(subtitled_path, threshold=0.35, max_cuts=15)
-            _existing_times = {round(s["time"], 1) for s in sfx_list}
-            for _cut_t in _sc_cuts:
-                # 避免与已有音效时间点重叠（±0.15s 内跳过）
-                _too_close = any(abs(_cut_t - _et) < 0.15 for _et in _existing_times)
-                if not _too_close:
-                    sfx_list.append({"time": _cut_t, "type": "whoosh", "volume": 0.18})
-                    _existing_times.add(round(_cut_t, 1))
-            sfx_list.sort(key=lambda s: s["time"])
-            print(f"   P1-B 帧间差分：检测到 {len(_sc_cuts)} 个场景切换点")
-        except Exception as _dsc_err:
-            print(f"   P1-B 帧间差分跳过（{_dsc_err}）")
+        if local_asset_mode:
+            print("   本地素材音效：直接采用实渲染转场决策，不追加盲目 whoosh")
+        else:
+            try:
+                from video_merger import detect_scene_cuts as _dsc
+                _sc_cuts = _dsc(subtitled_path, threshold=0.35, max_cuts=15)
+                _existing_times = {round(s["time"], 1) for s in sfx_list}
+                for _cut_t in _sc_cuts:
+                    # 避免与已有音效时间点重叠（±0.15s 内跳过）
+                    _too_close = any(abs(_cut_t - _et) < 0.15 for _et in _existing_times)
+                    if not _too_close:
+                        sfx_list.append({"time": _cut_t, "type": "whoosh", "volume": 0.18})
+                        _existing_times.add(round(_cut_t, 1))
+                sfx_list.sort(key=lambda s: s["time"])
+                print(f"   P1-B 帧间差分：检测到 {len(_sc_cuts)} 个场景切换点")
+            except Exception as _dsc_err:
+                print(f"   P1-B 帧间差分跳过（{_dsc_err}）")
 
         # 音效时间对齐 BGM 节拍（卡点效果）
         if bgm_file and bgm_file.exists():
             sfx_list = align_sfx_to_beats(sfx_list, bgm_file)
+        if postproduction_contract:
+            postproduction_contract["sfx"] = {"decisions": sfx_list}
         if sfx_list:
             # P1-5：音效时间点边界保护 —— 过滤超出视频实际时长的音效
             try:
@@ -6953,12 +7970,15 @@ def run_generation_pipeline(
             sfx_path = subtitled_path
     except Exception as e:
         print(f"⚠️  音效添加失败：{e}")
+        if local_asset_mode and strict_mode:
+            raise RuntimeError("本地素材音效智能决策失败，已阻断未完成的后期合同") from e
         sfx_path = subtitled_path
 
     # ============================================================
     # P1-4：第六步：生成封面图（从所有片段选最佳帧，而非固定第 1 段）
     # ============================================================
     cover_path = final_dir / f"{output_name}_cover.jpg"
+    _cover_candidate_paths: List[Path] = []
 
     try:
         # P1-4：从所有片段中选最佳封面帧（而非固定第 1 段）
@@ -6982,6 +8002,7 @@ def run_generation_pipeline(
             for _ri, _ratio in enumerate(_sample_ratios):
                 _t = _cdur * _ratio
                 _cand_path = final_dir / f"{output_name}_cover_c{_ci}_{int(_ratio*100)}.jpg"
+                _cover_candidate_paths.append(_cand_path)
                 try:
                     extract_frame(_cclip, _cand_path, time_sec=_t)
                     if _cand_path.exists():
@@ -7091,6 +8112,8 @@ def run_generation_pipeline(
     except Exception as e:
         print(f"⚠️  封面生成失败：{e}")
         cover_path = None
+    finally:
+        _cleanup_cover_candidates(_cover_candidate_paths)
 
     # 第七步调色已提前到第四步（拼接后、字幕前）执行，此处不再重复
 
@@ -7133,26 +8156,90 @@ def run_generation_pipeline(
     # P2-A：品牌开场/收尾动画（--brand-intro-outro 启用时）
     # 插在水印之后、最终导出之前
     # ============================================================
-    if brand_intro_outro:
+    if brand_intro_outro or _reference_outro:
         print()
         print("🎬 P2-A 添加品牌开场/收尾动画...")
         _bio_path = final_dir / f"{output_name}_with_brand.mp4"
         try:
             from video_merger import add_brand_intro_outro as _bio_fn
+            _validate_cta_voiceover_contract(
+                reference_profile or {},
+                voiceover_enabled=voiceover_enabled,
+                cta_audio=voiceover_audio if _reference_outro else None,
+            )
+            _outro_main_duration = None
+            if _reference_outro and voiceover_enabled and _outro_voice_start is not None:
+                _main_video_duration = _get_clip_duration(sfx_path)
+                _outro_main_duration = max(
+                    0.5,
+                    min(_main_video_duration, _outro_voice_start),
+                )
+                if _main_video_duration - _outro_main_duration > 0.08:
+                    print(
+                        f"  ✂️  CTA 连续性裁切：主片 {_main_video_duration:.2f}s → "
+                        f"{_outro_main_duration:.2f}s（尾卡对齐同一条口播的 CTA 起点）"
+                    )
             _bio_result = _bio_fn(
                 video=sfx_path,
                 output=_bio_path,
                 brand_name=BRAND_CONFIG.get("name", ""),
                 product_name=product_info.get("name", ""),
-                cta_text=BRAND_CONFIG.get("cta_text", "立即体验"),
+                cta_text=(reference_profile or {}).get("cta_text") or BRAND_CONFIG.get("cta_text", "立即体验"),
                 primary_color=BRAND_CONFIG.get("primary_color", "#FF6B6B"),
+                intro_duration=0.0 if _reference_outro else 2.0,
+                outro_duration=float(reference_profile["outro_duration"]) if _reference_outro else 1.5,
+                main_duration=_outro_main_duration,
+                outro_audio=None,
+                outro_bgm=bgm_file if _reference_outro else None,
+                outro_background_video=_resolve_local_cta_background(
+                    local_asset_mode=local_asset_mode,
+                    postproduction_contract=postproduction_contract,
+                    clean_video=graded_path,
+                ),
+                strict_material_background=bool(local_asset_mode and _reference_outro),
             )
             if _bio_result == _bio_path and _bio_path.exists():
                 sfx_path = _bio_path
+                if _reference_outro and voiceover_enabled:
+                    _validate_audio_covers_video(sfx_path)
         except Exception as _bio_err:
             if strict_mode:
                 raise RuntimeError(f"品牌开场/收尾生成失败：{_bio_err}") from _bio_err
             print(f"⚠️  品牌动画跳过（{_bio_err}）")
+
+    if _defer_full_voiceover_mix:
+        try:
+            _full_voiced_path = final_dir / f"{output_name}_voiced_full.mp4"
+            _mix_voiceover_with_bgm(
+                video=sfx_path,
+                voiceover=voiceover_audio,
+                output=_full_voiced_path,
+            )
+            _voice_similarity = _validate_voiceover_in_mix(
+                _full_voiced_path,
+                voiceover_audio,
+            )
+            _validate_audio_covers_video(_full_voiced_path)
+            sfx_path = _full_voiced_path
+            print(
+                f"✅ 完整连续口播统一混音完成（相似度 {_voice_similarity:.3f}，"
+                "主内容与 CTA 来自同一次 TTS）"
+            )
+        except Exception as _full_mix_err:
+            raise RuntimeError(f"完整连续口播统一混音失败：{_full_mix_err}") from _full_mix_err
+
+    if postproduction_contract and postproduction_contract_path:
+        postproduction_contract["cta"].update({
+            "rendered": bool(_reference_outro),
+            "main_duration": _outro_main_duration if _reference_outro else _rendered_main_duration,
+            "voice_start": _outro_voice_start,
+            "background_source": (
+                postproduction_contract["segments"][-1]["clip_path"]
+                if local_asset_mode and _reference_outro and postproduction_contract.get("segments")
+                else None
+            ),
+        })
+        write_postproduction_contract(postproduction_contract, postproduction_contract_path)
 
     # ============================================================
     # 导出最终成片
@@ -7181,23 +8268,20 @@ def run_generation_pipeline(
             raise RuntimeError(f"输出文件过小（{file_size} bytes），疑似空文件：{final_path}")
         try:
             actual_dur = _get_clip_duration(final_path)
-            # 根因修复：用实际片段时长 + 转场时长计算预期总时长，而非节奏模板预期值
-            # 之前用 compute_segment_timeline(rhythm_template) 是模板估算值，
-            # 当节奏适配失败、片段实际时长与模板偏差大时，会导致校验误判
-            # 正确做法：用 _seg_dur_map 中的实测片段时长 + 转场时长计算真实预期
-            _actual_seg_indices = sorted(_seg_indices_list) if _seg_indices_list else list(range(len(clip_paths)))
-            _actual_seg_durs = [_seg_dur_map.get(i, float(duration)) for i in _actual_seg_indices]
-            _actual_total_seg = sum(_actual_seg_durs)
-            _transition_total = 0.0
-            if len(clip_paths) > 1:
-                _avg_trans = scene_cfg.get("transition_duration", 0.3)
-                _transition_total = _avg_trans * (len(clip_paths) - 1)
-            _expected_total = _actual_total_seg - _transition_total
-            expected_min = _expected_total * 0.7  # 允许 30% 偏差（转场+裁切+编码误差）
+            # 最终导出只能保持其直接输入的真实时长，不能再用模板或平均转场反推。
+            _expected_total = _get_clip_duration(sfx_path)
+            expected_min = max(0.0, _expected_total - 0.15)
             if actual_dur < expected_min:
                 raise RuntimeError(
                     f"输出视频时长异常（实际 {actual_dur:.1f}s，期望至少 {expected_min:.1f}s）"
                 )
+            if postproduction_contract and postproduction_contract_path:
+                postproduction_contract["timeline"].update({
+                    "final_input_duration": _expected_total,
+                    "final_output_duration": actual_dur,
+                    "export_duration_delta": actual_dur - _expected_total,
+                })
+                write_postproduction_contract(postproduction_contract, postproduction_contract_path)
             print(f"✅ 完整性校验通过：{file_size/1024/1024:.1f} MB，{actual_dur:.1f}s")
         except RuntimeError:
             raise
@@ -7292,12 +8376,49 @@ def run_generation_pipeline(
             subtitles=subtitles,
             beat_timings=_beat_timings_for_quality,
             segments=_segments_for_quality,
+            cta_contract=(postproduction_contract or {}).get("cta"),
             auto_fix=True,
             platform="douyin",
         )
         production_quality_report = prod_report
         _prod_guard = ProductionQualityGuard()
         _prod_guard.print_report(prod_report, final_path.name)
+        if postproduction_contract and postproduction_contract_path:
+            postproduction_contract["quality"] = {
+                "passed": bool(prod_report.passed),
+                "overall_score": float(prod_report.overall_score),
+                "critical_issues": [issue.message for issue in prod_report.get_critical_issues()],
+            }
+            write_postproduction_contract(postproduction_contract, postproduction_contract_path)
+
+        # 正样本要求总体和时间一致性都达标；可归因的时间一致性失败记录为负样本。
+        if transition_decision_report:
+            from intelligent_transition import record_transition_outcomes
+
+            _temporal_dimension = prod_report.dimension_scores.get("temporal")
+            _transition_quality_score = min(
+                float(prod_report.overall_score),
+                float(_temporal_dimension.score) if _temporal_dimension else 0.0,
+            )
+            _learned_count = record_transition_outcomes(
+                transition_decision_report,
+                final_quality=_transition_quality_score,
+                final_passed=bool(prod_report.passed),
+                store=_transition_learning_store,
+                verification_id=output_name,
+                transition_failure_attributed=False,
+            )
+            transition_decision_report["verified_learning_records"] = _learned_count
+            transition_decision_report["verified_transition_quality"] = _transition_quality_score
+            transition_decision_report["learning_outcome"] = (
+                "positive" if prod_report.passed and _transition_quality_score >= 80.0
+                else "ignored_unattributed_failure"
+            )
+            write_transition_report(transition_decision_report, transition_report_path)
+            print(
+                f"🧠 智能转场学习：已记录 {_learned_count} 条"
+                f"{transition_decision_report['learning_outcome']} 验证结果"
+            )
 
         if not prod_report.passed:
             if strict_mode:
@@ -7358,6 +8479,8 @@ def run_generation_pipeline(
                 "best_of": best_of,
                 "kling_model": effective_kling_model,
                 "strategy": getattr(workflow_decision_result, "recommended_strategy", "standard"),
+                "transition_policy": transition_decision_report.get("policy") if transition_decision_report else None,
+                "transition_types": [t["type"] for t in scene_transitions],
             },
             character_assets=char_refs,
             product_image_path=product_image_path,
@@ -7368,7 +8491,8 @@ def run_generation_pipeline(
         print(
             "🔁 工作流闭环完成："
             f"资产 {len(workflow_summary['registered_assets'])}，"
-            f"反馈 {'已写入' if workflow_summary['feedback_collected'] else '未写入'}，"
+            f"自动观测 {'已记录' if workflow_summary['automatic_observation_recorded'] else '未记录'}，"
+            "使用者脚本反馈 未自动生成，"
             f"实验 {'已追踪' if workflow_summary['experiment_tracked'] else '未追踪'}"
         )
         for warning in workflow_summary.get("warnings", []):
@@ -7378,12 +8502,24 @@ def run_generation_pipeline(
     # 清理中间文件（只保留 _final.mp4 / _16x9_final.mp4 / _cover.jpg）
     # ============================================================
     _cleanup_intermediate_files(final_dir, output_name, final_path, wide_path)
+    script_artifact_path = final_dir / f"{output_name}_script.json"
+    script_artifact_path.write_text(
+        json.dumps(ad_script, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    final_script_sidecar = final_path.with_suffix(".script.json")
+    if final_script_sidecar != script_artifact_path:
+        final_script_sidecar.write_text(
+            json.dumps(ad_script, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     return {
         "final_path": final_path,
         "wide_path": wide_path,
         "output_name": output_name,
         "ad_script": ad_script,
+        "script_artifact_path": final_script_sidecar,
         "bgm_file": bgm_file,
         "preview": preview,
         # P2：失败感知字段，让调用方知道口播/封面是否成功
@@ -7393,6 +8529,10 @@ def run_generation_pipeline(
         "consistency_warnings": locals().get("_consistency_warnings", []),
         "quality_result": quality_result,
         "workflow_summary": locals().get("workflow_summary", {}),
+        "edit_decision_report": local_asset_edit_report,
+        "frame_evidence_report": local_asset_frame_evidence_report,
+        "postproduction_contract": postproduction_contract_path,
+        "transition_decision_report": locals().get("transition_report_path"),
     }
 
 
@@ -7453,7 +8593,11 @@ def run_one_click_create(
             from quality_gate import smart_pick_voiceover_style
             product_type = product_info.get("type", "default")
             voiceover_style = smart_pick_voiceover_style(product_type)
-    resolved_cast_plan = build_cast_plan({**product_info, "characters": characters} if characters else product_info)
+    resolved_cast_plan = (
+        {"core_characters": [], "supporting_characters": [], "ambient_entities": [], "rationale": "local_asset_mode"}
+        if getattr(args, "local_assets", None)
+        else build_cast_plan({**product_info, "characters": characters} if characters else product_info)
+    )
     resolved_characters = resolved_cast_plan.get("core_characters", [])
     product_info["cast_plan"] = resolved_cast_plan
     product_info["characters"] = resolved_characters
@@ -7509,6 +8653,8 @@ def run_one_click_create(
             image_first=getattr(args, "image_first", True),
             image_first_mode=getattr(args, "image_first_mode", "standard"),
             image_first_variants=getattr(args, "image_first_variants", 2),
+            local_assets=Path(args.local_assets).expanduser() if getattr(args, "local_assets", None) else None,
+            reference_video=Path(args.reference_video).expanduser() if getattr(args, "reference_video", None) else None,
         )
 
         final_path = result["final_path"]
@@ -7608,7 +8754,7 @@ def expand_theme_with_llm(theme: str, args) -> Optional[dict]:
 
     返回格式：
         {
-            "product_info": { name, type, selling_point, audience, style, age, gender, outfit },
+            "product_info": { name, type, selling_point, ingredients, origin, production_process, specifications, verified_claims, audience, style, age, gender, outfit },
             "args": { style, script_style, hook, rhythm_style, target_duration, voiceover, voice }
         }
     或 None（LLM 不可用 / 调用失败）。
@@ -7630,6 +8776,11 @@ def expand_theme_with_llm(theme: str, args) -> Optional[dict]:
       name: 产品名称（简洁，2-8字）
       type: 产品类型，从以下选择：美妆 食品 科技 服装 app 家居 健康 母婴 宠物 运动 default
       selling_point: 核心卖点（一句话，10-25字，突出用户利益）
+      ingredients: 用户主题明确提供的产品原料列表；未明确提供则必须为空列表，禁止推断
+      origin: 用户主题明确提供的产品产地；未明确提供则必须为空字符串，禁止从品类推断
+      production_process: 用户主题明确提供的工艺列表；未明确提供则必须为空列表
+      specifications: 用户主题明确提供的规格列表；未明确提供则必须为空列表
+      verified_claims: 用户主题明确陈述并可作为广告事实使用的卖点列表；不得扩写或推断功效
       audience: 目标人群（如 18-30岁都市女性）
       style: 广告风格（如 温暖治愈、科技感、青春活力、极简高端）
       age: 主角年龄（数字，如 25）
@@ -7656,6 +8807,7 @@ args:
     - 食品/生活类产品 → spielberg / koreeda + before_after + question
     - 快节奏产品 → rhythm_style=fast；沉浸式产品 → rhythm_style=cinematic
     - 需要讲解的功能性产品开启 voiceover=true，纯视觉类 voiceover=false
+    - ingredients/origin/production_process/specifications/verified_claims 只能抽取用户原文事实，禁止根据常识补全
     - **角色数量由系统自动根据产品类型推断，你只需返回产品基础信息即可**
     - characters / supporting_characters / ambient_entities 字段可以留空，系统会自动填充最优角色配置"""
 
@@ -7664,6 +8816,20 @@ args:
     result = generate_json(prompt, system_prompt=system_prompt)
     if not result or "product_info" not in result:
         return None
+    product_info = result["product_info"]
+    normalized_theme = re.sub(r"\s+", "", theme).lower()
+    for field in ("ingredients", "production_process", "specifications", "verified_claims"):
+        if not isinstance(product_info.get(field), list):
+            product_info[field] = []
+        product_info[field] = [
+            str(value).strip()
+            for value in product_info[field]
+            if str(value).strip() and re.sub(r"\s+", "", str(value)).lower() in normalized_theme
+        ]
+    if not isinstance(product_info.get("origin"), str):
+        product_info["origin"] = ""
+    elif re.sub(r"\s+", "", product_info["origin"]).lower() not in normalized_theme:
+        product_info["origin"] = ""
     return result
 
 
@@ -7775,6 +8941,7 @@ def main():
 
     # 如果指定了 --load，直接从模板加载
     if args.load:
+        explicit_output_name = args.output_name
         template_path = Path(args.load)
         if not template_path.exists():
             print(f"❌ 错误：模板文件不存在：{template_path}")
@@ -7846,11 +9013,15 @@ def main():
         if "no_llm" in args_dict:
             args.no_llm = args_dict["no_llm"]
         if "output_name" in args_dict:
-            args.output_name = args_dict["output_name"]
+            args.output_name = explicit_output_name or args_dict["output_name"]
         if "resume" in args_dict:
             args.resume = args_dict["resume"]
         if "allow_no_product_image" in args_dict:
             args.allow_no_product_image = args_dict["allow_no_product_image"]
+        if "local_assets" in args_dict:
+            args.local_assets = args_dict["local_assets"]
+        if "reference_video" in args_dict:
+            args.reference_video = args_dict["reference_video"]
 
         print("📋 已加载的参数：")
         for k, v in product_info.items():
@@ -7863,6 +9034,10 @@ def main():
             print(f"🌱 随机种子：{args.seed}")
         if args.product_image:
             print(f"🖼️ 商品参考图：{args.product_image}")
+        if getattr(args, "local_assets", None):
+            print(f"🎞️ 本地素材：{args.local_assets}")
+        if getattr(args, "reference_video", None):
+            print(f"🎯 参考广告：{args.reference_video}")
         print()
 
     else:
@@ -7879,6 +9054,18 @@ def main():
             print(f"   {style_info.get('description', '')}")
             print()
 
+        if not getattr(args, "local_assets", None):
+            _local_ans = input("是否使用本地视频素材文件夹？(y/n) [n]：").strip().lower()
+            if _local_ans == "y":
+                _local_path = input("请输入本地视频素材文件夹路径：").strip()
+                if not _local_path:
+                    print("❌ 错误：已选择本地素材模式，但未输入文件夹路径")
+                    sys.exit(1)
+                args.local_assets = _local_path
+                args.allow_no_product_image = True
+                print(f"🎞️ 本地素材模式：{args.local_assets}")
+                print()
+
         # 检查环境
         # P0-1 修复：同时支持 API Key 和 JWT（AccessKey+SecretKey）两种鉴权方式
         _has_api_key = bool(KLING_API_KEY and KLING_API_KEY not in ("your_kling_api_key_here", ""))
@@ -7887,7 +9074,7 @@ def main():
             and KLING_ACCESS_KEY not in ("your_access_key_here", "")
             and KLING_SECRET_KEY not in ("your_secret_key_here", "")
         )
-        if not _has_api_key and not _has_jwt:
+        if not getattr(args, "local_assets", None) and not _has_api_key and not _has_jwt:
             print("❌ 错误：未配置可灵 API 鉴权")
             print("  请在 .env 或 config.py 中配置以下任意一种：")
             print("  方式一（推荐）：KLING_ACCESS_KEY=ak-xxx 和 KLING_SECRET_KEY=sk-xxx")
@@ -7990,6 +9177,10 @@ def main():
             product_name = input_with_default("产品名称", "我的产品")
             product_type = input_with_default("产品类型（美妆/食品/科技/服装/app）", "default")
             selling_point = input_with_default("核心卖点", "卓越品质，值得拥有")
+            ingredients = input("产品原料（可选，多个用逗号分隔，不确定请留空）：").strip()
+            origin = input("产品产地（可选，不确定请留空）：").strip()
+            production_process = input("生产工艺（可选，多个用逗号分隔，不确定请留空）：").strip()
+            verified_claims = input("已核验卖点（可选，多个用逗号分隔，不确定请留空）：").strip()
             audience = input_with_default("目标人群", "18-35岁")
             style = input_with_default("广告风格", "现代简约")
             character_age = input_with_default("角色年龄", "25")
@@ -7999,6 +9190,10 @@ def main():
                 "name": product_name,
                 "type": product_type,
                 "selling_point": selling_point,
+                "ingredients": [value.strip() for value in re.split(r"[,，]", ingredients) if value.strip()],
+                "origin": origin,
+                "production_process": [value.strip() for value in re.split(r"[,，]", production_process) if value.strip()],
+                "verified_claims": [value.strip() for value in re.split(r"[,，]", verified_claims) if value.strip()],
                 "audience": audience,
                 "style": style,
                 "age": character_age,
@@ -8044,8 +9239,8 @@ def main():
         _preview_mode = getattr(args, "preview", False)
         _est_mode = "std" if _preview_mode else args.mode
         _est_clips = 1 if _preview_mode else 5
-        _resolved_characters = build_cast_plan(product_info).get("core_characters", [])
-        _est_num_chars = len(_resolved_characters) or 1
+        _resolved_characters = [] if getattr(args, "local_assets", None) else build_cast_plan(product_info).get("core_characters", [])
+        _est_num_chars = len(_resolved_characters) if getattr(args, "local_assets", None) else len(_resolved_characters) or 1
         _policy_changes = apply_low_cost_generation_policy(
             args,
             num_clips=_est_clips,
@@ -8101,8 +9296,8 @@ def main():
             ab_count = max(1, min(getattr(args, "ab_versions", 1), 3))
             _preview_mode = getattr(args, "preview", False)
             _est_clips = 1 if _preview_mode else 5
-            _resolved_characters = build_cast_plan(product_info).get("core_characters", [])
-            _est_num_chars = len(_resolved_characters) or 1
+            _resolved_characters = [] if getattr(args, "local_assets", None) else build_cast_plan(product_info).get("core_characters", [])
+            _est_num_chars = len(_resolved_characters) if getattr(args, "local_assets", None) else len(_resolved_characters) or 1
         _policy_changes = apply_low_cost_generation_policy(
             args,
             num_clips=_est_clips,

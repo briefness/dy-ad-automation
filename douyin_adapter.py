@@ -13,7 +13,7 @@
 """
 
 import copy
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
 
 # ============================================================
@@ -498,6 +498,8 @@ def adapt_rhythm_template_to_segments(
 def compute_segment_timeline(
     template: Dict[str, Any],
     seg_indices: Optional[list] = None,
+    segment_durations: Optional[Dict[int, float]] = None,
+    transitions: Optional[List[Dict[str, Any]]] = None,
 ) -> list[dict]:
     """
     根据节奏模板计算每段在最终成片中的实际时间轴（考虑转场重叠）。
@@ -508,6 +510,8 @@ def compute_segment_timeline(
     Args:
         template: 节奏模板（来自 get_rhythm_template）
         seg_indices: 实际成功的段索引白名单（0-based），None 表示全部成功
+        segment_durations: ffprobe 实测片段时长映射；提供后覆盖模板时长
+        transitions: 按实际合并顺序排列的转场决策；duration=0 表示真实无转场
 
     Returns:
         时间轴列表，每项包含：
@@ -518,7 +522,7 @@ def compute_segment_timeline(
             - type:     段落类型
             - purpose:  叙事目的
     """
-    transition = template.get("transition_duration", 0.3)
+    default_transition = float(template.get("transition_duration", 0.3))
     segments = template["segments"]
 
     # 白名单过滤
@@ -526,12 +530,27 @@ def compute_segment_timeline(
         index_set = set(seg_indices)
         segments = [s for s in segments if s["index"] in index_set]
 
+    if transitions is not None and len(transitions) != max(0, len(segments) - 1):
+        raise ValueError(
+            f"转场数量必须等于镜头数减一：收到 {len(transitions)} 个转场 / {len(segments)} 个镜头"
+        )
+
     timeline = []
     current_start = 0.0
     for i, seg in enumerate(segments):
-        dur = seg["duration"]
+        dur = float((segment_durations or {}).get(seg["index"], seg["duration"]))
+        if dur <= 0:
+            raise ValueError(f"镜头 {seg['index']} 的实测时长必须大于 0：{dur}")
         # 除第一段外，每段与前一段有 transition 秒的重叠
         if i > 0:
+            decision = transitions[i - 1] if transitions is not None else None
+            raw_transition = decision.get("duration") if decision is not None else None
+            transition = default_transition if raw_transition is None else float(raw_transition)
+            if transition < 0 or transition >= min(float(timeline[-1]["duration"]), dur):
+                raise ValueError(
+                    f"边界 {i - 1} 的转场时长无效：{transition}s；"
+                    "必须大于等于 0 且小于相邻镜头时长"
+                )
             current_start -= transition
         end = current_start + dur
         timeline.append({

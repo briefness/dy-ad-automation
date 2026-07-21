@@ -28,6 +28,7 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 ASSET_LIBRARY_PATH = PROJECT_ROOT / "data" / "assets"
 FEEDBACK_DB_PATH = PROJECT_ROOT / "data" / "feedback.db"
 EXPERIMENT_DB_PATH = PROJECT_ROOT / "data" / "experiments.db"
+LOCAL_ASSET_INDEX_PATH = PROJECT_ROOT / "data" / "local_asset_index"
 
 # ============================================================
 # 可灵 API 配置
@@ -97,8 +98,24 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "agnes-2.0-flash")
 LLM_TEMPERATURE = 0.8
 LLM_MAX_TOKENS = 2000
-LLM_TIMEOUT = 30
+LLM_TIMEOUT = 60
 LLM_MAX_RETRIES = 2
+
+# ============================================================
+# 本地视频素材视觉分析配置
+# ============================================================
+
+VISION_ENABLED = os.getenv("VISION_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+VISION_BASE_URL = os.getenv("VISION_BASE_URL", "")
+VISION_API_KEY = os.getenv("VISION_API_KEY", "")
+VISION_MODEL = os.getenv("VISION_MODEL", "")
+VISION_TIMEOUT = int(os.getenv("VISION_TIMEOUT", "60"))
+VISION_MAX_RETRIES = int(os.getenv("VISION_MAX_RETRIES", "2"))
+
+LOCAL_ASSET_WINDOW_SECONDS = float(os.getenv("LOCAL_ASSET_WINDOW_SECONDS", "4"))
+LOCAL_ASSET_WINDOW_STRIDE = float(os.getenv("LOCAL_ASSET_WINDOW_STRIDE", "2"))
+LOCAL_ASSET_CONTACT_SHEET_FRAMES = int(os.getenv("LOCAL_ASSET_CONTACT_SHEET_FRAMES", "12"))
+LOCAL_ASSET_MAX_WINDOWS = int(os.getenv("LOCAL_ASSET_MAX_WINDOWS", "120"))
 
 # ============================================================
 # 视频拼接配置

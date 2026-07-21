@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 import json
 
+from douyin_adapter import DOUYIN_CONFIG
+
 
 class Severity(Enum):
     CRITICAL = "critical"
@@ -87,7 +89,12 @@ class ProductionQualityReport:
 
 class ProductionQualityGuard:
     DOUYIN_SAFE_AREA = {"top": 0.12, "bottom": 0.18, "left": 0.05, "right": 0.05}
-    DOUYIN_UI_AVOID = {"top": 0.0, "bottom": 0.25, "left": 0.0, "right": 0.0}
+    DOUYIN_UI_AVOID = {
+        "top": 0.0,
+        "bottom": float(DOUYIN_CONFIG["subtitle"]["bottom_margin_ratio"]),
+        "left": 0.0,
+        "right": 0.0,
+    }
     TARGET_LUFS = -14.0
     MIN_PRODUCT_VISIBILITY_RATIO = 0.35
     MIN_CTA_DURATION = 1.5
@@ -106,6 +113,7 @@ class ProductionQualityGuard:
         subtitles: Optional[List[Dict]] = None,
         beat_timings: Optional[List[float]] = None,
         segments: Optional[List[Dict]] = None,
+        cta_contract: Optional[Dict] = None,
         auto_fix: bool = True,
     ) -> Tuple[Path, ProductionQualityReport]:
         report = ProductionQualityReport()
@@ -114,7 +122,9 @@ class ProductionQualityGuard:
         self._check_technical_quality(video_path, report)
         self._check_temporal_consistency(video_path, report)
         self._check_aesthetic_quality(video_path, report)
-        self._check_ad_effectiveness(video_path, product_reference, subtitles, segments, report)
+        self._check_ad_effectiveness(
+            video_path, product_reference, subtitles, segments, report, cta_contract=cta_contract,
+        )
         self._check_platform_compliance(video_path, report)
         self._check_ai_artifacts(video_path, report)
         self._check_narrative_rhythm(video_path, beat_timings, subtitles, segments, report)
@@ -489,6 +499,7 @@ class ProductionQualityGuard:
         subtitles: Optional[List[Dict]],
         segments: Optional[List[Dict]],
         report: ProductionQualityReport,
+        cta_contract: Optional[Dict] = None,
     ):
         issues = []
         score = 100
@@ -543,7 +554,12 @@ class ProductionQualityGuard:
             ))
 
         if segments:
-            has_cta = any(
+            has_cta = bool(
+                cta_contract
+                and cta_contract.get("enabled")
+                and str(cta_contract.get("text") or "").strip()
+                and float(cta_contract.get("duration") or 0.0) >= self.MIN_CTA_DURATION
+            ) or any(
                 s.get("narrative", "").lower() in ("cta", "call_to_action", "action")
                 or "购买" in s.get("text", "") or "点击" in s.get("text", "")
                 for s in segments
@@ -561,7 +577,7 @@ class ProductionQualityGuard:
             ui_avoid_bottom = int(h * self.ui_avoid["bottom"])
             subtitle_in_ui_area = False
             for sub in subtitles:
-                sub_y = sub.get("y_ratio", 0.85)
+                sub_y = float(sub.get("y_ratio", 1.0 - self.ui_avoid["bottom"]))
                 if sub_y * h > h - ui_avoid_bottom:
                     subtitle_in_ui_area = True
                     break
@@ -575,9 +591,10 @@ class ProductionQualityGuard:
 
             sub_durations = []
             for sub in subtitles:
-                start = sub.get("start_time", 0)
-                end = sub.get("end_time", 0)
-                sub_durations.append(end - start)
+                start = float(sub.get("start", sub.get("start_time", 0)) or 0)
+                end = float(sub.get("end", sub.get("end_time", start)) or start)
+                if end > start:
+                    sub_durations.append(end - start)
             if sub_durations:
                 avg_sub_duration = sum(sub_durations) / len(sub_durations)
                 if avg_sub_duration < 0.8:
@@ -1150,6 +1167,7 @@ def run_production_quality_check(
     subtitles: Optional[List[Dict]] = None,
     beat_timings: Optional[List[float]] = None,
     segments: Optional[List[Dict]] = None,
+    cta_contract: Optional[Dict] = None,
     auto_fix: bool = True,
     platform: str = "douyin",
 ) -> Tuple[Path, ProductionQualityReport]:
@@ -1161,6 +1179,7 @@ def run_production_quality_check(
         subtitles=subtitles,
         beat_timings=beat_timings,
         segments=segments,
+        cta_contract=cta_contract,
         auto_fix=auto_fix,
     )
 

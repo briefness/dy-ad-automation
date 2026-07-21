@@ -19,8 +19,10 @@ AI 口播配音模块
 import subprocess
 import re
 import shutil
+import hashlib
+import json
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from datetime import datetime
 
 
@@ -130,6 +132,43 @@ VOICE_PRESETS = {
 # 默认音色
 DEFAULT_VOICE = "female_young"
 
+
+def recommend_voice_for_narration(
+    product_info: Dict[str, any],
+    script_lines: List[Dict[str, any]],
+    requested_voice: str = "auto",
+    creative_profile: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    """Select a stable commercial voice from product type and final spoken copy."""
+    material_driven = str((creative_profile or {}).get("source") or "") == "selected_local_assets"
+    if requested_voice in VOICE_PRESETS and not material_driven:
+        return requested_voice, "用户显式指定音色"
+    category = str(product_info.get("type") or product_info.get("category") or "default")
+    text = "".join(str(line.get("text") or "") for line in script_lines)
+    visual_energy = str((creative_profile or {}).get("energy") or "medium")
+    story_role_counts = (creative_profile or {}).get("story_role_counts") or {}
+    source_story_count = sum(
+        int(story_role_counts.get(role) or 0)
+        for role in ("ingredient", "origin", "production")
+    )
+    if category in {"食品", "饮品", "美食", "food", "beverage"}:
+        if material_driven and source_story_count:
+            return "female_young", f"素材包含原料或产地叙事，选择自然清晰而不过度煽情的年轻女声"
+        if visual_energy == "high":
+            return "energetic_female", f"{category}高动态素材优先清晰有推动力的活力女声"
+        if visual_energy == "low":
+            return "female_warm", f"{category}低动态素材优先自然连贯的温暖女声"
+        return "female_young", f"{category}带货短句优先自然清晰的年轻女声"
+    if material_driven and source_story_count:
+        return "female_young", "素材包含原料或产地叙事，选择自然清晰的商业女声"
+    if category in {"科技", "金融", "教育", "tech", "finance"}:
+        return "male_pro", f"{category}信息密度较高 优先专业男声"
+    if len(text) >= 90 or re.search(r"故事|回忆|陪伴|温柔", text):
+        return "female_warm", "长叙事或温和语气优先温暖女声"
+    if re.search(r"冲|快|立刻|现在|惊喜|挑战", text):
+        return "energetic_female", "高能行动型文案优先活力女声"
+    return DEFAULT_VOICE, "通用短视频口播优先自然清晰音色"
+
 # 火山引擎 TTS V3 配置（从环境变量读取，未配置时自动降级）
 # 接口文档：https://www.volcengine.com/docs/6561/1257544
 _VOLC_API_URL: str = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
@@ -160,6 +199,26 @@ def _load_volc_credentials() -> tuple[str, str]:
         except Exception:
             pass
     return api_key, resource_id
+
+
+def build_tts_synthesis_contract(text: str, voice: str = DEFAULT_VOICE) -> Dict[str, Any]:
+    """Return the non-sensitive inputs that fully identify a TTS master request."""
+    voice_config = VOICE_PRESETS.get(voice, VOICE_PRESETS[DEFAULT_VOICE])
+    _, resource_id = _load_volc_credentials()
+    payload = {
+        "version": 1,
+        "engine": "volcengine_tts_v3",
+        "resource_id": resource_id,
+        "text": re.sub(r"\s+", " ", str(text or "")).strip(),
+        "voice": voice,
+        "speaker": voice_config.get("volc_voice_type"),
+        "rate": int(voice_config.get("rate", 180)),
+        "pitch": float(voice_config.get("pitch", 1.0)),
+        "audio_format": "m4a_aac_24khz_128k_mono",
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    payload["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return payload
 
 
 def _validate_audio_file(audio_path: Path, min_size: int = 1024) -> None:
@@ -597,7 +656,7 @@ def _generate_tts_pyttsx3(
     return output_path
 
 
-def split_sentences(text: str, max_chars: int = 20) -> List[str]:
+def split_sentences(text: str, max_chars: int = 11) -> List[str]:
     """
     智能断句：将长文本按标点切成短句
 
@@ -665,7 +724,9 @@ def split_sentences(text: str, max_chars: int = 20) -> List[str]:
         cleaned = _re.sub(_punct_pattern_split, '', stripped)
         return bool(cleaned)
 
-    return [s for s in result if _has_readable_content(s)]
+    readable = [s for s in result if _has_readable_content(s)]
+    from video_merger import _split_single_line_text
+    return [chunk for sentence in readable for chunk in _split_single_line_text(sentence, max_chars)]
 
 
 def generate_full_voiceover(
@@ -675,6 +736,10 @@ def generate_full_voiceover(
     total_duration: float = 25.0,
     pause_between_sentences: float = 0.15,
     max_rate_multiplier: float = 1.6,
+    continuous_narration: bool = False,
+    continuous_text: Optional[str] = None,
+    performance_profile: Optional[Dict[str, Any]] = None,
+    pre_generated_audio: Optional[Path] = None,
 ) -> Tuple[Path, List[Dict[str, any]]]:
     """
     生成完整的口播音频（智能断句 + 多段拼接 + 自动时间对齐）
@@ -695,8 +760,26 @@ def generate_full_voiceover(
     tmp_dir = Path(tempfile.mkdtemp(prefix="tts_"))
     voice_config = VOICE_PRESETS.get(voice, VOICE_PRESETS[DEFAULT_VOICE])
     base_rate = voice_config["rate"]
+    if performance_profile is not None:
+        performance_profile.update({
+            "voice": voice,
+            "base_rate": base_rate,
+            "tempo_multiplier": 1.0,
+        })
 
     try:
+        if continuous_narration:
+            return _generate_continuous_voiceover(
+                script_lines=script_lines,
+                output_path=output_path,
+                tmp_dir=tmp_dir,
+                voice=voice,
+                total_duration=total_duration,
+                max_rate_multiplier=max_rate_multiplier,
+                continuous_text=continuous_text,
+                performance_profile=performance_profile,
+                pre_generated_audio=pre_generated_audio,
+            )
         # ============== 第一轮：正常语速生成，检测是否溢出 ==============
         audio_segments = []
         aligned_subtitles = []
@@ -728,6 +811,9 @@ def generate_full_voiceover(
                     "start": current_time,
                     "duration": duration,
                     "sentence": sentence,
+                    "segment": seg_num,
+                    "line_start": float(target_start),
+                    "line_end": float(line.get("end", total_duration)),
                 })
 
                 aligned_subtitles.append({
@@ -754,11 +840,26 @@ def generate_full_voiceover(
 
         # ============== 如果溢出：用 ffmpeg atempo 加速已有音频（比重新生成快很多） ==============
         if overflow_ratio > 1.0 and has_ffmpeg:
-            actual_rate = min(base_rate * overflow_ratio, base_rate * max_rate_multiplier)
-            rate_ratio = actual_rate / base_rate
-            atempo = rate_ratio  # atempo = 输出时长/输入时长，加速时 >1
+            segment_groups: Dict[Any, List[Dict[str, any]]] = {}
+            for segment in audio_segments:
+                segment_groups.setdefault(segment.get("segment"), []).append(segment)
+            rate_by_segment: Dict[Any, float] = {}
+            for segment_id, group in segment_groups.items():
+                line_start = float(group[0]["line_start"])
+                line_end = float(group[0]["line_end"])
+                available = max(0.1, min(line_end, total_duration - 0.1) - line_start)
+                spoken = sum(float(item["duration"]) for item in group)
+                spoken += pause_between_sentences * max(0, len(group) - 1)
+                required_rate = max(1.0, spoken / available)
+                if required_rate > max_rate_multiplier:
+                    raise RuntimeError(
+                        f"口播段 {segment_id} 在最大 {max_rate_multiplier:.1f}x 语速下仍无法装入镜头："
+                        f"需要 {required_rate:.2f}x"
+                    )
+                rate_by_segment[segment_id] = required_rate
 
-            print(f"  ⚡ 口播时长溢出，用 ffmpeg atempo 加速到 {rate_ratio:.2f}x")
+            max_rate = max(rate_by_segment.values(), default=1.0)
+            print(f"  ⚡ 口播时长溢出，按镜头段独立加速（最高 {max_rate:.2f}x）")
 
             new_segments = []
             new_subtitles = []
@@ -766,8 +867,13 @@ def generate_full_voiceover(
             # 否则使用原始 seg["start"] 会导致段间出现与压缩比例成正比的累积空隙，
             # 字幕与音频严重错位。
             current_start = float(audio_segments[0]["start"]) if audio_segments else 0.0
+            current_segment = audio_segments[0].get("segment") if audio_segments else None
 
             for i, seg in enumerate(audio_segments):
+                if seg.get("segment") != current_segment:
+                    current_segment = seg.get("segment")
+                    current_start = float(seg.get("line_start", current_start))
+                atempo = rate_by_segment.get(current_segment, 1.0)
                 fast_path = tmp_dir / f"fast_{i:03d}.m4a"
                 try:
                     cmd = [
@@ -785,12 +891,12 @@ def generate_full_voiceover(
                 sub = aligned_subtitles[i]
                 new_start = current_start
                 new_end = new_start + new_duration
-                if new_end > total_duration - 0.1:
-                    new_end = total_duration - 0.1
-                    new_duration = new_end - new_start
-                    if new_duration < 0.1:
-                        # P1 修复：跳过当前过短片段，保留后续内容，而非截断全部
-                        continue
+                line_end = min(float(seg.get("line_end", total_duration)), total_duration - 0.1)
+                if new_end > line_end + 0.08:
+                    raise RuntimeError(
+                        f"口播段 {current_segment} 编码后仍越过镜头边界："
+                        f"{new_end:.2f}s > {line_end:.2f}s"
+                    )
 
                 new_segments.append({
                     "path": fast_path,
@@ -806,9 +912,6 @@ def generate_full_voiceover(
 
                 current_start = new_end
 
-                if new_end >= total_duration - 0.1:
-                    break
-
             audio_segments = new_segments
             aligned_subtitles = new_subtitles
 
@@ -821,6 +924,285 @@ def generate_full_voiceover(
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _generate_continuous_voiceover(
+    script_lines: List[Dict[str, any]],
+    output_path: Path,
+    tmp_dir: Path,
+    voice: str,
+    total_duration: float,
+    max_rate_multiplier: float,
+    continuous_text: Optional[str] = None,
+    performance_profile: Optional[Dict[str, Any]] = None,
+    pre_generated_audio: Optional[Path] = None,
+) -> Tuple[Path, List[Dict[str, any]]]:
+    """Synthesize one authored narration and keep captions locked to shot windows."""
+    readable_lines = [line for line in script_lines if str(line.get("text") or "").strip()]
+    if not readable_lines:
+        raise RuntimeError("连续口播没有可读文案")
+    full_text = re.sub(r"\s+", " ", str(continuous_text or "")).strip()
+    if not full_text:
+        raise RuntimeError("连续口播缺少显式完整文案，禁止把分镜短句拼接为一条伪连续口播")
+    raw_path = Path(pre_generated_audio) if pre_generated_audio else tmp_dir / "continuous_raw.m4a"
+    if pre_generated_audio:
+        if not raw_path.is_file():
+            raise RuntimeError(f"预生成连续口播不存在：{raw_path}")
+    else:
+        generate_tts_audio(full_text, raw_path, voice=voice)
+    raw_duration = _get_audio_duration(raw_path)
+    start = max(0.0, float(readable_lines[0].get("start", 0.0)))
+    requested_end = float(readable_lines[-1].get("end", total_duration - 0.1))
+    available = max(0.1, min(requested_end, total_duration - 0.1) - start)
+    raw_ratio = raw_duration / available
+    if pre_generated_audio:
+        tempo_multiplier = 1.0
+    elif raw_ratio > 1.0:
+        tempo_multiplier = raw_ratio
+    elif raw_ratio < 0.97:
+        tempo_multiplier = max(0.9, raw_ratio)
+    else:
+        tempo_multiplier = 1.0
+    if tempo_multiplier > max_rate_multiplier:
+        raise RuntimeError(
+            f"连续口播在最大 {max_rate_multiplier:.1f}x 语速下仍无法装入视频："
+            f"需要 {tempo_multiplier:.2f}x"
+        )
+    if performance_profile is not None:
+        performance_profile.update({
+            "mode": "single_take",
+            "tts_requests": 1,
+            "tts_reused": bool(pre_generated_audio),
+            "continuous_text": full_text,
+            "tempo_multiplier": round(tempo_multiplier, 4),
+        })
+
+    audio_path = raw_path
+    spoken_duration = raw_duration
+    if abs(tempo_multiplier - 1.0) > 0.001:
+        audio_path = tmp_dir / "continuous_timed.m4a"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(raw_path),
+                "-filter:a", f"atempo={tempo_multiplier:.4f}",
+                "-vn", "-c:a", "aac", "-b:a", "192k", str(audio_path),
+            ],
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+        spoken_duration = _get_audio_duration(audio_path)
+        action = "加速" if tempo_multiplier > 1.0 else "自然放慢"
+        print(f"  ⚡ 连续口播整体{action}到 {tempo_multiplier:.2f}x")
+
+    spoken_audio_end = _detect_spoken_audio_end(audio_path, spoken_duration)
+    speech_end = start + spoken_audio_end
+    trailing_gap = max(0.0, min(requested_end, total_duration - 0.1) - speech_end)
+    if performance_profile is not None:
+        performance_profile.update({
+            "spoken_audio_end": round(spoken_audio_end, 4),
+            "speech_end": round(speech_end, 4),
+            "trailing_gap": round(trailing_gap, 4),
+        })
+    if trailing_gap > 0.85:
+        raise RuntimeError(
+            f"单条连续口播尾部缺少口播：画面合同结束前仍有 {trailing_gap:.2f}s 空白"
+        )
+
+    _mix_audio_segments(
+        [{"path": audio_path, "start": start, "duration": spoken_duration}],
+        output_path,
+        total_duration,
+    )
+
+    return output_path, split_and_align_voiceover_subtitles(
+        readable_lines,
+        audio_path,
+        start + spoken_duration,
+    )
+
+
+def _detect_spoken_audio_end(audio_path: Path, duration: float) -> float:
+    """Measure the last non-silent sample in an unpadded TTS performance."""
+    if not audio_path.exists() or shutil.which("ffmpeg") is None:
+        return duration
+    result = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-i", str(audio_path),
+            "-af", "silencedetect=noise=-42dB:d=0.18", "-f", "null", "-",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        return duration
+    events = [
+        (kind, float(value))
+        for kind, value in re.findall(
+            r"silence_(start|end):\s*([0-9.]+)",
+            result.stderr or "",
+        )
+    ]
+    if not events or events[-1][0] != "start":
+        return duration
+    last_silence_start = events[-1][1]
+    return last_silence_start if duration - last_silence_start <= 3.0 else duration
+
+
+def _detect_audio_pause_intervals(
+    audio_path: Path,
+    duration: float,
+    minimum_duration: float = 0.12,
+) -> List[Tuple[float, float]]:
+    """Return closed, internal silence intervals measured from one TTS master."""
+    return _detect_audio_alignment(audio_path, duration, minimum_duration)["pauses"]
+
+
+def _detect_audio_alignment(
+    audio_path: Path,
+    duration: float,
+    minimum_duration: float = 0.12,
+) -> Dict[str, Any]:
+    """Measure spoken bounds and internal pauses from the same TTS performance."""
+    fallback = {"speech_start": 0.0, "speech_end": float(duration), "pauses": []}
+    if not audio_path.exists() or shutil.which("ffmpeg") is None:
+        return fallback
+    result = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-i", str(audio_path),
+            "-af", f"silencedetect=noise=-42dB:d={minimum_duration}", "-f", "null", "-",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        return fallback
+    open_start: Optional[float] = None
+    closed: List[Tuple[float, float]] = []
+    stderr = result.stderr if isinstance(result.stderr, str) else ""
+    for kind, value in re.findall(r"silence_(start|end):\s*([0-9.]+)", stderr):
+        point = float(value)
+        if kind == "start":
+            open_start = point
+        elif open_start is not None:
+            closed.append((open_start, point))
+            open_start = None
+
+    speech_start = 0.0
+    speech_end = float(duration)
+    if closed and closed[0][0] <= 0.05:
+        speech_start = min(float(duration), closed[0][1])
+    trailing = open_start
+    if trailing is None and closed and closed[-1][1] >= float(duration) - 0.05:
+        trailing = closed[-1][0]
+    if trailing is not None and float(duration) - trailing <= 3.0:
+        speech_end = max(speech_start + 0.1, min(float(duration), trailing))
+
+    pauses = [
+        (start, end)
+        for start, end in closed
+        if start > speech_start + 0.05
+        and end < speech_end - 0.05
+        and end - start >= minimum_duration
+    ]
+    return {
+        "speech_start": speech_start,
+        "speech_end": speech_end,
+        "pauses": pauses,
+    }
+
+
+def align_voiceover_lines_to_audio_pauses(
+    lines: List[Dict[str, Any]],
+    audio_path: Path,
+    duration: float,
+    preserve_container_edges: bool = False,
+) -> List[Dict[str, Any]]:
+    """Snap semantic cue boundaries to pauses measured in the single TTS performance."""
+    if not lines:
+        return []
+    container_start = float(lines[0].get("start", 0.0))
+    analysis = _detect_audio_alignment(audio_path, float(duration) - container_start)
+    start = (
+        container_start
+        if preserve_container_edges else
+        container_start + float(analysis["speech_start"])
+    )
+    end = (
+        max(container_start + 0.1, float(duration))
+        if preserve_container_edges else
+        max(start + 0.1, container_start + float(analysis["speech_end"]))
+    )
+    predicted = [float(line.get("end", end)) for line in lines[:-1]]
+    pause_centers = [
+        container_start + sum(interval) / 2.0
+        for interval in analysis["pauses"]
+    ]
+    tolerance = 1.2
+    boundaries: List[Tuple[float, str]] = []
+    candidate_index = 0
+    previous = start
+    for expected in predicted:
+        available = [
+            (index, value)
+            for index, value in enumerate(pause_centers[candidate_index:], candidate_index)
+            if value > previous + 0.1
+        ]
+        if available:
+            selected_index, selected = min(available, key=lambda item: abs(item[1] - expected))
+        else:
+            selected_index, selected = candidate_index, expected
+        if available and abs(selected - expected) <= tolerance:
+            boundary = selected
+            precision = "measured_audio_pause"
+            candidate_index = selected_index + 1
+        else:
+            boundary = expected
+            precision = "speech_weight_estimate"
+        boundary = max(previous + 0.1, min(boundary, end - 0.1 * (len(lines) - len(boundaries) - 1)))
+        boundaries.append((boundary, precision))
+        previous = boundary
+
+    aligned: List[Dict[str, Any]] = []
+    cursor = start
+    for index, line in enumerate(lines):
+        boundary, precision = boundaries[index] if index < len(boundaries) else (end, "measured_audio_end")
+        aligned.append({
+            **line,
+            "start": round(cursor, 4),
+            "end": round(boundary, 4),
+            "alignment_precision": precision,
+        })
+        cursor = boundary
+    return aligned
+
+
+def split_and_align_voiceover_subtitles(
+    lines: List[Dict[str, Any]],
+    audio_path: Path,
+    audio_end: float,
+    max_units: int = 11,
+) -> List[Dict[str, Any]]:
+    """Split punctuated speech into phrases and align them to the single TTS master."""
+    from video_merger import _split_single_line_text, _subtitle_units
+
+    phrases: List[Dict[str, Any]] = []
+    for line in lines:
+        chunks = _split_single_line_text(str(line.get("text") or ""), max_units)
+        if not chunks:
+            continue
+        start = float(line.get("start", 0.0))
+        end = float(line.get("end", start + 0.1))
+        weights = [max(1.0, _subtitle_units(chunk)) for chunk in chunks]
+        total_weight = sum(weights)
+        cursor = start
+        for index, (chunk, weight) in enumerate(zip(chunks, weights)):
+            chunk_end = end if index == len(chunks) - 1 else cursor + (end - start) * weight / total_weight
+            phrases.append({**line, "text": chunk, "start": cursor, "end": chunk_end})
+            cursor = chunk_end
+    return align_voiceover_lines_to_audio_pauses(phrases, audio_path, audio_end)
 
 
 def _get_audio_duration(audio_path: Path) -> float:
@@ -920,14 +1302,10 @@ def align_subtitles_to_voiceover(
     voiceover_subs: List[Dict[str, any]],
 ) -> List[Dict[str, any]]:
     """
-    将字幕与口播时间轴对齐（以口播为准，保留原字幕样式信息）。
+    将字幕替换为口播时间轴，并按 segment 继承原字幕样式信息。
 
-    策略：
-    - 按 text 内容做双指针模糊匹配（去标点对比），找到对应关系后
-      将 voiceover_sub 的 start/end 覆盖到原字幕条目，
-      其余字段（highlight / style_override 等）保留原值。
-    - voiceover_subs 多出的条目直接追加。
-    - 匹配不上的原字幕保留原时间，避免字幕消失。
+    口播文案与屏显短标题通常不是同一句，文本模糊匹配会同时保留两者，
+    造成同一时间两行字幕重叠。启用口播时，口播时间轴是唯一字幕来源。
 
     Args:
         subtitles: 原始字幕列表（含 highlight / style 等字段）
@@ -938,48 +1316,26 @@ def align_subtitles_to_voiceover(
     """
     if not voiceover_subs:
         return subtitles
-    if not subtitles:
-        return voiceover_subs
-
-    import re as _re
-
-    def _normalize(text: str) -> str:
-        """去掉标点和空格，便于模糊比较"""
-        return _re.sub(r"[\s\W]", "", text or "")
-
-    # 建立 voiceover_subs 的 normalized text → index 映射
-    vo_norm = [_normalize(v.get("text", "")) for v in voiceover_subs]
-    orig_norm = [_normalize(s.get("text", "")) for s in subtitles]
-
-    matched: List[Dict[str, any]] = []
-    vo_idx = 0  # 滑动游标
-
-    for i, sub in enumerate(subtitles):
-        orig_key = orig_norm[i]
-        found = False
-        # 在 voiceover_subs 的剩余部分中找最近匹配
-        for j in range(vo_idx, len(voiceover_subs)):
-            vo_key = vo_norm[j]
-            # 精确匹配或包含关系（口播断句可能更短）
-            if orig_key == vo_key or (orig_key and orig_key in vo_key) or (vo_key and vo_key in orig_key):
-                merged = dict(sub)  # 保留原字幕所有字段（highlight, style 等）
-                merged["start"] = voiceover_subs[j]["start"]
-                merged["end"] = voiceover_subs[j]["end"]
-                matched.append(merged)
-                vo_idx = j + 1
-                found = True
-                break
-        if not found:
-            # 匹配不上：保留原字幕原时间，不丢弃
-            matched.append(dict(sub))
-
-    # voiceover_subs 中多余的条目（原字幕没有的新断句）直接追加
-    for j in range(vo_idx, len(voiceover_subs)):
-        matched.append(dict(voiceover_subs[j]))
-
-    # 按 start 排序，确保时间轴有序
-    matched.sort(key=lambda s: s.get("start", 0))
-    return matched
+    styles_by_segment = {
+        int(sub.get("segment", index)): {
+            key: value
+            for key, value in sub.items()
+            if key not in {"text", "start", "end", "segment"}
+        }
+        for index, sub in enumerate(subtitles)
+    }
+    aligned = []
+    for index, spoken in enumerate(voiceover_subs):
+        segment = int(spoken.get("segment", index))
+        merged = dict(styles_by_segment.get(segment, {}))
+        merged.update({
+            "text": str(spoken.get("text") or ""),
+            "start": float(spoken["start"]),
+            "end": float(spoken["end"]),
+        })
+        merged["segment"] = segment
+        aligned.append(merged)
+    return sorted(aligned, key=lambda item: item.get("start", 0))
 
 
 def adjust_voiceover_to_video_duration(

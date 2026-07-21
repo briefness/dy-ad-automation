@@ -121,6 +121,83 @@ PACE_KEYWORDS = {
 }
 
 
+def _track_descriptor(track: Dict[str, Any]) -> str:
+    values: List[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            values.append(value.lower())
+        elif isinstance(value, dict):
+            for nested in value.values():
+                collect(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                collect(nested)
+
+    for key in ("title", "tags", "categories", "description"):
+        collect(track.get(key))
+    return " ".join(values)
+
+
+def rank_tracks_for_contract(
+    tracks: List[Dict[str, Any]],
+    music_contract: Optional[dict],
+    query: str = "",
+) -> List[Dict[str, Any]]:
+    """Deterministically rank track metadata against the selected-footage contract."""
+    contract = music_contract or {}
+    term_groups = {
+        "acoustic": {"acoustic", "guitar", "folk", "organic", "instrumental"},
+        "pop": {"pop", "upbeat", "positive", "rhythmic"},
+        "lofi": {"lofi", "chill", "mellow", "relaxing"},
+        "electronic": {"electronic", "modern", "technology", "synth"},
+        "warm": {"warm", "cozy", "gentle", "authentic", "delightful", "calm"},
+        "calm": {"calm", "quiet", "relaxing", "gentle", "slow"},
+        "upbeat": {"upbeat", "positive", "rhythmic", "uplifting"},
+        "natural_origin": {"organic", "folk", "acoustic", "gentle", "calm", "fields", "nature"},
+        "product_demo": {"upbeat", "rhythmic", "positive", "modern"},
+        "high": {"energetic", "uptempo", "rhythmic", "intense"},
+        "medium": {"steady", "groove", "rhythmic", "guitar", "instrumental"},
+        "low": {"calm", "ambient", "mellow", "gentle", "slow"},
+    }
+    wanted = []
+    for key in ("genre", "mood", "semantic_tone", "energy"):
+        value = str(contract.get(key) or "").lower()
+        wanted.extend(term_groups.get(value, {value} if value else set()))
+    negative = {"kids", "playful", "christmas", "vocal", "suspenseful"}
+    if str(contract.get("semantic_tone") or "") == "natural_origin":
+        negative.update({"corporate", "epic", "rock", "intense", "hype"})
+
+    ranked = []
+    for position, track in enumerate(tracks):
+        descriptor = _track_descriptor(track)
+        score = sum(1.0 for term in wanted if term and term in descriptor)
+        score -= sum(2.0 for term in negative if term in descriptor)
+        if query and query.lower() in descriptor:
+            score += 0.5
+        item = dict(track)
+        item["material_fit_score"] = round(score, 3)
+        ranked.append((score, -position, item))
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item for _, _, item in ranked]
+
+
+def _bpm_matches_contract(detected_bpm: float, music_contract: Optional[dict], pace: Optional[str]) -> bool:
+    if detected_bpm <= 0:
+        return str((music_contract or {}).get("energy") or "") == "low"
+    bpm_min = float((music_contract or {}).get("bpm_min") or 0)
+    bpm_max = float((music_contract or {}).get("bpm_max") or 0)
+    if bpm_min > 0 and bpm_max >= bpm_min:
+        perceived = [detected_bpm, detected_bpm * 2.0, detected_bpm / 2.0]
+        return any(bpm_min <= value <= bpm_max for value in perceived)
+    return (
+        (pace == "fast" and detected_bpm >= 110)
+        or (pace == "slow" and detected_bpm <= 90)
+        or (pace == "medium" and 80 <= detected_bpm <= 120)
+        or pace is None
+    )
+
+
 def _detect_pace_from_clips(clip_structure: list) -> str:
     """
     根据分镜结构推断视频节奏等级
@@ -491,6 +568,9 @@ def pick_bgm_for_product(
     min_duration = style_config.get("min_duration", 20)
     max_duration = style_config.get("max_duration", 120)
     order = style_config.get("order", "plays")
+    material_driven = str((music_contract or {}).get("source") or "") == "selected_local_assets"
+    if material_driven:
+        random_pick = False
 
     # 构建关键词搜索列表（优先级从高到低）
     all_keywords = []
@@ -587,85 +667,52 @@ def pick_bgm_for_product(
         if not valid_tracks:
             continue
 
-        # 选一首（优先选没听过的，增加多样性）
-        chosen = _pick_unique_track(valid_tracks, random_pick)
-        if not chosen:
-            continue
+        valid_tracks = rank_tracks_for_contract(valid_tracks, music_contract, query=keyword)
 
-        track_id = chosen["id"]
-        track_title = chosen.get("title", track_id)
-        track_duration = chosen.get("duration", 0)
-        track_mp3_url = chosen.get("files", {}).get("mp3")
+        candidates = list(valid_tracks)
+        while candidates:
+            chosen = _pick_unique_track(candidates, random_pick)
+            if not chosen:
+                break
+            candidates = [track for track in candidates if track["id"] != chosen["id"]]
+            track_id = chosen["id"]
+            track_title = chosen.get("title", track_id)
+            track_duration = chosen.get("duration", 0)
+            track_mp3_url = chosen.get("files", {}).get("mp3")
+            print(
+                f"🎵 候选 BGM：{track_title}（{int(track_duration)}s，"
+                f"素材匹配 {chosen.get('material_fit_score', 0):.1f}）"
+            )
+            local_path = download_track(track_id, track_title, download_url=track_mp3_url)
+            if not local_path:
+                continue
 
-        print(f"🎵 选中 BGM：{track_title}（{int(track_duration)}s）")
-
-        # 下载
-        local_path = download_track(track_id, track_title, download_url=track_mp3_url)
-        if local_path:
-            # P1 修复：BPM 校验，节奏不匹配则同一 keyword 内重试其他候选
-            if pace:
+            bpm_required = bool(
+                pace
+                or (music_contract or {}).get("bpm_min")
+                or (music_contract or {}).get("bpm_max")
+            )
+            if bpm_required:
                 try:
                     from video_merger import _detect_beats, _estimate_bpm
-                    beats = _detect_beats(local_path)
-                    detected_bpm = _estimate_bpm(beats)
-                    if detected_bpm > 0:
-                        bpm_ok = (
-                            (pace == "fast" and detected_bpm >= 110)
-                            or (pace == "slow" and detected_bpm <= 90)
-                            or (pace == "medium" and 80 <= detected_bpm <= 120)
-                        )
-                        if not bpm_ok:
-                            print(f"  ⚠️  BPM {detected_bpm:.0f} 不符合 {pace} 节奏，换下一首")
-                            # 不加入历史，删除下载的文件
-                            try:
-                                local_path.unlink()
-                            except Exception:
-                                pass
-                            # 从 valid_tracks 中移除当前这首，同一 keyword 内继续选其他候选
-                            valid_tracks = [t for t in valid_tracks if t["id"] != track_id]
-                            while valid_tracks:
-                                chosen = _pick_unique_track(valid_tracks, random_pick)
-                                if not chosen:
-                                    break
-                                track_id = chosen["id"]
-                                track_title = chosen.get("title", track_id)
-                                track_duration = chosen.get("duration", 0)
-                                track_mp3_url = chosen.get("files", {}).get("mp3")
-                                local_path = download_track(track_id, track_title, download_url=track_mp3_url)
-                                if not local_path:
-                                    valid_tracks = [t for t in valid_tracks if t["id"] != track_id]
-                                    continue
-                                beats = _detect_beats(local_path)
-                                detected_bpm = _estimate_bpm(beats)
-                                if detected_bpm > 0:
-                                    bpm_ok = (
-                                        (pace == "fast" and detected_bpm >= 110)
-                                        or (pace == "slow" and detected_bpm <= 90)
-                                        or (pace == "medium" and 80 <= detected_bpm <= 120)
-                                    )
-                                    if bpm_ok:
-                                        print(f"  ✅ BPM {detected_bpm:.0f} 符合 {pace} 节奏")
-                                        break
-                                    print(f"  ⚠️  BPM {detected_bpm:.0f} 不符合 {pace} 节奏，继续换")
-                                    try:
-                                        local_path.unlink()
-                                    except Exception:
-                                        pass
-                                valid_tracks = [t for t in valid_tracks if t["id"] != track_id]
-                            else:
-                                # 当前 keyword 所有候选都不符合，跳到下一个 keyword
-                                continue
-                        else:
-                            print(f"  ✅ BPM {detected_bpm:.0f} 符合 {pace} 节奏")
-                except Exception as e:
-                    print(f"  ⚠️  BPM 检测失败，跳过校验：{e}")
+                    detected_bpm = _estimate_bpm(_detect_beats(local_path))
+                    if not _bpm_matches_contract(detected_bpm, music_contract, pace):
+                        print(f"  ⚠️  实测 BPM {detected_bpm:.0f} 不符合素材合同，继续换")
+                        if material_driven:
+                            local_path.unlink(missing_ok=True)
+                        continue
+                    print(f"  ✅ 实测 BPM {detected_bpm:.0f} 符合素材合同")
+                except Exception as exc:
+                    if material_driven:
+                        print(f"  ⚠️  无法验证真实 BPM（{exc}），拒绝该候选")
+                        continue
+                    print(f"  ⚠️  BPM 检测失败，保留候选：{exc}")
 
-            # 加入历史记录，避免下次重复
             _add_bgm_history(track_id, track_title)
             return local_path
 
     # 所有关键词都失败了，用 default 兜底再试一次
-    if product_type != "default":
+    if product_type != "default" and not material_driven:
         print(f"⚠️ 品类「{product_type}」未找到合适 BGM，尝试默认风格...")
         result = pick_bgm_for_product(
             "default", target_duration, random_pick,
@@ -675,7 +722,7 @@ def pick_bgm_for_product(
             return result
 
     # 最终 fallback：扫描 assets/ 目录下的本地 BGM 文件
-    return _pick_local_bgm_fallback()
+    return None if material_driven else _pick_local_bgm_fallback()
 
 
 def _pick_local_bgm_fallback() -> Optional[Path]:
@@ -768,9 +815,17 @@ def get_bgm_copyright_info(bgm_path: Optional[Path]) -> dict:
     if "bgm_cache" in str(bgm_path):
         # 来自 FreeToUse API
         track_id = bgm_path.stem
+        title = next(
+            (
+                str(item.get("title") or track_id)
+                for item in reversed(_load_bgm_history())
+                if str(item.get("track_id") or "") == track_id
+            ),
+            track_id,
+        )
         return {
             "source": "freetouse_api",
-            "title": track_id,
+            "title": title,
             "is_commercial_safe": False,  # 免费版不保证商用
             "warning": "FreeToUse 免费版曲目，商用前请核实授权",
         }

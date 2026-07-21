@@ -512,6 +512,32 @@ export KLING_BASE_URL="https://api-beijing.klingai.com"
 
 ## ✍️ 广告脚本生成
 
+### 本地素材脚本反馈学习
+
+本地素材流程的主观脚本质量规则冷启动为空。程序不会预设“钩子必须怎样”“必须有购买理由”或固定创意分数，也不会把自动质检结果当作使用者反馈。素材事实边界、连续口播结构和真实时长只用于确认脚本能否执行。
+
+每次成片会在最终视频旁保存同名 `.script.json`。使用者可以把具体成片的真实评价录入规则库：
+
+```bash
+python script_feedback.py \
+  --video output/final/示例_final.mp4 \
+  --rule "字幕应该像带货文案而不是画面描述" \
+  --verdict violated \
+  --comment "这版只是重复描述画面"
+```
+
+认可某个成片符合相同规则时：
+
+```bash
+python script_feedback.py \
+  --video output/final/另一版_final.mp4 \
+  --rule "字幕应该像带货文案而不是画面描述" \
+  --verdict satisfied \
+  --comment "这版把素材转成了选择理由"
+```
+
+同一规则必须获得至少两个不同成片的明确使用者反馈后才成为 active 规则。相同成片重复反馈不会提升可信度。自动评分、LLM 判断和参考视频分析不能创建或晋升规则；参考视频只提供生成时可观察的结构和语气。
+
 内置完整的 5 段式广告脚本生成引擎，根据产品信息自动生成：
 
 - **痛点钩子** — 从品类痛点库中随机抽取，引发共鸣

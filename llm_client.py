@@ -36,6 +36,23 @@ from config import (
 )
 
 
+class LLMJSONError(RuntimeError):
+    """Base class for a received response whose JSON contract is unusable."""
+
+    def __init__(self, message: str, raw_text: str, finish_reason: str = ""):
+        super().__init__(message)
+        self.raw_text = raw_text
+        self.finish_reason = finish_reason
+
+
+class LLMJSONParseError(LLMJSONError):
+    """The provider returned a complete response that is not valid JSON."""
+
+
+class LLMJSONTruncatedError(LLMJSONError):
+    """The provider stopped because the output token budget was exhausted."""
+
+
 # ============================================================
 # LLM 客户端
 # ============================================================
@@ -179,6 +196,7 @@ class LLMClient:
         messages: List[Dict[str, str]],
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        raise_on_parse_error: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """
         发送聊天请求，返回解析后的 JSON 字典。
@@ -217,32 +235,62 @@ class LLMClient:
         # P1 修复：真正使用 response_format 参数（OpenAI 兼容标准）
         # 先尝试带 response_format 调用，如果模型不支持会报错，再降级
         text = None
+        finish_reason = ""
+        response_format_unsupported = False
         if self.api_key:
-            try:
-                url = f"{self.base_url}/chat/completions"
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}",
-                }
-                payload = {
-                    "model": self.model,
-                    "messages": json_messages,
-                    "temperature": temperature if temperature is not None else LLM_TEMPERATURE,
-                    "max_tokens": max_tokens if max_tokens is not None else LLM_MAX_TOKENS,
-                    "stream": False,
-                    "response_format": {"type": "json_object"},
-                }
-                resp = self._session.post(
-                    url, json=payload, headers=headers, timeout=self.timeout,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                text = data["choices"][0]["message"]["content"]
-            except Exception:
-                # 降级：不用 response_format，靠 prompt + 文本解析
-                pass
+            url = f"{self.base_url}/chat/completions"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            }
+            payload = {
+                "model": self.model,
+                "messages": json_messages,
+                "temperature": temperature if temperature is not None else LLM_TEMPERATURE,
+                "max_tokens": max_tokens if max_tokens is not None else LLM_MAX_TOKENS,
+                "stream": False,
+                "response_format": {"type": "json_object"},
+            }
+            last_error = None
+            for attempt in range(self.max_retries + 1):
+                try:
+                    resp = self._session.post(
+                        url, json=payload, headers=headers, timeout=self.timeout,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    choice = data["choices"][0]
+                    text = choice["message"]["content"]
+                    finish_reason = str(choice.get("finish_reason") or "")
+                    break
+                except requests.exceptions.HTTPError as exc:
+                    status = exc.response.status_code if exc.response is not None else 0
+                    detail = exc.response.text.lower() if exc.response is not None else ""
+                    if status in {400, 404, 422} and (
+                        "response_format" in detail
+                        and any(term in detail for term in ("not support", "unsupported", "unknown"))
+                    ):
+                        response_format_unsupported = True
+                        break
+                    last_error = f"HTTP 错误：{exc}"
+                except requests.exceptions.Timeout as exc:
+                    last_error = f"请求超时：{exc}"
+                except requests.exceptions.ConnectionError as exc:
+                    last_error = f"连接错误：{exc}"
+                except Exception as exc:
+                    last_error = f"JSON 请求失败：{exc}"
+                if attempt < self.max_retries:
+                    wait_sec = 2 ** attempt
+                    print(
+                        f"⚠️  LLM JSON 调用失败（第 {attempt + 1} 次），"
+                        f"{wait_sec}s 后重试...  {last_error}"
+                    )
+                    time.sleep(wait_sec)
+            if text is None and not response_format_unsupported:
+                print(f"❌ LLM JSON 调用失败（已重试 {self.max_retries} 次）：{last_error}")
+                return None
 
-        if text is None:
+        if text is None and response_format_unsupported:
             text = self.chat(json_messages, temperature=temperature, max_tokens=max_tokens)
         if text is None:
             return None
@@ -253,6 +301,9 @@ class LLMClient:
         except Exception as e:
             print(f"❌ LLM JSON 解析失败：{e}")
             print(f"   原始输出前 200 字：{text[:200]}")
+            if raise_on_parse_error:
+                error_type = LLMJSONTruncatedError if finish_reason == "length" else LLMJSONParseError
+                raise error_type(str(e), text, finish_reason) from e
             return None
 
     # ----------------------------------------------------------

@@ -3152,6 +3152,7 @@ def script_to_subtitles(
     num_clips: Optional[int] = None,
     seg_indices: Optional[List[int]] = None,
     segment_durations: Optional[Dict[int, float]] = None,
+    segment_timeline: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     将广告脚本转换为字幕列表
@@ -3167,6 +3168,8 @@ def script_to_subtitles(
         segment_durations: 每段的独立时长映射 {seg_idx: duration}。
             提供时覆盖 clip_duration，实现节奏模板驱动的非等长时间轴。
             None 时使用均匀 clip_duration（向后兼容）。
+        segment_timeline: 实际渲染时间轴。提供后作为唯一时间来源，覆盖统一转场时长
+            与 segment_durations，确保字幕跟随真实镜头边界。
 
     Returns:
         字幕列表（text/start/end）
@@ -3209,6 +3212,14 @@ def script_to_subtitles(
             ordered = ordered[:num_clips]
 
     seg_starts = _get_seg_start(ordered)
+    if segment_timeline is not None:
+        timeline_map = {int(item["index"]): item for item in segment_timeline}
+        index_set = set(timeline_map)
+        seg_starts = {index: float(item["start"]) for index, item in timeline_map.items()}
+        dur_map = {
+            index: float(item.get("duration", float(item["end"]) - float(item["start"])))
+            for index, item in timeline_map.items()
+        }
 
     subtitles = []
     for seg in script["segments"]:
@@ -3224,7 +3235,7 @@ def script_to_subtitles(
         text = seg.get("subtitle", "")
         start = seg_start + seg_dur * 0.15
         end = seg_start + seg_dur * 0.85
-        subtitles.append({"text": text, "start": start, "end": end})
+        subtitles.append({"text": text, "start": start, "end": end, "segment": seg_idx})
     return subtitles
 
 
@@ -3235,6 +3246,7 @@ def script_to_voiceover(
     num_clips: Optional[int] = None,
     seg_indices: Optional[List[int]] = None,
     segment_durations: Optional[Dict[int, float]] = None,
+    segment_timeline: Optional[List[Dict[str, Any]]] = None,
     voiceover_style: str = "standard",
 ) -> List[Dict[str, Any]]:
     """
@@ -3251,11 +3263,18 @@ def script_to_voiceover(
         segment_durations: 每段的独立时长映射 {seg_idx: duration}。
             提供时覆盖 clip_duration，实现节奏模板驱动的非等长时间轴。
             None 时使用均匀 clip_duration（向后兼容）。
+        segment_timeline: 实际渲染时间轴。提供后作为唯一时间来源，覆盖统一转场时长
+            与 segment_durations，确保口播跟随真实镜头边界。
         voiceover_style: 口播风格（standard/emotional/energetic/professional/storytelling）。
 
     Returns:
         口播列表（text/start/end/segment）
     """
+    has_continuous_contract = bool(script.get("voiceover_full"))
+    if has_continuous_contract:
+        from local_asset_pipeline import validate_continuous_voiceover_contract
+
+        validate_continuous_voiceover_contract(script)
     # P1 #2（v2）：seg_indices 白名单优先
     index_set: Optional[set] = set(seg_indices) if seg_indices is not None else None
     pos_map: Dict[int, int] = (
@@ -3292,6 +3311,14 @@ def script_to_voiceover(
             ordered = ordered[:num_clips]
 
     seg_starts = _get_seg_start(ordered)
+    if segment_timeline is not None:
+        timeline_map = {int(item["index"]): item for item in segment_timeline}
+        index_set = set(timeline_map)
+        seg_starts = {index: float(item["start"]) for index, item in timeline_map.items()}
+        dur_map = {
+            index: float(item.get("duration", float(item["end"]) - float(item["start"])))
+            for index, item in timeline_map.items()
+        }
 
     def _apply_voiceover_style(text: str, style: str, seg_idx: int) -> str:
         text = text.strip()
@@ -3325,7 +3352,9 @@ def script_to_voiceover(
                 break
         seg_dur = dur_map.get(seg_idx, float(clip_duration))
         seg_start = seg_starts.get(seg_idx, 0.0)
-        text = _apply_voiceover_style(seg.get("voiceover", ""), voiceover_style, seg_idx)
+        text = str(seg.get("voiceover", "")).strip()
+        if not has_continuous_contract:
+            text = _apply_voiceover_style(text, voiceover_style, seg_idx)
         start = seg_start + seg_dur * 0.1
         end = seg_start + seg_dur * 0.9
         lines.append({"text": text, "start": start, "end": end, "segment": seg_idx})

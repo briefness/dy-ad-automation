@@ -3,6 +3,9 @@ pyyaml>=6.0
 python-dotenv>=1.0.0
 pytest>=7.0.0
 Pillow>=9.0.0
+numpy>=1.24.0          # 连续帧运动统计与稳健聚合
+opencv-python-headless>=4.8.0; sys_platform != "darwin"  # 光流、全局相机运动与主体残差运动分离
+opencv-python>=4.8.0; sys_platform == "darwin"  # macOS 复用本地 OpenCV 运行时
 PyJWT>=2.8.0          # JWT 鉴权（kling_client.py）
 pyttsx3>=2.90         # 跨平台 TTS fallback（tts_client.py）
 fonttools>=4.43.0     # ASS 字幕字体名称读取（video_merger.py，可选）

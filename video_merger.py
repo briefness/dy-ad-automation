@@ -16,6 +16,10 @@
 
 import shutil
 import subprocess
+import re
+import math
+import unicodedata
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 
@@ -87,6 +91,243 @@ def _color_range_args() -> List[str]:
         "-color_trc", "bt709",
         "-color_primaries", "bt709",
     ]
+
+
+def _subtitle_units(text: str) -> float:
+    return sum(1.0 if ord(char) > 127 else 0.55 for char in text)
+
+
+@lru_cache(maxsize=256)
+def _native_word_boundaries(text: str) -> frozenset[int]:
+    """Return macOS NaturalLanguage word boundaries without adding a tokenizer dependency."""
+    if not text or shutil.which("swift") is None:
+        return frozenset()
+    swift_source = r'''
+import Foundation
+import NaturalLanguage
+let data = FileHandle.standardInput.readDataToEndOfFile()
+guard let text = String(data: data, encoding: .utf8) else { exit(1) }
+let tokenizer = NLTokenizer(unit: .word)
+tokenizer.string = text
+var offsets: [Int] = []
+tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
+    offsets.append(text.distance(from: text.startIndex, to: range.upperBound))
+    return true
+}
+print(offsets.map(String.init).joined(separator: ","))
+'''
+    try:
+        result = subprocess.run(
+            ["swift", "-e", swift_source],
+            input=text,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        return frozenset(int(value) for value in result.stdout.strip().split(",") if value)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return frozenset()
+
+
+def _subtitle_cut_penalty(
+    text: str,
+    cut: int,
+    target_units: float,
+    word_boundaries: frozenset[int],
+) -> float:
+    """Score a Chinese caption cut by balance and phrase-boundary quality."""
+    if cut <= 0 or cut >= len(text):
+        return float("inf")
+    penalty = abs(_subtitle_units(text[:cut]) - target_units)
+    if word_boundaries and cut not in word_boundaries:
+        penalty += 100.0
+    if word_boundaries and cut in word_boundaries:
+        previous = max((boundary for boundary in word_boundaries if boundary < cut), default=0)
+        following = min((boundary for boundary in word_boundaries if boundary > cut), default=len(text))
+        if cut - previous == 1 and following - cut == 1:
+            penalty += 7.0
+    left = text[cut - 1]
+    right = text[cut]
+    if left in "的地得和与及跟把被向给在从为是有这那一各每" or right in "的地得和与及跟把被向给在从为是有这那一各每":
+        penalty += 8.0
+    if left in "装型款类式" and "\u4e00" <= right <= "\u9fff":
+        penalty += 12.0
+    if text[max(0, cut - 2):cut] in {"不同", "各种", "多种", "每种", "这款", "那款"}:
+        penalty += 12.0
+    if left in "，。！？；、：,.!?;:" or right in "，。！？；、：,.!?;:":
+        penalty -= 2.0
+    return penalty
+
+
+def _split_single_line_text(text: str, max_units: int) -> List[str]:
+    cleaned = re.sub(r"\s+", "", str(text or "").replace("\\N", "").replace("\n", ""))
+    if not cleaned:
+        return []
+    phrases = [part for part in re.split(r"(?<=[，。！？；、：,.!?;:])", cleaned) if part]
+    chunks: List[str] = []
+    current = ""
+    for phrase in phrases:
+        if _subtitle_units(current + phrase) <= max_units:
+            current += phrase
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if _subtitle_units(phrase) > max_units:
+            total_units = _subtitle_units(phrase)
+            parts_needed = max(2, math.ceil(total_units / max_units))
+            remaining = phrase
+            for part_index in range(parts_needed - 1):
+                remaining_parts = parts_needed - part_index
+                target = _subtitle_units(remaining) / remaining_parts
+                word_boundaries = _native_word_boundaries(remaining)
+                candidates = range(1, len(remaining))
+                cut = min(
+                    candidates,
+                    key=lambda candidate: _subtitle_cut_penalty(
+                        remaining, candidate, target, word_boundaries,
+                    ),
+                )
+                chunks.append(remaining[:cut])
+                remaining = remaining[cut:]
+            phrase = remaining
+        if phrase:
+            current = phrase
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def prepare_single_line_subtitles(
+    subtitles: List[Dict[str, Any]],
+    max_units: int = 11,
+) -> List[Dict[str, Any]]:
+    """Split timed speech into readable, strictly single-line caption phrases."""
+    prepared: List[Dict[str, Any]] = []
+    for subtitle in subtitles:
+        spoken_chunks = _split_single_line_text(subtitle.get("text", ""), max_units)
+        chunks = [
+            display
+            for chunk in spoken_chunks
+            if (display := strip_subtitle_punctuation(chunk))
+        ]
+        if not chunks:
+            continue
+        start = float(subtitle.get("start", 0.0))
+        end = max(start + 0.1, float(subtitle.get("end", start + 2.0)))
+        weights = [max(_subtitle_units(chunk), 1.0) for chunk in chunks]
+        total_weight = sum(weights)
+        cursor = start
+        for index, (chunk, weight) in enumerate(zip(chunks, weights)):
+            chunk_end = end if index == len(chunks) - 1 else cursor + (end - start) * weight / total_weight
+            item = dict(subtitle)
+            item["text"] = chunk
+            item["start"] = cursor
+            item["end"] = chunk_end
+            highlights = item.get("highlight") or []
+            item["highlight"] = [word for word in highlights if word and word in chunk]
+            prepared.append(item)
+            cursor = chunk_end
+    return prepared
+
+
+def strip_subtitle_punctuation(text: str) -> str:
+    """Remove punctuation and symbols from display captions while preserving spoken copy."""
+    cleaned = "".join(
+        char for char in str(text or "")
+        if not unicodedata.category(char).startswith(("P", "S"))
+    )
+    return re.sub(r"\s+", "", cleaned).strip()
+
+
+def build_tail_card_display_text(product_name: str, cta_text: str) -> str:
+    """Build punctuation-free tail-card copy without changing the spoken CTA source."""
+    return " ".join(
+        value
+        for value in (
+            strip_subtitle_punctuation(product_name),
+            strip_subtitle_punctuation(cta_text),
+        )
+        if value
+    )
+
+
+def _relative_luminance(rgb: Tuple[int, int, int]) -> float:
+    channels = []
+    for value in rgb:
+        channel = max(0.0, min(1.0, value / 255.0))
+        channels.append(channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def choose_readable_subtitle_color(
+    background_rgb: Tuple[int, int, int],
+    candidates: List[str],
+    fallback: str = "#FFFFFF",
+    minimum_contrast: float = 4.5,
+) -> str:
+    """Choose the highest-contrast candidate, falling back to white when uncertain."""
+    background_luminance = _relative_luminance(background_rgb)
+    scored = []
+    for color in candidates:
+        if not re.fullmatch(r"#[0-9A-Fa-f]{6}", str(color or "")):
+            continue
+        rgb = tuple(int(color[index:index + 2], 16) for index in (1, 3, 5))
+        luminance = _relative_luminance(rgb)
+        contrast = (max(background_luminance, luminance) + 0.05) / (min(background_luminance, luminance) + 0.05)
+        scored.append((contrast, str(color).upper()))
+    if not scored:
+        return fallback.upper()
+    contrast, color = max(scored)
+    return color if contrast >= minimum_contrast else fallback.upper()
+
+
+def assign_intelligent_subtitle_colors(
+    video: Path,
+    subtitles: List[Dict[str, Any]],
+    candidates: List[str],
+    fallback: str = "#FFFFFF",
+) -> List[Dict[str, Any]]:
+    """Sample each caption window and attach a readable per-caption color."""
+    from io import BytesIO
+    from PIL import Image
+
+    colored = []
+    for subtitle in subtitles:
+        item = dict(subtitle)
+        timestamp = (float(item.get("start", 0.0)) + float(item.get("end", 0.0))) / 2
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-v", "error", "-ss", f"{timestamp:.3f}", "-i", str(video),
+                    "-frames:v", "1", "-vf", "scale=270:480", "-f", "image2pipe", "-vcodec", "png", "-",
+                ],
+                capture_output=True,
+                timeout=20,
+                check=True,
+            )
+            frame = Image.open(BytesIO(result.stdout)).convert("RGB")
+            region = frame.crop((int(frame.width * 0.15), int(frame.height * 0.55), int(frame.width * 0.85), int(frame.height * 0.82)))
+            background = tuple(int(value) for value in region.resize((1, 1), Image.Resampling.LANCZOS).getpixel((0, 0)))
+            item["color"] = choose_readable_subtitle_color(background, candidates, fallback=fallback)
+        except Exception:
+            item["color"] = fallback.upper()
+        colored.append(item)
+    return colored
+
+
+def choose_subtitle_animation(narrative: str, has_voiceover: bool = False) -> str:
+    """Choose restrained animation by narrative purpose; voiceover never implies typewriter."""
+    normalized = str(narrative or "").strip().lower()
+    tokens = set(re.findall(r"[a-z_]+", normalized))
+    if tokens & {"hook", "intro", "opening", "attention", "pain_point"}:
+        return "pop"
+    if tokens & {"cta", "call_to_action", "outro"}:
+        return "slide"
+    if tokens & {"usage_demo", "demo", "result", "proof", "highlight"}:
+        return "highlight" if has_voiceover else "fade"
+    return "fade"
 
 
 # ============================================================
@@ -392,8 +633,6 @@ def select_transition(
     Returns:
         转场配置字典：{"type": str, "duration": float}
     """
-    import random
-
     style = style if style in _STYLE_CONFIG else "default"
     style_cfg = _STYLE_CONFIG[style]
 
@@ -417,12 +656,8 @@ def select_transition(
         if not candidates:
             candidates = ["dissolve"]
 
-    # 3. 从候选中选择（优先第一个，加一定随机性）
-    # 70% 概率选第一个，30% 概率在剩余中随机
-    if len(candidates) > 1 and random.random() < 0.3:
-        chosen_type = random.choice(candidates[1:])
-    else:
-        chosen_type = candidates[0]
+    # 3. 旧调用路径也必须可复现；完整智能决策由 intelligent_transition.py 执行。
+    chosen_type = candidates[0]
 
     # 4. 计算时长
     info = TRANSITION_LIBRARY[chosen_type]
@@ -1556,10 +1791,12 @@ def create_transition_ffmpeg(
         filter_complex = (
             f"[0:v]scale={OUTPUT_RESOLUTION.replace('x', ':')}:force_original_aspect_ratio=decrease,"
             f"pad={OUTPUT_RESOLUTION.replace('x', ':')}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"fps={OUTPUT_FPS},format=yuv420p,setsar=1[v0n];"
+            f"fps={OUTPUT_FPS},format=yuv420p,setsar=1,"
+            f"settb=expr=1/{OUTPUT_FPS},setpts=N/({OUTPUT_FPS}*TB)[v0n];"
             f"[1:v]scale={OUTPUT_RESOLUTION.replace('x', ':')}:force_original_aspect_ratio=decrease,"
             f"pad={OUTPUT_RESOLUTION.replace('x', ':')}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"fps={OUTPUT_FPS},format=yuv420p,setsar=1[v1n];"
+            f"fps={OUTPUT_FPS},format=yuv420p,setsar=1,"
+            f"settb=expr=1/{OUTPUT_FPS},setpts=N/({OUTPUT_FPS}*TB)[v1n];"
             f"[v0n][v1n]xfade=transition={xfade_type}:duration={duration}:offset={offset}[vout];"
             f"[0:a][1:a]acrossfade=d={duration}:c1=tri:c2=tri[aout]"
         )
@@ -1569,10 +1806,12 @@ def create_transition_ffmpeg(
         filter_parts_v = (
             f"[0:v]scale={OUTPUT_RESOLUTION.replace('x', ':')}:force_original_aspect_ratio=decrease,"
             f"pad={OUTPUT_RESOLUTION.replace('x', ':')}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"fps={OUTPUT_FPS},format=yuv420p,setsar=1[v0n];"
+            f"fps={OUTPUT_FPS},format=yuv420p,setsar=1,"
+            f"settb=expr=1/{OUTPUT_FPS},setpts=N/({OUTPUT_FPS}*TB)[v0n];"
             f"[1:v]scale={OUTPUT_RESOLUTION.replace('x', ':')}:force_original_aspect_ratio=decrease,"
             f"pad={OUTPUT_RESOLUTION.replace('x', ':')}:(ow-iw)/2:(oh-ih)/2:black,"
-            f"fps={OUTPUT_FPS},format=yuv420p,setsar=1[v1n];"
+            f"fps={OUTPUT_FPS},format=yuv420p,setsar=1,"
+            f"settb=expr=1/{OUTPUT_FPS},setpts=N/({OUTPUT_FPS}*TB)[v1n];"
             f"[v0n][v1n]xfade=transition={xfade_type}:duration={duration}:offset={offset}[vout]"
         )
         if clip1_has_audio and not clip2_has_audio:
@@ -1621,6 +1860,38 @@ def create_transition_ffmpeg(
     return output
 
 
+def normalize_transition_decisions(
+    clips: List[Path],
+    transitions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return the exact frame-aligned transition durations the renderer will use."""
+    if len(transitions) != max(0, len(clips) - 1):
+        raise ValueError(
+            f"转场数量必须等于镜头数减一：收到 {len(transitions)} 个转场 / {len(clips)} 个镜头"
+        )
+    durations = [_get_clip_duration(clip) for clip in clips]
+    normalized = []
+    for index, transition in enumerate(transitions):
+        item = dict(transition)
+        transition_type = str(item.get("type") or "none").lower()
+        requested = item.get("duration")
+        requested_duration = 0.0 if requested is None else float(requested)
+        if transition_type in {"none", "cut"}:
+            render_duration = 0.0
+        else:
+            render_duration = min(
+                requested_duration,
+                min(durations[index], durations[index + 1]) * 0.45,
+            )
+            if render_duration <= 0:
+                raise ValueError(f"边界 {index} 的 {transition_type} 转场时长必须大于 0")
+            render_duration = round(render_duration * OUTPUT_FPS) / OUTPUT_FPS
+        item["requested_duration"] = requested_duration
+        item["duration"] = render_duration
+        normalized.append(item)
+    return normalized
+
+
 def _merge_with_transitions(
     clips: List[Path],
     output: Path,
@@ -1647,6 +1918,7 @@ def _merge_with_transitions(
     Returns:
         输出文件路径
     """
+    transitions = normalize_transition_decisions(clips, transitions)
     durations = [_get_clip_duration(clip) for clip in clips]
     # P0 修复：必须所有片段都有音轨才能用 acrossfade；any() 会导致引用无音轨片段的 [N:a] 崩溃
     clip_audio_flags = [_has_audio_stream(clip) for clip in clips]
@@ -1661,27 +1933,36 @@ def _merge_with_transitions(
             f"pad={OUTPUT_RESOLUTION.replace('x', ':')}:(ow-iw)/2:(oh-ih)/2:black,"
             f"fps={OUTPUT_FPS},"
             f"format=yuv420p,"
-            f"setsar=1{norm_label}"
+            f"setsar=1,settb=expr=1/{OUTPUT_FPS},"
+            f"setpts=N/({OUTPUT_FPS}*TB){norm_label}"
         )
 
     # 构建视频 xfade 滤镜链（使用归一化后的 clip）
     # O6 修复：用整数帧累积计算 offset，消除 5 段浮点累积后 ±0.05s 的时序误差
     video_parts = []
     current_vlabel = "[vn00]"
-    cumulative_frames = 0  # 整数帧计数，避免浮点累积误差
+    current_duration_frames = round(durations[0] * OUTPUT_FPS)
 
     for i in range(len(clips) - 1):
-        trans_type = XFADE_TYPE_MAP.get(transitions[i]["type"], "fade")
-        # P0 修复：转场时长不能超过相邻两段较短者的 45%，否则后片段过短会让 xfade 读空
-        max_trans = min(durations[i], durations[i + 1]) * 0.45
-        trans_duration = min(transitions[i]["duration"], max_trans)
+        transition_name = str(transitions[i].get("type") or "none").lower()
+        if transition_name in {"none", "cut"}:
+            next_vlabel = f"[v{i:02d}]"
+            video_parts.append(
+                f"{current_vlabel}[vn{i+1:02d}]concat=n=2:v=1:a=0,"
+                f"settb=expr=1/{OUTPUT_FPS},setpts=N/({OUTPUT_FPS}*TB){next_vlabel}"
+            )
+            current_vlabel = next_vlabel
+            current_duration_frames += round(durations[i + 1] * OUTPUT_FPS)
+            continue
+
+        trans_type = XFADE_TYPE_MAP.get(transition_name, "fade")
+        trans_duration = float(transitions[i]["duration"])
         if trans_duration <= 0:
             raise RuntimeError(f"片段时长异常，无法创建转场：{clips[i].name} / {clips[i + 1].name}")
         # 整数帧计算：先转帧数再转回秒，消除浮点累积误差
-        dur_frames = round(durations[i] * OUTPUT_FPS)
         trans_frames = round(trans_duration * OUTPUT_FPS)
         # offset 保护：防止 trans_frames >= dur_frames 时 ffmpeg 报错
-        raw_offset_frames = cumulative_frames + dur_frames - trans_frames
+        raw_offset_frames = current_duration_frames - trans_frames
         offset_frames = max(0, raw_offset_frames)
         offset = offset_frames / OUTPUT_FPS
         # 精确转场时长（按帧对齐）
@@ -1690,10 +1971,11 @@ def _merge_with_transitions(
         next_vlabel = f"[v{i:02d}]"
         video_parts.append(
             f"{current_vlabel}[vn{i+1:02d}]xfade=transition={trans_type}:"
-            f"duration={trans_duration_aligned:.4f}:offset={offset:.4f}{next_vlabel}"
+            f"duration={trans_duration_aligned:.4f}:offset={offset:.4f},"
+            f"settb=expr=1/{OUTPUT_FPS},setpts=N/({OUTPUT_FPS}*TB){next_vlabel}"
         )
         current_vlabel = next_vlabel
-        cumulative_frames += dur_frames - trans_frames
+        current_duration_frames += round(durations[i + 1] * OUTPUT_FPS) - trans_frames
 
     filter_parts = norm_parts + video_parts
 
@@ -1747,7 +2029,10 @@ def _merge_with_transitions(
         fade_filters = []
         cumulative_a = 0.0
         for i in range(len(clips) - 1):
-            trans_d = transitions[i]["duration"]
+            trans_d = float(transitions[i].get("duration") or 0.0)
+            if trans_d <= 0:
+                cumulative_a += durations[i]
+                continue
             fade_out_start = cumulative_a + durations[i] - trans_d
             fade_in_start  = cumulative_a + durations[i]
             if fade_out_start > 0:
@@ -1768,7 +2053,7 @@ def _merge_with_transitions(
             current_alabel = "[acatraw]"
 
         # P0 修复：将音频精确截断到视频总时长（concat 输出比 xfade 视频长 sum(trans_d)）
-        total_video_duration = sum(durations) - sum(t["duration"] for t in transitions)
+        total_video_duration = sum(durations) - sum(float(t.get("duration") or 0.0) for t in transitions)
         audio_trimmed = "[acattrim]"
         audio_concat_parts.append(
             f"{current_alabel}atrim=duration={total_video_duration:.4f},asetpts=PTS-STARTPTS{audio_trimmed}"
@@ -1780,7 +2065,7 @@ def _merge_with_transitions(
     # BGM 混音（智能选段 + 淡入淡出）
     bgm_input_index = len(clips)
     if bgm and bgm.exists():
-        total_duration = sum(durations) - sum(t["duration"] for t in transitions)
+        total_duration = sum(durations) - sum(float(t.get("duration") or 0.0) for t in transitions)
         # Bug #4 修复：直接传入正确的 input_label，消除脆弱的 string replace
         bgm_filter = _build_bgm_audio_filter(
             total_duration,
@@ -2185,6 +2470,7 @@ def merge_clips_ffmpeg(
     bgm: Optional[Path] = None,
     subtitles: Optional[List[Dict[str, Any]]] = None,
     envelope_key_times: Optional[List[float]] = None,
+    strict_transitions: bool = False,
 ) -> Path:
     """
     使用 ffmpeg 拼接多个视频片段，支持真正的交叉转场
@@ -2200,6 +2486,7 @@ def merge_clips_ffmpeg(
         subtitles: （已废弃，由 add_subtitles_ffmpeg 单独处理）字幕配置列表
         envelope_key_times: Q4 优化：节奏模板的实际段落边界时间点（秒）列表。
             传入时用于构建精确的 BGM 音量包络曲线，不传则默认均分估算。
+        strict_transitions: 智能转场模式。要求数量精确匹配，合成失败时直接阻断。
 
     Returns:
         输出文件路径
@@ -2208,15 +2495,28 @@ def merge_clips_ffmpeg(
     if not clips:
         raise ValueError("没有可拼接的视频片段")
 
-    # 尝试使用转场效果（转场数量不足时循环使用）
+    # 智能转场必须使用逐边界决策，禁止循环复用或失败后降级。
     if transitions:
         try:
             num_transitions_needed = len(clips) - 1
-            full_transitions = [transitions[i % len(transitions)] for i in range(num_transitions_needed)]
+            if strict_transitions and len(transitions) != num_transitions_needed:
+                raise RuntimeError(
+                    f"智能转场数量不匹配：需要 {num_transitions_needed}，实际 {len(transitions)}"
+                )
+            full_transitions = (
+                list(transitions)
+                if strict_transitions
+                else [transitions[i % len(transitions)] for i in range(num_transitions_needed)]
+            )
             return _merge_with_transitions(clips, output, full_transitions, bgm,
                                            envelope_key_times=envelope_key_times)
         except Exception as e:
+            if strict_transitions:
+                raise RuntimeError(f"智能转场合成失败，已阻断输出：{e}") from e
             print(f"⚠️ 转场拼接失败（{e}），回退到简单拼接")
+
+    if strict_transitions and len(clips) > 1:
+        raise RuntimeError("智能转场决策缺失，已阻断输出")
 
     # 简单拼接（无转场或转场失败时回退）
     return _merge_simple_concat(clips, output, bgm, envelope_key_times=envelope_key_times)
@@ -2463,7 +2763,7 @@ Title: Fancy Subtitles
 ScriptType: v4.00+
 PlayResX: {video_w}
 PlayResY: {video_h}
-WrapStyle: 0
+WrapStyle: 2
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
@@ -2490,11 +2790,23 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         text = sub.get("text", "")
         highlight_words = sub.get("highlight", [])
         duration = max(end - start, 0.1)
+        item_margin_v = margin_v
+
+        if "\n" in text or "\\N" in text or _subtitle_units(text) * actual_font_size > safe_text_width:
+            raise ValueError(
+                f"subtitle exceeds single-line safe width: {text!r}; "
+                "run prepare_single_line_subtitles before rendering"
+            )
 
         start_str = _format_ass_time(start)
         end_str = _format_ass_time(end)
+        item_color = str(sub.get("color") or primary_color)
+        if not re.fullmatch(r"#[0-9A-Fa-f]{6}", item_color):
+            item_color = "#FFFFFF"
+        color_tag = f"{{\\c{_hex_to_ass_color(item_color, '00')}}}"
 
-        if animation == "typewriter":
+        item_animation = sub.get("animation", animation)
+        if item_animation == "typewriter":
             # 打字机效果：逐行 Dialogue 实现，每行多显示一个字
             # O3 修复：打字速度基于字符数自适应，每字约 80ms（~750字/分钟），
             # 避免短字幕打完后静止过久，或长字幕来不及打完
@@ -2527,7 +2839,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 cs = _format_ass_time(char_start)
                 ce = _format_ass_time(char_end)
                 ass_lines.append(
-                    f"Dialogue: 0,{cs},{ce},Default,,0,0,0,,{partial_text}"
+                    f"Dialogue: 0,{cs},{ce},Default,,0,0,{item_margin_v},,{color_tag}{partial_text}"
                 )
 
             # 保持阶段：全部显示（含高亮）直到结束
@@ -2535,10 +2847,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 hold_start = start + type_duration
                 hs = _format_ass_time(hold_start)
                 ass_lines.append(
-                    f"Dialogue: 0,{hs},{end_str},Default,,0,0,0,,{full_with_hl}"
+                    f"Dialogue: 0,{hs},{end_str},Default,,0,0,{item_margin_v},,{color_tag}{full_with_hl}"
                 )
 
-        elif animation == "pop":
+        elif item_animation == "pop":
             # P2-11：pop 动画锚点修复
             # 加 \an2（底部中心对齐），使缩放从中心展开而非左上角，防止字幕视觉跑位
             anim_tag = (
@@ -2549,23 +2861,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             for hw in highlight_words:
                 if hw and hw in _t:
                     _t = _t.replace(hw, f"{{\\rHighlight\\fscx130\\fscy130}}{hw}{{\\r}}", 1)
-            display_text = f"{anim_tag}{_t}"
+            display_text = f"{anim_tag}{color_tag}{_t}"
             ass_lines.append(
-                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{display_text}"
+                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,{item_margin_v},,{display_text}"
             )
 
-        elif animation == "slide":
+        elif item_animation == "slide":
             slide_dist = int(video_h * 0.03)
+            center_x = video_w // 2
+            base_y = video_h - item_margin_v
             anim_tag = (
-                f"{{\\move(0,{slide_dist},0,0,0,300)\\alpha&HFF&\\t(0,300,\\alpha&H00&)}}"
+                f"{{\\move({center_x},{base_y + slide_dist},{center_x},{base_y},0,300)"
+                f"\\alpha&HFF&\\t(0,300,\\alpha&H00&)}}"
             )
             _t = text.replace(chr(10), "\\N")
-            display_text = f"{anim_tag}{_t}"
+            display_text = f"{anim_tag}{color_tag}{_t}"
             ass_lines.append(
-                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{display_text}"
+                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,{item_margin_v},,{display_text}"
             )
 
-        elif animation == "fade":
+        elif item_animation == "fade":
             fade_in = min(0.3, duration * 0.1)
             fade_out = min(0.3, duration * 0.1)
             anim_tag = (
@@ -2573,27 +2888,27 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 f"\\t({int((duration-fade_out)*1000)},{int(duration*1000)},\\alpha&HFF&)}}"
             )
             _t = text.replace(chr(10), "\\N")
-            display_text = f"{anim_tag}{_t}"
+            display_text = f"{anim_tag}{color_tag}{_t}"
             ass_lines.append(
-                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{display_text}"
+                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,{item_margin_v},,{display_text}"
             )
 
-        elif animation == "highlight":
+        elif item_animation == "highlight":
             display_text = text
             for hw in highlight_words:
                 if hw in display_text:
                     tagged = f"{{\\rHighlight\\fscx130\\fscy130}}{hw}{{\\r}}"
                     display_text = display_text.replace(hw, tagged)
             _t = display_text.replace(chr(10), "\\N")
-            display_text = f"{{\\alpha&HFF&\\t(0,200,\\alpha&H00&)}}{_t}"
+            display_text = f"{{\\alpha&HFF&\\t(0,200,\\alpha&H00&)}}{color_tag}{_t}"
             ass_lines.append(
-                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{display_text}"
+                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,{item_margin_v},,{display_text}"
             )
 
         else:
-            display_text = text.replace(chr(10), "\\N")
+            display_text = color_tag + text.replace(chr(10), "\\N")
             ass_lines.append(
-                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,0,,{display_text}"
+                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,{item_margin_v},,{display_text}"
             )
 
     ass_content = ass_header + "\n".join(ass_lines) + "\n"
@@ -3007,7 +3322,11 @@ def align_sfx_to_beats(
 
     aligned = []
     for sfx in sfx_list:
-        new_time = _align_to_beat(sfx["time"], beats, max_offset)
+        new_time = (
+            float(sfx["time"])
+            if sfx.get("locked_to_visual")
+            else _align_to_beat(sfx["time"], beats, max_offset)
+        )
         aligned.append({
             **sfx,
             "time": new_time,
@@ -3642,6 +3961,11 @@ def add_brand_intro_outro(
     primary_color: str = "#FF6B6B",
     intro_duration: float = 2.0,
     outro_duration: float = 1.5,
+    main_duration: Optional[float] = None,
+    outro_audio: Optional[Path] = None,
+    outro_bgm: Optional[Path] = None,
+    outro_background_video: Optional[Path] = None,
+    strict_material_background: bool = False,
     resolution: str = "1080x1920",
     fps: int = 30,
 ) -> Path:
@@ -3663,6 +3987,7 @@ def add_brand_intro_outro(
         primary_color: 品牌主色（HEX），转换为 RGB 用于 ffmpeg
         intro_duration: 开场时长（秒）
         outro_duration: 收尾时长（秒）
+        main_duration: 主片进入尾卡前的保留时长；None 表示保留完整主片
         resolution: 分辨率（如 1080x1920）
         fps: 帧率
 
@@ -3686,7 +4011,7 @@ def add_brand_intro_outro(
     _font_path = _get_font_path("bold")
     _font_arg = f":fontfile={_ffmpeg_escape_filter_path(_font_path)}" if _font_path else ""
     _brand_text = _ffmpeg_escape_drawtext_text(brand_name)
-    _outro_text_raw = f"{product_name}  |  {cta_text}" if product_name else cta_text
+    _outro_text_raw = build_tail_card_display_text(product_name, cta_text)
     _outro_text = _ffmpeg_escape_drawtext_text(_outro_text_raw)
 
     has_audio = _has_audio_stream(video)
@@ -3695,46 +4020,90 @@ def add_brand_intro_outro(
         with _bio_tmp.TemporaryDirectory(prefix="brand_io_") as _bio_dir:
             _bio_dir = Path(_bio_dir)
 
-            # ── 开场片段 ──
-            _intro_path = _bio_dir / "intro.mp4"
-            _intro_vf = (
-                f"color=c={_bg_color}:size={resolution}:rate={fps}:d={intro_duration},"
-                f"drawtext=text='{_brand_text}'"
-                f"{_font_arg}"
-                f":fontsize={_font_size_lg}:fontcolor=white"
-                f":x=(w-text_w)/2:y=(h-text_h)/2"
-                f":alpha='if(lt(t,0.5),t/0.5,if(gt(t,{intro_duration-0.5}),({intro_duration}-t)/0.5,1))'"
-            )
-            # Bug5 修复：intro/outro 必须带音轨（静音），否则 concat 时主视频有音轨而动画段无音轨
-            # 会导致 ffmpeg concat demuxer 在开场/收尾输出静音（音轨数不匹配）
-            # 解决：同时用 lavfi anullsrc 生成同等时长的静音音轨并编码为 aac
-            _intro_cmd = [
-                "ffmpeg", "-y",
-                "-f", "lavfi", "-i", _intro_vf,
-                "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=44100",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                *_video_vbv_args(),
-                "-pix_fmt", "yuv420p", *_color_range_args(), "-r", str(fps),
-                "-c:a", "aac", "-b:a", "128k",
-                "-t", str(intro_duration),
-                str(_intro_path),
-            ]
-            subprocess.run(_intro_cmd, capture_output=True, timeout=30, check=True)
+            _intro_path = None
+            if intro_duration > 0:
+                _intro_path = _bio_dir / "intro.mp4"
+                _intro_vf = (
+                    f"color=c={_bg_color}:size={resolution}:rate={fps}:d={intro_duration},"
+                    f"drawtext=text='{_brand_text}'{_font_arg}:fontsize={_font_size_lg}:fontcolor=white"
+                    f":x=(w-text_w)/2:y=(h-text_h)/2"
+                    f":alpha='if(lt(t,0.5),t/0.5,if(gt(t,{intro_duration-0.5}),({intro_duration}-t)/0.5,1))'"
+                )
+                subprocess.run([
+                    "ffmpeg", "-y", "-f", "lavfi", "-i", _intro_vf,
+                    "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "18", *_video_vbv_args(),
+                    "-pix_fmt", "yuv420p", *_color_range_args(), "-r", str(fps),
+                    "-c:a", "aac", "-b:a", "128k", "-t", str(intro_duration), str(_intro_path),
+                ], capture_output=True, timeout=30, check=True)
 
             # ── 收尾片段 ──
             _outro_path = _bio_dir / "outro.mp4"
-            _outro_vf = (
-                f"color=c={_bg_color}:size={resolution}:rate={fps}:d={outro_duration},"
-                f"drawtext=text='{_outro_text}'"
-                f"{_font_arg}"
-                f":fontsize={_font_size_sm}:fontcolor=white"
+            _outro_background = None
+            if outro_background_video and Path(outro_background_video).is_file():
+                _outro_background = _bio_dir / "outro_background.jpg"
+                _background_result = subprocess.run([
+                    "ffmpeg", "-y", "-sseof", "-0.08", "-i", str(outro_background_video),
+                    "-frames:v", "1", "-q:v", "2", str(_outro_background),
+                ], capture_output=True, timeout=30)
+                if _background_result.returncode != 0 or not _outro_background.exists():
+                    if strict_material_background:
+                        raise RuntimeError("无法从本地素材主片提取 CTA 尾卡背景")
+                    _outro_background = None
+
+            _drawtext = (
+                f"drawtext=text='{_outro_text}'{_font_arg}:fontsize={_font_size_sm}:fontcolor=white"
                 f":x=(w-text_w)/2:y=(h-text_h)/2"
                 f":alpha='if(lt(t,0.3),t/0.3,if(gt(t,{outro_duration-0.3}),({outro_duration}-t)/0.3,1))'"
             )
+            if _outro_background:
+                _outro_video_input = ["-loop", "1", "-i", str(_outro_background)]
+                _outro_video_filter = [
+                    "-vf",
+                    f"scale={_w}:{_h}:force_original_aspect_ratio=increase,"
+                    f"crop={_w}:{_h},drawbox=x=0:y=0:w=iw:h=ih:color=black@0.38:t=fill,{_drawtext}",
+                ]
+            else:
+                _outro_vf = f"color=c={_bg_color}:size={resolution}:rate={fps}:d={outro_duration},{_drawtext}"
+                _outro_video_input = ["-f", "lavfi", "-i", _outro_vf]
+                _outro_video_filter = []
+            _has_outro_voice = bool(outro_audio and Path(outro_audio).exists())
+            _has_outro_bgm = bool(outro_bgm and Path(outro_bgm).exists())
+            _outro_audio_inputs = []
+            if _has_outro_voice:
+                _outro_audio_inputs += ["-i", str(outro_audio)]
+            if _has_outro_bgm:
+                _outro_audio_inputs += ["-stream_loop", "-1", "-i", str(outro_bgm)]
+            if not _has_outro_voice and not _has_outro_bgm:
+                _outro_audio_inputs += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
+            _audio_filters = []
+            _audio_labels = []
+            _audio_index = 1
+            if _has_outro_voice:
+                _audio_filters.append(f"[{_audio_index}:a]apad=whole_dur={outro_duration}[voice]")
+                _audio_labels.append("[voice]")
+                _audio_index += 1
+            if _has_outro_bgm:
+                _audio_filters.append(
+                    f"[{_audio_index}:a]atrim=0:{outro_duration},asetpts=PTS-STARTPTS,volume=0.18[bed]"
+                )
+                _audio_labels.append("[bed]")
+            if len(_audio_labels) > 1:
+                _audio_filters.append(
+                    f"{''.join(_audio_labels)}amix=inputs={len(_audio_labels)}:duration=longest:normalize=0[aout]"
+                )
+                _audio_map = ["-filter_complex", ";".join(_audio_filters), "-map", "0:v", "-map", "[aout]"]
+            elif _audio_filters:
+                label = "voice" if _has_outro_voice else "bed"
+                _audio_map = ["-filter_complex", ";".join(_audio_filters), "-map", "0:v", "-map", f"[{label}]"]
+            else:
+                _audio_map = []
             _outro_cmd = [
                 "ffmpeg", "-y",
-                "-f", "lavfi", "-i", _outro_vf,
-                "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=44100",
+                *_outro_video_input,
+                *_outro_audio_inputs,
+                *_audio_map,
+                *_outro_video_filter,
                 "-c:v", "libx264", "-preset", "fast", "-crf", "18",
                 *_video_vbv_args(),
                 "-pix_fmt", "yuv420p", *_color_range_args(), "-r", str(fps),
@@ -3742,35 +4111,78 @@ def add_brand_intro_outro(
                 "-t", str(outro_duration),
                 str(_outro_path),
             ]
-            subprocess.run(_outro_cmd, capture_output=True, timeout=30, check=True)
+            _outro_result = subprocess.run(
+                _outro_cmd, capture_output=True, text=True, timeout=30,
+            )
+            if _outro_result.returncode != 0:
+                raise RuntimeError(
+                    "CTA 尾卡渲染失败：" + (_outro_result.stderr or "unknown ffmpeg error")[-1200:]
+                )
 
-            # ── concat 拼接：开场 + 主视频 + 收尾 ──
-            _concat_file = _bio_dir / "concat.txt"
-            with open(_concat_file, "w") as _cf:
-                _cf.write(f"file '{_ffconcat_escape_path(_intro_path)}'\n")
-                _cf.write(f"file '{_ffconcat_escape_path(video)}'\n")
-                _cf.write(f"file '{_ffconcat_escape_path(_outro_path)}'\n")
+            # ── concat 拼接：显式统一音视频流，避免 data stream/采样率差异截断尾卡音频 ──
+            _main_path = Path(video)
+            if not has_audio:
+                _main_path = _bio_dir / "main_with_silence.mp4"
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", str(video),
+                    "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                    "-map", "0:v:0", "-map", "1:a:0",
+                    "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-shortest",
+                    str(_main_path),
+                ], capture_output=True, timeout=120, check=True)
 
-            _concat_cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", str(_concat_file),
+            _concat_segments = [
+                *([_intro_path] if _intro_path else []),
+                _main_path,
+                _outro_path,
+            ]
+            _concat_cmd = ["ffmpeg", "-y"]
+            for _segment_path in _concat_segments:
+                _concat_cmd += ["-i", str(_segment_path)]
+            _filter_parts = []
+            _concat_labels = []
+            _main_index = 1 if _intro_path else 0
+            for _index in range(len(_concat_segments)):
+                _video_filters = [f"fps={fps}", "format=yuv420p", "setsar=1"]
+                _audio_filters = [
+                    "aresample=44100:async=1:first_pts=0",
+                    "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo",
+                ]
+                if _index == _main_index and main_duration and main_duration > 0:
+                    _video_filters.insert(0, f"trim=duration={main_duration:.3f}")
+                    _audio_filters.insert(0, f"atrim=duration={main_duration:.3f}")
+                _filter_parts.append(
+                    f"[{_index}:v:0]{','.join(_video_filters)},setpts=PTS-STARTPTS[v{_index}]"
+                )
+                _filter_parts.append(
+                    f"[{_index}:a:0]{','.join(_audio_filters)},asetpts=PTS-STARTPTS[a{_index}]"
+                )
+                _concat_labels.append(f"[v{_index}][a{_index}]")
+            _filter_parts.append(
+                f"{''.join(_concat_labels)}concat=n={len(_concat_segments)}:v=1:a=1[vout][aout]"
+            )
+            _concat_cmd += [
+                "-filter_complex", ";".join(_filter_parts),
+                "-map", "[vout]", "-map", "[aout]",
+                "-dn",
                 "-c:v", "libx264", "-preset", "fast", "-crf", "16",
                 *_video_vbv_args(),
                 "-pix_fmt", "yuv420p", *_color_range_args(),
                 "-r", str(fps),
+                "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart", str(output),
             ]
-            if has_audio:
-                _concat_cmd += ["-c:a", "aac", "-b:a", "192k"]
-            _concat_cmd += ["-movflags", "+faststart", str(output)]
             subprocess.run(_concat_cmd, capture_output=True, timeout=300, check=True)
 
-        if output.exists() and output.stat().st_size > 10_000:
+        output_duration = _get_clip_duration(output) if output.exists() else 0.0
+        if output.exists() and output.stat().st_size > 1_000 and output_duration >= outro_duration + 0.4:
             print(f"✅ 品牌开场/收尾动画添加完成（开场 {intro_duration}s + 收尾 {outro_duration}s）")
             return output
         raise RuntimeError("输出文件无效")
 
     except Exception as _bio_err:
+        if strict_material_background:
+            raise
         print(f"⚠️  品牌动画添加失败（{_bio_err}），使用原视频")
         _bio_sh.copy2(video, output)
         return video
@@ -3927,6 +4339,9 @@ def generate_sfx_timings(
     transition_duration: float = 0.6,
     narratives: Optional[List[str]] = None,
     segment_durations: Optional[List[float]] = None,
+    transition_decisions: Optional[List[Dict[str, Any]]] = None,
+    segment_timeline: Optional[List[Dict[str, Any]]] = None,
+    sfx_intensity: str = "moderate",
 ) -> list:
     """
     根据分镜结构生成音效时间点
@@ -3945,11 +4360,22 @@ def generate_sfx_timings(
         segment_durations: 每段独立时长列表（与片段顺序一致）。
             提供时覆盖 clip_duration，实现节奏模板驱动的非等长时间轴。
             None 时使用均匀 clip_duration（向后兼容）。
+        segment_timeline: 实际渲染时间轴；提供后直接使用其 start/duration，
+            不再从统一转场时长重新推导。
 
     Returns:
         音效列表
     """
     sfx_list = []
+    intensity_scale = {
+        "none": 0.0,
+        "minimal": 0.45,
+        "subtle": 0.65,
+        "moderate": 1.0,
+        "strong": 1.15,
+    }.get(sfx_intensity, 1.0)
+    if intensity_scale <= 0:
+        return sfx_list
 
     # 构建段时长列表
     if segment_durations is not None:
@@ -3957,26 +4383,55 @@ def generate_sfx_timings(
     else:
         dur_list = [float(clip_duration)] * num_clips
 
-    # 计算每段起始时间（考虑转场重叠）
-    seg_starts = []
-    current = 0.0
-    for i in range(num_clips):
-        if i > 0:
-            current -= transition_duration
-        seg_starts.append(current)
-        current += dur_list[i]
+    if segment_timeline is not None:
+        if len(segment_timeline) != num_clips:
+            raise ValueError("实际时间轴段数必须与镜头数一致")
+        seg_starts = [float(item["start"]) for item in segment_timeline]
+        dur_list = [float(item["duration"]) for item in segment_timeline]
+    else:
+        # 计算每段起始时间（考虑转场重叠）
+        seg_starts = []
+        current = 0.0
+        for i in range(num_clips):
+            if i > 0:
+                decision = (
+                    transition_decisions[i - 1]
+                    if transition_decisions and i - 1 < len(transition_decisions)
+                    else None
+                )
+                raw_duration = decision.get("duration") if decision is not None else None
+                current -= float(transition_duration if raw_duration is None else raw_duration)
+            seg_starts.append(current)
+            current += dur_list[i]
 
     # 转场音效
     for i in range(num_clips - 1):
+        decision = (
+            transition_decisions[i]
+            if transition_decisions and i < len(transition_decisions)
+            else None
+        )
+        raw_duration = decision.get("duration") if decision is not None else None
+        selected_duration = float(transition_duration if raw_duration is None else raw_duration)
         # 转场点：第 i+1 段的开始时间 + 半个转场时长
-        transition_time = seg_starts[i + 1] + transition_duration / 2
+        transition_time = seg_starts[i + 1] + selected_duration / 2
         transition_time = max(0.0, transition_time)
 
-        # 转场类型交替：第1、3个用 impact，其他用 whoosh
-        sfx_type = "impact" if i % 2 == 0 else "whoosh"
-        volume = 0.3 if sfx_type == "impact" else 0.2
+        if decision is not None:
+            transition_type = str(decision.get("type") or "none").lower()
+            if transition_type in {"none", "cut", "dissolve", "fade"}:
+                continue
+            sfx_type = "impact" if transition_type in {"mask", "circleopen", "circleclose"} else "whoosh"
+        else:
+            sfx_type = "impact" if i % 2 == 0 else "whoosh"
+        volume = (0.3 if sfx_type == "impact" else 0.2) * intensity_scale
 
-        sfx_list.append({"time": transition_time, "type": sfx_type, "volume": volume})
+        sfx_list.append({
+            "time": transition_time,
+            "type": sfx_type,
+            "volume": round(volume, 3),
+            "locked_to_visual": True,
+        })
 
     # 问题3修复：覆盖 ad_script.py 中全量 narrative 值
     # 高潮/转折/展示类 → 强冲击 ding(0.4)
@@ -4015,28 +4470,41 @@ def generate_sfx_timings(
                 sfx_list.append({
                     "time": max(0.0, seg_start + 0.3),
                     "type": "ding",
-                    "volume": 0.4,
+                    "volume": round(0.4 * intensity_scale, 3),
+                    "locked_to_visual": False,
                 })
             elif narrative in _RESULT_NARRATIVES:
                 sfx_list.append({
                     "time": max(0.0, seg_start + 0.3),
                     "type": "ding",
-                    "volume": 0.3,
+                    "volume": round(0.3 * intensity_scale, 3),
+                    "locked_to_visual": False,
                 })
             elif narrative in _CTA_NARRATIVES:
                 sfx_list.append({
                     "time": max(0.0, seg_start + 0.2),
                     "type": "ding",
-                    "volume": 0.35,
+                    "volume": round(0.35 * intensity_scale, 3),
+                    "locked_to_visual": False,
                 })
     else:
         # 退化策略：按硬编码段位置（兼容无叙事信息的调用方）
         if num_clips >= 3 and len(seg_starts) > 2:
             highlight_time = seg_starts[2] + 0.3
-            sfx_list.append({"time": max(0.0, highlight_time), "type": "ding", "volume": 0.4})
+            sfx_list.append({
+                "time": max(0.0, highlight_time),
+                "type": "ding",
+                "volume": round(0.4 * intensity_scale, 3),
+                "locked_to_visual": False,
+            })
         if num_clips >= 5 and len(seg_starts) > 4:
             cta_time = seg_starts[4] + 0.2
-            sfx_list.append({"time": max(0.0, cta_time), "type": "ding", "volume": 0.35})
+            sfx_list.append({
+                "time": max(0.0, cta_time),
+                "type": "ding",
+                "volume": round(0.35 * intensity_scale, 3),
+                "locked_to_visual": False,
+            })
 
     return sfx_list
 
@@ -4753,7 +5221,10 @@ def export_final_video(
             _analyze_cmd = [
                 "ffmpeg", "-y",
                 "-i", str(input_video),
-                "-af", f"loudnorm=I={audio_lufs}:LRA=7:TP={audio_peak}:print_format=json",
+                "-af", (
+                    "acompressor=threshold=0.126:ratio=3:attack=10:release=150:makeup=1,"
+                    f"loudnorm=I={audio_lufs}:LRA=7:TP={audio_peak}:print_format=json"
+                ),
                 "-vn", "-f", "null", "-",
             ]
             # 动态超时：每秒视频给 5s 分析时间，最少 120s（防止长视频超时）
@@ -4783,15 +5254,15 @@ def export_final_video(
         # attack=10ms（原20ms）：更快响应，人声进入时 BGM 立刻压低
         # release=150ms（原250ms）：人声结束后 BGM 更快恢复，节奏感更强
         audio_filter = (
-            f"loudnorm=I={audio_lufs}:LRA=7:TP={audio_peak}"
-            f":measured_I={measured_I:.2f}:measured_LRA={measured_LRA:.2f}"
-            f":measured_TP={measured_TP:.2f}:measured_thresh={measured_thresh:.2f}"
-            f":offset={offset:.2f}:linear=true,"
             # B3 修复：acompressor 的 threshold 单位是线性值（0-1），不是 dBFS。
             # 原来的 -18dB 被 FFmpeg 解析为字符串，压缩器静默失效。
             # -18dBFS 对应线性值 = 10^(-18/20) ≈ 0.126
             f"acompressor=threshold=0.126:ratio=3:attack=10:release=150:makeup=1,"
-            f"alimiter=limit={audio_peak}dB:attack=5:release=50,"
+            f"loudnorm=I={audio_lufs}:LRA=7:TP={audio_peak}"
+            f":measured_I={measured_I:.2f}:measured_LRA={measured_LRA:.2f}"
+            f":measured_TP={measured_TP:.2f}:measured_thresh={measured_thresh:.2f}"
+            f":offset={offset:.2f}:linear=true,"
+            f"alimiter=limit={audio_peak}dB:level=false:attack=5:release=50,"
             f"aformat=sample_rates=44100:sample_fmts=fltp:channel_layouts=stereo"
         )
         base_cmd.extend([
