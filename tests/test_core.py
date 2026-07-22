@@ -5172,6 +5172,53 @@ class TestMaterialDrivenPostProduction:
 
         assert ranked[0]["id"] == "natural"
 
+    def test_bgm_ranking_uses_final_video_contract_not_generic_popularity(self):
+        from bgm_client import rank_tracks_for_contract
+
+        tracks = [
+            {
+                "id": "corporate",
+                "title": "Corporate Vocal Hype",
+                "tags": [[0, "corporate"], [1, "vocal"], [2, "hype"]],
+                "categories": [[0, {"name": "Business"}]],
+            },
+            {
+                "id": "source",
+                "title": "Quiet Organic Fields",
+                "tags": [[0, "organic"], [1, "acoustic"], [2, "authentic"], [3, "nature"]],
+                "categories": [[0, {"name": "Calm"}]],
+            },
+        ]
+
+        ranked = rank_tracks_for_contract(tracks, {
+            "genre": "acoustic",
+            "mood": "warm",
+            "energy": "medium",
+            "semantic_tone": "natural_origin",
+            "visual_brightness": "balanced",
+            "visual_contrast": "soft",
+            "story_role_counts": {"origin": 2, "ingredient": 1, "finished_product": 1},
+        })
+
+        assert ranked[0]["id"] == "source"
+        assert ranked[0]["material_fit_score"] > ranked[1]["material_fit_score"]
+
+    def test_unique_bgm_randomness_stays_within_best_fit_tier(self):
+        from bgm_client import _pick_unique_track
+
+        tracks = [
+            {"id": "best", "material_fit_score": 6.0},
+            {"id": "peer", "material_fit_score": 5.2},
+            {"id": "weak", "material_fit_score": 1.0},
+        ]
+
+        with patch("bgm_client._load_bgm_history", return_value=[]), \
+             patch("bgm_client.random.choice", side_effect=lambda pool: pool[-1]) as choice:
+            chosen = _pick_unique_track(tracks, random_pick=True)
+
+        assert chosen["id"] == "peer"
+        assert [item["id"] for item in choice.call_args.args[0]] == ["best", "peer"]
+
     def test_material_music_contract_selects_balanced_audio_not_loudest_chorus(self):
         from video_merger import select_bgm_segment
 
@@ -5877,6 +5924,53 @@ class TestReferenceAdAnalysis:
 
         assert timeline["clip_durations"][0] == 3.0
         assert sum(timeline["clip_durations"].values()) == pytest.approx(9.0, abs=0.01)
+
+    def test_local_one_take_pause_alignment_cannot_exceed_material_capacity(self, tmp_path):
+        import one_click_create
+
+        script = {
+            "voiceover_full": "前段铺垫。素材只有三秒。后段承接。",
+            "segments": [
+                {"segment": 0, "product_story_role": "finished_product", "voiceover": "前段铺垫。"},
+                {"segment": 1, "product_story_role": "origin", "voiceover": "素材只有三秒。"},
+                {"segment": 2, "product_story_role": "finished_product", "voiceover": "后段承接。"},
+            ],
+        }
+        asset_index = {
+            "windows": [
+                {
+                    "source_path": str(tmp_path / "product.mp4"),
+                    "start": 0.0,
+                    "end": 20.0,
+                    "analysis": {"usable_for_ad": True, "product_story_role": "finished_product"},
+                },
+                {
+                    "source_path": str(tmp_path / "origin.mp4"),
+                    "start": 0.0,
+                    "end": 3.04,
+                    "analysis": {"usable_for_ad": True, "product_story_role": "origin"},
+                },
+            ],
+        }
+        aligned = [
+            {"segment": 0, "text": "前段铺垫。", "start": 0.0, "end": 4.12},
+            {"segment": 1, "text": "素材只有三秒。", "start": 4.12, "end": 7.87, "alignment_precision": "measured_audio_pause"},
+            {"segment": 2, "text": "后段承接。", "start": 7.87, "end": 10.0},
+        ]
+
+        with patch("one_click_create.align_voiceover_lines_to_audio_pauses", return_value=aligned):
+            timeline = one_click_create._build_local_one_take_timeline_from_audio(
+                ad_script=script,
+                asset_index=asset_index,
+                reference_profile={},
+                transition_duration=0.0,
+                output_path=tmp_path / "master.m4a",
+                audio_duration=10.0,
+                voice="energetic_female",
+                voice_reason="test",
+            )
+
+        assert timeline["clip_durations"][1] <= 3.04
 
     def test_local_pipeline_generates_master_before_materializing_and_reuses_it(self):
         source = Path("one_click_create.py").read_text(encoding="utf-8")

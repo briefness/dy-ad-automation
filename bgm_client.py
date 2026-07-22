@@ -139,6 +139,91 @@ def _track_descriptor(track: Dict[str, Any]) -> str:
     return " ".join(values)
 
 
+def _add_terms(target: Dict[str, float], terms: set[str], weight: float) -> None:
+    for term in terms:
+        target[term] = max(target.get(term, 0.0), weight)
+
+
+def _build_contract_term_weights(contract: Dict[str, Any]) -> tuple[Dict[str, float], Dict[str, float]]:
+    term_groups = {
+        "acoustic": {"acoustic", "guitar", "folk", "organic", "instrumental"},
+        "pop": {"pop", "upbeat", "positive", "rhythmic", "commercial"},
+        "lofi": {"lofi", "chill", "mellow", "relaxing"},
+        "electronic": {"electronic", "modern", "technology", "synth"},
+        "orchestral": {"orchestral", "cinematic", "inspiring", "emotional"},
+        "jazz": {"jazz", "moody", "smooth", "warm"},
+        "warm": {"warm", "cozy", "gentle", "authentic", "delightful", "calm"},
+        "calm": {"calm", "quiet", "relaxing", "gentle", "slow"},
+        "cool": {"cool", "modern", "electronic", "stylish", "technology"},
+        "grand": {"grand", "inspiring", "cinematic", "uplifting"},
+        "upbeat": {"upbeat", "positive", "rhythmic", "uplifting", "fresh"},
+        "natural_origin": {"organic", "folk", "acoustic", "gentle", "calm", "fields", "nature", "authentic"},
+        "product_demo": {"advertising", "commercial", "promo", "upbeat", "rhythmic", "positive", "modern", "lifestyle"},
+        "high": {"energetic", "uptempo", "rhythmic", "intense", "fast"},
+        "medium": {"steady", "groove", "rhythmic", "guitar", "instrumental", "moderate"},
+        "low": {"calm", "ambient", "mellow", "gentle", "slow"},
+        "bright": {"bright", "happy", "fresh", "light", "upbeat"},
+        "dark": {"moody", "cinematic", "ambient", "deep"},
+        "soft": {"soft", "gentle", "warm", "acoustic"},
+        "balanced": {"balanced", "steady", "clean", "modern"},
+        "high_contrast": {"punchy", "dynamic", "bold", "rhythmic"},
+    }
+    role_groups = {
+        "ingredient": {"organic", "acoustic", "folk", "warm", "authentic", "gentle"},
+        "origin": {"nature", "fields", "organic", "documentary", "folk", "authentic"},
+        "production": {"craft", "handmade", "organic", "steady", "documentary"},
+        "finished_product": {"product", "commercial", "clean", "modern", "positive"},
+        "usage": {"lifestyle", "upbeat", "positive", "warm", "modern"},
+        "result": {"uplifting", "positive", "inspiring", "commercial"},
+        "context": {"lifestyle", "ambient", "warm", "calm"},
+    }
+
+    positive: Dict[str, float] = {}
+    for key, weight in (
+        ("genre", 2.4),
+        ("mood", 2.2),
+        ("semantic_tone", 2.8),
+        ("energy", 1.8),
+        ("visual_brightness", 0.9),
+    ):
+        value = str(contract.get(key) or "").lower()
+        if value:
+            _add_terms(positive, term_groups.get(value, {value}), weight)
+
+    contrast = str(contract.get("visual_contrast") or "").lower()
+    if contrast == "high":
+        _add_terms(positive, term_groups["high_contrast"], 0.9)
+    elif contrast:
+        _add_terms(positive, term_groups.get(contrast, {contrast}), 0.8)
+
+    story_role_counts = contract.get("story_role_counts") or {}
+    if isinstance(story_role_counts, dict):
+        total_roles = sum(int(count or 0) for count in story_role_counts.values())
+        for role, count in story_role_counts.items():
+            role_weight = 0.8 + 1.2 * (int(count or 0) / max(total_roles, 1))
+            _add_terms(positive, role_groups.get(str(role).lower(), set()), role_weight)
+
+    negative: Dict[str, float] = {
+        "kids": 3.0,
+        "playful": 2.6,
+        "christmas": 4.0,
+        "vocal": 3.0,
+        "song": 1.8,
+        "singing": 2.4,
+        "comedy": 2.2,
+    }
+    semantic_tone = str(contract.get("semantic_tone") or "").lower()
+    energy = str(contract.get("energy") or "").lower()
+    if semantic_tone == "natural_origin":
+        negative.update({"corporate": 4.0, "epic": 3.2, "rock": 2.8, "intense": 2.4, "hype": 3.2, "edm": 2.4})
+    if energy == "low":
+        negative.update({"fast": 2.6, "uptempo": 2.6, "energetic": 2.4, "intense": 2.4, "hype": 3.0})
+    elif energy == "high":
+        negative.update({"sleep": 2.0, "sad": 2.0, "ambient": 1.4})
+
+    return positive, negative
+
+
 def rank_tracks_for_contract(
     tracks: List[Dict[str, Any]],
     music_contract: Optional[dict],
@@ -146,33 +231,13 @@ def rank_tracks_for_contract(
 ) -> List[Dict[str, Any]]:
     """Deterministically rank track metadata against the selected-footage contract."""
     contract = music_contract or {}
-    term_groups = {
-        "acoustic": {"acoustic", "guitar", "folk", "organic", "instrumental"},
-        "pop": {"pop", "upbeat", "positive", "rhythmic"},
-        "lofi": {"lofi", "chill", "mellow", "relaxing"},
-        "electronic": {"electronic", "modern", "technology", "synth"},
-        "warm": {"warm", "cozy", "gentle", "authentic", "delightful", "calm"},
-        "calm": {"calm", "quiet", "relaxing", "gentle", "slow"},
-        "upbeat": {"upbeat", "positive", "rhythmic", "uplifting"},
-        "natural_origin": {"organic", "folk", "acoustic", "gentle", "calm", "fields", "nature"},
-        "product_demo": {"upbeat", "rhythmic", "positive", "modern"},
-        "high": {"energetic", "uptempo", "rhythmic", "intense"},
-        "medium": {"steady", "groove", "rhythmic", "guitar", "instrumental"},
-        "low": {"calm", "ambient", "mellow", "gentle", "slow"},
-    }
-    wanted = []
-    for key in ("genre", "mood", "semantic_tone", "energy"):
-        value = str(contract.get(key) or "").lower()
-        wanted.extend(term_groups.get(value, {value} if value else set()))
-    negative = {"kids", "playful", "christmas", "vocal", "suspenseful"}
-    if str(contract.get("semantic_tone") or "") == "natural_origin":
-        negative.update({"corporate", "epic", "rock", "intense", "hype"})
+    wanted, negative = _build_contract_term_weights(contract)
 
     ranked = []
     for position, track in enumerate(tracks):
         descriptor = _track_descriptor(track)
-        score = sum(1.0 for term in wanted if term and term in descriptor)
-        score -= sum(2.0 for term in negative if term in descriptor)
+        score = sum(weight for term, weight in wanted.items() if term and term in descriptor)
+        score -= sum(weight for term, weight in negative.items() if term and term in descriptor)
         if query and query.lower() in descriptor:
             score += 0.5
         item = dict(track)
@@ -502,20 +567,27 @@ def _pick_unique_track(valid_tracks: list, random_pick: bool = True) -> Optional
     history = _load_bgm_history()
     used_ids = {h["track_id"] for h in history}
 
-    # 从前 15 首里找没听过的
-    top_candidates = valid_tracks[:15]
+    best_score = float(valid_tracks[0].get("material_fit_score") or 0.0)
+    score_floor = best_score - (1.0 if best_score > 0 else 0.0)
+
+    # 从前 15 首里找没听过的，同时保留和最高分同一档的曲目。
+    top_candidates = [
+        track
+        for track in valid_tracks[:15]
+        if float(track.get("material_fit_score") or 0.0) >= score_floor
+    ] or valid_tracks[:3]
     fresh_tracks = [t for t in top_candidates if t["id"] not in used_ids]
 
     if fresh_tracks:
         if random_pick:
-            # 从未听过的里面随机选（从 top 10 的"新鲜"里选）
-            pool = fresh_tracks[:10] if len(fresh_tracks) > 10 else fresh_tracks
+            # Keep variety without dropping to a visibly worse fit.
+            pool = fresh_tracks[:5] if len(fresh_tracks) > 5 else fresh_tracks
             return random.choice(pool)
         else:
             return fresh_tracks[0]
 
-    # 都听过了，从 top 10 随机选
-    top_tracks = valid_tracks[:10]
+    # 都听过了，从同一档匹配池里随机选
+    top_tracks = top_candidates[:5] if top_candidates else valid_tracks[:3]
     if random_pick:
         return random.choice(top_tracks)
     return top_tracks[0]
@@ -668,6 +740,15 @@ def pick_bgm_for_product(
             continue
 
         valid_tracks = rank_tracks_for_contract(valid_tracks, music_contract, query=keyword)
+        if music_contract:
+            viable_tracks = [
+                track for track in valid_tracks
+                if float(track.get("material_fit_score") or 0.0) >= -1.0
+            ]
+            if not viable_tracks:
+                print("  ⚠️  候选曲目与当前视频调性冲突，继续换关键词")
+                continue
+            valid_tracks = viable_tracks
 
         candidates = list(valid_tracks)
         while candidates:

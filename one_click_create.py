@@ -1257,6 +1257,79 @@ def _prepare_local_one_take_master(
     )
 
 
+def _cap_aligned_voiceover_lines_to_material_capacity(
+    lines: List[Dict[str, Any]],
+    max_clip_durations: Dict[int, float],
+    main_duration: float,
+    transition_duration: float,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    main_entries = [
+        (position, line)
+        for position, line in enumerate(lines)
+        if not line.get("is_outro")
+    ]
+    if not main_entries:
+        return lines, False
+
+    capacities: List[float] = []
+    durations: List[float] = []
+    for main_position, (_, line) in enumerate(main_entries):
+        segment_index = int(line.get("segment", main_position))
+        raw_capacity = float(max_clip_durations.get(segment_index, main_duration))
+        capacity = raw_capacity - (transition_duration if main_position > 0 else 0.0)
+        capacities.append(max(0.5, capacity))
+        durations.append(max(0.001, float(line["end"]) - float(line["start"])))
+
+    if all(duration <= capacity + 0.01 for duration, capacity in zip(durations, capacities)):
+        return lines, False
+
+    active = set(range(len(durations)))
+    remaining = float(main_duration)
+    final_durations = [0.0] * len(durations)
+    while active:
+        active_weight = sum(durations[index] for index in active) or float(len(active))
+        capped = []
+        for index in active:
+            proposed = remaining * durations[index] / active_weight
+            if proposed > capacities[index]:
+                final_durations[index] = capacities[index]
+                remaining -= capacities[index]
+                capped.append(index)
+        if not capped:
+            for index in active:
+                final_durations[index] = remaining * durations[index] / active_weight
+            remaining = 0.0
+            break
+        active.difference_update(capped)
+
+    capped_lines = [dict(line) for line in lines]
+    cursor = 0.0
+    for duration, (original_index, line) in zip(final_durations, main_entries):
+        capped_lines[original_index] = {
+            **line,
+            "start": round(cursor, 3),
+            "end": round(cursor + duration, 3),
+            "alignment_precision": "capacity_capped_measured_audio_pause"
+            if line.get("alignment_precision") == "measured_audio_pause"
+            else line.get("alignment_precision", "capacity_capped"),
+        }
+        cursor += duration
+
+    outro_cursor = float(main_duration)
+    for index, line in enumerate(capped_lines):
+        if not line.get("is_outro"):
+            continue
+        duration = max(0.0, float(line["end"]) - float(line["start"]))
+        capped_lines[index] = {
+            **line,
+            "start": round(outro_cursor, 3),
+            "end": round(outro_cursor + duration, 3),
+        }
+        outro_cursor += duration
+
+    return capped_lines, True
+
+
 def _build_local_one_take_timeline_from_audio(
     ad_script: Dict[str, Any],
     asset_index: Dict[str, Any],
@@ -1350,6 +1423,12 @@ def _build_local_one_take_timeline_from_audio(
         audio_duration,
         preserve_container_edges=True,
     )
+    aligned_lines, capacity_capped = _cap_aligned_voiceover_lines_to_material_capacity(
+        aligned_lines,
+        max_clip_durations,
+        main_duration,
+        transition_duration,
+    )
     timeline["voiceover_lines"] = aligned_lines
     main_lines = [line for line in aligned_lines if not line.get("is_outro")]
     timeline["clip_durations"] = {
@@ -1363,11 +1442,14 @@ def _build_local_one_take_timeline_from_audio(
         sum(float(line["end"]) - float(line["start"]) for line in outro_lines),
         3,
     )
-    timeline["alignment_precision"] = (
-        "measured_audio_pauses"
-        if any(line.get("alignment_precision") == "measured_audio_pause" for line in aligned_lines)
-        else "speech_weight_estimate"
-    )
+    if capacity_capped:
+        timeline["alignment_precision"] = "capacity_capped_measured_audio_pauses"
+    else:
+        timeline["alignment_precision"] = (
+            "measured_audio_pauses"
+            if any(line.get("alignment_precision") == "measured_audio_pause" for line in aligned_lines)
+            else "speech_weight_estimate"
+        )
     timeline.update({
         "audio_path": str(output_path),
         "source_audio_path": str(source_audio_path or output_path),
