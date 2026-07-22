@@ -243,6 +243,8 @@ from one_click_create import (
     MusicContract,
     CharacterBible,
     ProductBible,
+    apply_video_style_to_args,
+    _recommend_video_style,
 )
 
 
@@ -896,6 +898,74 @@ class TestCLIArguments:
         assert args.stabilize is False
         assert args.image_first is False
         assert args.best_of == 1
+
+
+class TestVideoStyleInput:
+    def test_parse_args_defaults_video_style_to_auto(self):
+        with patch.object(sys, "argv", ["one_click_create.py"]):
+            args = parse_args()
+
+        assert args.video_style == "auto"
+        assert "video_style" not in args._explicit_args
+
+    def test_user_video_style_maps_to_script_voiceover_and_rhythm(self):
+        with patch.object(sys, "argv", ["one_click_create.py", "--video-style", "种草"]):
+            args = parse_args()
+
+        resolution = apply_video_style_to_args(args, {"type": "食品"})
+
+        assert args.video_style == "种草"
+        assert args.script_style == "social_proof"
+        assert args.hook == "celeb_style"
+        assert args.voiceover_style == "emotional"
+        assert args.rhythm_style == "moderate"
+        assert resolution["video_style_source"] == "user"
+
+    def test_auto_video_style_uses_recommended_default(self):
+        product_info = {"type": "数码", "audience": "真实测评用户"}
+        with patch.object(sys, "argv", ["one_click_create.py"]):
+            args = parse_args()
+
+        resolution = apply_video_style_to_args(args, product_info)
+
+        assert args.video_style == "测评"
+        assert args.script_style == "before_after"
+        assert args.voiceover_style == "professional"
+        assert resolution["video_style_source"] == "auto"
+
+    def test_video_style_does_not_override_explicit_low_level_args(self):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "one_click_create.py",
+                "--video-style=带货",
+                "--script-style",
+                "storytelling",
+                "--hook",
+                "story",
+            ],
+        ):
+            args = parse_args()
+
+        apply_video_style_to_args(args, {"type": "食品"})
+
+        assert args.script_style == "storytelling"
+        assert args.hook == "story"
+        assert args.voiceover_style == "energetic"
+        assert args.rhythm_style == "fast"
+
+    def test_stable_output_name_changes_with_video_style(self):
+        product_info = {"name": "测试产品", "type": "食品", "selling_point": "清爽"}
+        with patch.object(sys, "argv", ["one_click_create.py", "--video-style", "带货"]):
+            sales_args = parse_args()
+        apply_video_style_to_args(sales_args, product_info)
+
+        with patch.object(sys, "argv", ["one_click_create.py", "--video-style", "个人vlog"]):
+            vlog_args = parse_args()
+        apply_video_style_to_args(vlog_args, product_info)
+
+        assert build_stable_output_name(product_info, sales_args) != build_stable_output_name(product_info, vlog_args)
 
 
 class TestProductPresenceDetection:

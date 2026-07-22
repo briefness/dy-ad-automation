@@ -172,10 +172,184 @@ from image_first_strategy import (
     print_image_first_report,
 )
 
+VIDEO_STYLE_PRESETS = {
+    "带货": {
+        "script_style": "demonstration",
+        "hook": "demonstration",
+        "voiceover_style": "energetic",
+        "rhythm_style": "fast",
+        "tone": "direct_sales",
+        "prompt_note": "表达像短视频带货口播：开头直接给购买理由，字幕突出卖点、使用场景和行动号召，口播更干脆有成交感。",
+    },
+    "直播带货": {
+        "script_style": "demonstration",
+        "hook": "demonstration",
+        "voiceover_style": "energetic",
+        "rhythm_style": "fast",
+        "tone": "direct_sales",
+        "prompt_note": "表达像短视频带货口播：开头直接给购买理由，字幕突出卖点、使用场景和行动号召，口播更干脆有成交感。",
+    },
+    "个人vlog": {
+        "script_style": "storytelling",
+        "hook": "story",
+        "voiceover_style": "storytelling",
+        "rhythm_style": "moderate",
+        "tone": "personal_vlog",
+        "prompt_note": "表达像个人 vlog 分享：字幕和口播保留第一人称体验、日常场景和真实感，少用硬广腔。",
+    },
+    "个人 vlog": {
+        "script_style": "storytelling",
+        "hook": "story",
+        "voiceover_style": "storytelling",
+        "rhythm_style": "moderate",
+        "tone": "personal_vlog",
+        "prompt_note": "表达像个人 vlog 分享：字幕和口播保留第一人称体验、日常场景和真实感，少用硬广腔。",
+    },
+    "vlog": {
+        "script_style": "storytelling",
+        "hook": "story",
+        "voiceover_style": "storytelling",
+        "rhythm_style": "moderate",
+        "tone": "personal_vlog",
+        "prompt_note": "表达像个人 vlog 分享：字幕和口播保留第一人称体验、日常场景和真实感，少用硬广腔。",
+    },
+    "种草": {
+        "script_style": "social_proof",
+        "hook": "celeb_style",
+        "voiceover_style": "emotional",
+        "rhythm_style": "moderate",
+        "tone": "recommendation",
+        "prompt_note": "表达像真实种草分享：字幕先给兴趣点和推荐理由，口播强调体验、适合谁、为什么值得试。",
+    },
+    "测评": {
+        "script_style": "before_after",
+        "hook": "pain_point",
+        "voiceover_style": "professional",
+        "rhythm_style": "moderate",
+        "tone": "review",
+        "prompt_note": "表达像真实测评：字幕和口播要有观察、对比和结论，避免夸张承诺。",
+    },
+    "开箱": {
+        "script_style": "demonstration",
+        "hook": "demonstration",
+        "voiceover_style": "standard",
+        "rhythm_style": "moderate",
+        "tone": "unboxing",
+        "prompt_note": "表达像开箱体验：字幕和口播按看到什么、怎么用、第一感受推进。",
+    },
+}
+
 
 def _safe_output_stem(value: str) -> str:
     """生成安全文件名前缀。"""
     return "".join(c for c in value if c.isalnum() or c in "-_").strip() or "product"
+
+
+def _normalize_video_style(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+
+
+def _arg_str(args: argparse.Namespace, name: str, default: str = "") -> str:
+    value = getattr(args, name, default)
+    return value if isinstance(value, str) and value else default
+
+
+def _video_style_preset(value: str) -> dict:
+    normalized = _normalize_video_style(value)
+    for key, preset in VIDEO_STYLE_PRESETS.items():
+        if _normalize_video_style(key) == normalized:
+            return preset
+    if "带货" in value or "卖货" in value or "转化" in value:
+        return VIDEO_STYLE_PRESETS["带货"]
+    if "vlog" in normalized or "日常" in value or "生活记录" in value:
+        return VIDEO_STYLE_PRESETS["个人vlog"]
+    if "种草" in value or "推荐" in value or "分享" in value:
+        return VIDEO_STYLE_PRESETS["种草"]
+    if "测评" in value or "评测" in value or "对比" in value:
+        return VIDEO_STYLE_PRESETS["测评"]
+    if "开箱" in value:
+        return VIDEO_STYLE_PRESETS["开箱"]
+    return {
+        "script_style": DEFAULT_SCRIPT_STYLE,
+        "hook": DEFAULT_HOOK_TYPE,
+        "voiceover_style": DEFAULT_VOICEOVER_STYLE,
+        "rhythm_style": "moderate",
+        "tone": "custom_video_style",
+        "prompt_note": f"视频风格参考：{value}。只影响字幕、脚本结构和口播语气，不改写产品事实。",
+    }
+
+
+def _recommend_video_style(product_info: dict, args: Optional[argparse.Namespace] = None) -> str:
+    """根据产品信息和用户已有设置推荐视频风格默认值。"""
+    if args is not None:
+        current = str(getattr(args, "video_style", "") or "").strip()
+        if current and current not in ("auto",):
+            return current
+
+    product_type = str(product_info.get("type", "default") or "default")
+    scene_desc = str(product_info.get("scene_description", "") or "")
+    audience = str(product_info.get("audience", "") or "")
+    tone = str(product_info.get("tone", "") or "")
+    style_hint = " ".join([product_type, scene_desc, audience, tone]).lower()
+
+    if any(keyword in style_hint for keyword in ("vlog", "日常", "生活", "记录", "分享", "陪伴")):
+        return "个人vlog"
+    if any(keyword in style_hint for keyword in ("种草", "推荐", "安利", "心动")):
+        return "种草"
+    if any(keyword in style_hint for keyword in ("测评", "评测", "对比", "试用")):
+        return "测评"
+    if any(keyword in style_hint for keyword in ("开箱", "拆箱")):
+        return "开箱"
+    if any(keyword in style_hint for keyword in ("直播", "带货", "成交", "转化", "下单", "购买")):
+        return "带货"
+
+    try:
+        from quality_gate import evolve_voiceover_style_recommendation
+        voiced_style, _ = evolve_voiceover_style_recommendation(product_type)
+    except Exception:
+        from quality_gate import smart_pick_voiceover_style
+        voiced_style = smart_pick_voiceover_style(product_type)
+
+    if voiced_style == "storytelling":
+        return "个人vlog"
+    if voiced_style == "professional":
+        return "测评"
+    if voiced_style == "energetic":
+        return "带货"
+    if voiced_style == "emotional":
+        return "种草"
+    return "带货"
+
+
+def apply_video_style_to_args(args: argparse.Namespace, product_info: Optional[dict] = None) -> dict:
+    """把用户输入的视频风格翻译到已有脚本/口播/节奏参数。"""
+    explicit = set(getattr(args, "_explicit_args", set()) or set())
+    video_style = str(getattr(args, "video_style", "") or "").strip()
+    if not video_style or video_style == "auto":
+        video_style = _recommend_video_style(product_info or {}, args)
+        args.video_style = video_style
+
+    preset = _video_style_preset(video_style)
+    applied = {"video_style": video_style}
+
+    if "script_style" not in explicit:
+        args.script_style = preset["script_style"]
+        applied["script_style"] = args.script_style
+    if "hook" not in explicit:
+        args.hook = preset["hook"]
+        applied["hook"] = args.hook
+    if "voiceover_style" not in explicit:
+        args.voiceover_style = preset["voiceover_style"]
+        applied["voiceover_style"] = args.voiceover_style
+    if "rhythm_style" not in explicit:
+        args.rhythm_style = preset["rhythm_style"]
+        applied["rhythm_style"] = args.rhythm_style
+
+    applied["tone"] = preset["tone"]
+    applied["prompt_note"] = preset["prompt_note"]
+    applied["video_style_source"] = "user" if "video_style" in explicit and video_style != "auto" else "auto"
+    args.video_style_resolution = applied
+    return applied
 
 
 def build_stable_output_name(product_info: dict, args: argparse.Namespace) -> str:
@@ -189,6 +363,7 @@ def build_stable_output_name(product_info: dict, args: argparse.Namespace) -> st
         "mode": getattr(args, "mode", DEFAULT_MODE),
         "aspect_ratio": getattr(args, "aspect_ratio", DEFAULT_ASPECT_RATIO),
         "product_image": str(getattr(args, "product_image", "") or ""),
+        "video_style": _arg_str(args, "video_style", "auto"),
         "hook": getattr(args, "hook", DEFAULT_HOOK_TYPE),
         "script_style": getattr(args, "script_style", DEFAULT_SCRIPT_STYLE),
         "target_duration": getattr(args, "target_duration", None),
@@ -1591,6 +1766,24 @@ def input_with_default(prompt: str, default: str = "") -> str:
         user_input = input(f"{prompt} [{default}]：").strip()
         return user_input if user_input else default
     return input(f"{prompt}：").strip()
+
+
+def prompt_video_style_if_needed(args: argparse.Namespace, product_info: dict) -> dict:
+    """交互模式下展示智能推荐的视频风格，并允许用户改成最终值。"""
+    explicit = set(getattr(args, "_explicit_args", set()) or set())
+    if "video_style" in explicit and str(getattr(args, "video_style", "") or "").strip() != "auto":
+        args.video_style_source = "user"
+        return apply_video_style_to_args(args, product_info)
+
+    recommended = _recommend_video_style(product_info, args)
+    chosen = input_with_default("视频风格（影响脚本/字幕/口播）", recommended).strip()
+    args.video_style = chosen or recommended
+    args.video_style_source = "auto" if args.video_style == recommended else "user"
+    if args.video_style_source == "user":
+        args._explicit_args = explicit | {"video_style"}
+    else:
+        args._explicit_args = explicit - {"video_style"}
+    return apply_video_style_to_args(args, product_info)
 
 
 def estimate_cost(
@@ -4897,6 +5090,11 @@ def parse_args():
         help="节奏风格：fast（快节奏）/ moderate（标准）/ cinematic（电影感），默认 moderate",
     )
     parser.add_argument(
+        "--video-style",
+        default="auto",
+        help="视频风格（默认 auto 智能推荐；可输入带货/个人vlog/种草/测评/开箱或自定义文本）",
+    )
+    parser.add_argument(
         "--product-image",
         metavar="PATH",
         default=None,
@@ -5104,7 +5302,17 @@ def parse_args():
         default=None,
         help="同产品参考广告视频；提取带货结构、可见事实、连续口播节奏和尾卡形式",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    argv_options = sys.argv[1:]
+    explicit_args = {
+        action.dest
+        for action in parser._actions
+        if action.option_strings
+        for option in action.option_strings
+        if any(arg == option or arg.startswith(f"{option}=") for arg in argv_options)
+    }
+    args._explicit_args = explicit_args
+    return args
 
 
 def save_template(product_info: dict, args: argparse.Namespace, output_path: Path):
@@ -5122,6 +5330,8 @@ def save_template(product_info: dict, args: argparse.Namespace, output_path: Pat
             "seed": getattr(args, "seed", None),
             "product_image": str(args.product_image) if getattr(args, "product_image", None) else None,
             "allow_no_product_image": getattr(args, "allow_no_product_image", False),
+            "video_style": getattr(args, "video_style", "auto"),
+            "video_style_source": getattr(args, "video_style_source", "auto"),
             "hook_type": getattr(args, "hook", DEFAULT_HOOK_TYPE),
             "script_style": getattr(args, "script_style", DEFAULT_SCRIPT_STYLE),
             "use_voiceover": getattr(args, "voiceover", False),
@@ -5179,6 +5389,8 @@ def load_template(template_path: Path) -> tuple:
     args_dict.setdefault("seed", None)
     args_dict.setdefault("product_image", None)
     args_dict.setdefault("allow_no_product_image", False)
+    args_dict.setdefault("video_style", "auto")
+    args_dict.setdefault("video_style_source", "auto")
     args_dict.setdefault("hook_type", DEFAULT_HOOK_TYPE)
     args_dict.setdefault("script_style", DEFAULT_SCRIPT_STYLE)
     args_dict.setdefault("use_voiceover", False)
@@ -8661,6 +8873,11 @@ def run_generation_pipeline(
                 "mode": mode,
                 "duration": duration,
                 "aspect_ratio": aspect_ratio,
+                "video_style": product_info.get("video_style"),
+                "video_style_source": product_info.get("video_style_source"),
+                "script_style": script_style,
+                "hook_type": hook_type,
+                "voiceover_style": voiceover_style,
                 "target_duration": target_duration,
                 "rhythm_style": rhythm_style,
                 "best_of": best_of,
@@ -8748,6 +8965,32 @@ def run_one_click_create(
     Raises:
         RuntimeError: 任何步骤失败时抛出异常
     """
+    video_style_resolution = apply_video_style_to_args(args, product_info)
+    if video_style_resolution:
+        args.video_style_source = video_style_resolution.get("video_style_source", "auto")
+        source_label = "用户指定" if args.video_style_source == "user" else "智能推荐"
+        print(f"🎭 视频风格：{args.video_style}（{source_label}）")
+        applied_labels = []
+        if "script_style" in video_style_resolution:
+            applied_labels.append(f"脚本={video_style_resolution['script_style']}")
+        if "hook" in video_style_resolution:
+            applied_labels.append(f"钩子={video_style_resolution['hook']}")
+        if "voiceover_style" in video_style_resolution:
+            applied_labels.append(f"口播={video_style_resolution['voiceover_style']}")
+        if "rhythm_style" in video_style_resolution:
+            applied_labels.append(f"节奏={video_style_resolution['rhythm_style']}")
+        if applied_labels:
+            print(f"   已映射：{', '.join(applied_labels)}")
+        style_prompt_note = video_style_resolution.get("prompt_note", "")
+        if style_prompt_note:
+            existing_extra = str(product_info.get("extra_requirements", "") or "").strip()
+            if style_prompt_note not in existing_extra:
+                product_info["extra_requirements"] = (
+                    f"{existing_extra}\n{style_prompt_note}".strip()
+                )
+        product_info["video_style"] = args.video_style
+        product_info["video_style_source"] = args.video_style_source
+
     if output_name is None:
         if getattr(args, "output_name", None):
             output_name = _safe_output_stem(str(args.output_name))
@@ -8770,16 +9013,6 @@ def run_one_click_create(
     voiceover_style = getattr(args, "voiceover_style", DEFAULT_VOICEOVER_STYLE)
     voice = getattr(args, "voice", "auto")
     script_style = getattr(args, "script_style", DEFAULT_SCRIPT_STYLE)
-
-    if voiceover_style in ("auto", "standard"):
-        try:
-            from quality_gate import evolve_voiceover_style_recommendation
-            product_type = product_info.get("type", "default")
-            voiceover_style, _ = evolve_voiceover_style_recommendation(product_type)
-        except Exception:
-            from quality_gate import smart_pick_voiceover_style
-            product_type = product_info.get("type", "default")
-            voiceover_style = smart_pick_voiceover_style(product_type)
     resolved_cast_plan = (
         {"core_characters": [], "supporting_characters": [], "ambient_entities": [], "rationale": "local_asset_mode"}
         if getattr(args, "local_assets", None)
@@ -8893,6 +9126,8 @@ def run_one_click_create(
                 f.write("\n")
 
                 f.write(f"【脚本概要】\n")
+                if getattr(args, "video_style", None):
+                    f.write(f"  视频风格：{args.video_style}（{getattr(args, 'video_style_source', 'auto')}）\n")
                 f.write(f"  脚本风格：{SCRIPT_STYLES.get(script_style, {}).get('name', script_style)}\n")
                 for seg in ad_script["segments"]:
                     f.write(f"  [{seg['segment']+1}] {seg['narrative']}: {seg['subtitle']}\n")
@@ -9153,6 +9388,10 @@ def main():
         args.human_fidelity = args_dict.get("human_fidelity", DEFAULT_HUMAN_FIDELITY)
         args.seed = args_dict.get("seed", None)
         args.product_image = args_dict.get("product_image", None)
+        args.video_style = args_dict.get("video_style", "auto")
+        args.video_style_source = args_dict.get("video_style_source", "auto")
+        if args.video_style_source == "user" and args.video_style != "auto":
+            args._explicit_args = set(getattr(args, "_explicit_args", set()) or set()) | {"video_style"}
         # P1 修复：补全模板参数透传（之前只存了 9 个基础参数）
         if "hook_type" in args_dict:
             args.hook = args_dict["hook_type"]
@@ -9231,6 +9470,12 @@ def main():
                 print(f"🖼️ 商品参考图：{args.product_image}")
         if getattr(args, "reference_video", None):
             print(f"🎯 参考广告：{args.reference_video}")
+        video_style_resolution = apply_video_style_to_args(args, product_info)
+        if video_style_resolution:
+            print(
+                f"🎭 视频风格：{args.video_style}"
+                f"（{'用户指定' if video_style_resolution.get('video_style_source') == 'user' else '智能推荐'}）"
+            )
         print()
         source_plan = _prepare_generation_source_plan(
             args,
@@ -9366,6 +9611,7 @@ def main():
                         args.voiceover = _llm_args["voiceover"]
                     if _llm_args.get("voice") in _VALID_VOICES:
                         args.voice = _llm_args["voice"]
+                    prompt_video_style_if_needed(args, product_info)
                     print("✅ AI 参数配置完成")
                     if not getattr(args, "local_assets", None):
                         print()
@@ -9410,6 +9656,7 @@ def main():
                 product_info["supporting_characters"] = cast_plan.get("supporting_characters", [])
                 product_info["ambient_entities"] = cast_plan.get("ambient_entities", [])
 
+            prompt_video_style_if_needed(args, product_info)
             print()
             print("=" * 60)
             print("📋 产品信息确认")
