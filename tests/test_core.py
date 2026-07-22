@@ -2855,6 +2855,8 @@ class TestMusicContract:
         assert contract["recommended_pace"] == "fast"
         assert contract["bpm_min"] >= 120
         assert contract["bpm_max"] <= 150
+        assert contract["video_style"] == ""
+        assert contract["music_keywords"]
 
     def test_cinematic_style_overrides_mood(self):
         """电影风格应覆盖基础 mood 和 genre"""
@@ -2914,6 +2916,24 @@ class TestMusicContract:
         for clip in clips:
             assert "suspenseful orchestral energy" in clip
             assert "BPM rhythm" in clip
+
+    def test_video_style_and_script_profile_affect_music_contract(self):
+        product_info = {"type": "食品", "audience": "18-35", "video_style": "个人vlog"}
+        script_profile = {"tone": "warm", "keywords": ["清爽", "日常"], "avoid": ["硬广"]}
+        contract = build_music_contract(
+            product_info,
+            cinematic_style="none",
+            script_style="storytelling",
+            voiceover_style="storytelling",
+            rhythm_style="moderate",
+            script_music_profile=script_profile,
+        )
+
+        assert contract["video_style"] == "个人vlog"
+        assert contract["video_style_tone"] == "personal_vlog"
+        assert "vlog" in contract["music_keywords"]
+        assert "清爽" in contract["music_keywords"]
+        assert "硬广" in contract["avoid_keywords"]
 
 
 class TestIssueDrivenRepair:
@@ -5272,6 +5292,99 @@ class TestMaterialDrivenPostProduction:
 
         assert ranked[0]["id"] == "source"
         assert ranked[0]["material_fit_score"] > ranked[1]["material_fit_score"]
+
+    def test_bgm_ranking_prefers_video_style_and_script_match(self):
+        from bgm_client import rank_tracks_for_contract
+
+        tracks = [
+            {
+                "id": "sales",
+                "title": "Commercial Pop Promo",
+                "tags": [[0, "commercial"], [1, "promo"], [2, "rhythmic"]],
+                "categories": [[0, {"name": "Pop"}]],
+            },
+            {
+                "id": "vlog",
+                "title": "Warm Vlog Acoustic",
+                "tags": [[0, "vlog"], [1, "acoustic"], [2, "lifestyle"]],
+                "categories": [[0, {"name": "Acoustic"}]],
+            },
+        ]
+
+        ranked = rank_tracks_for_contract(tracks, {
+            "genre": "acoustic",
+            "mood": "warm",
+            "energy": "medium",
+            "video_style_tone": "personal_vlog",
+            "script_tone": "warm",
+            "music_keywords": ["vlog", "lifestyle", "warm"],
+            "avoid_keywords": ["vocal"],
+        })
+
+        assert ranked[0]["id"] == "vlog"
+
+    def test_bgm_audio_audition_rejects_bpm_mismatch(self, tmp_path):
+        from bgm_client import _score_bgm_audio_candidate
+
+        bgm = tmp_path / "candidate.mp3"
+        bgm.write_bytes(b"0" * 9000)
+
+        with patch("video_merger._get_audio_duration", return_value=40.0), \
+             patch("video_merger.select_bgm_segment", return_value={
+                 "strategy": "contract_energy_window",
+                 "average_loudness_db": -22.0,
+                 "loudness_range_db": 8.0,
+             }), \
+             patch("video_merger._analyze_loudness", return_value=[-22.0] * 40), \
+             patch("video_merger._detect_beats", return_value=[0.0, 1.0, 2.0, 3.0]), \
+             patch("video_merger._estimate_bpm", return_value=72.0):
+            score = _score_bgm_audio_candidate(
+                bgm,
+                target_duration=20.0,
+                music_contract={"bpm_min": 116, "bpm_max": 132, "energy": "medium"},
+                pace="fast",
+                metadata_score=4.0,
+            )
+
+        assert score["reject"] is True
+        assert score["reason"] == "bpm_mismatch"
+
+    def test_bgm_picker_auditions_candidates_before_returning(self, tmp_path):
+        from bgm_client import pick_bgm_for_product
+
+        weak = tmp_path / "weak.mp3"
+        strong = tmp_path / "strong.mp3"
+        weak.write_bytes(b"0" * 9000)
+        strong.write_bytes(b"1" * 9000)
+        tracks = [
+            {"id": "weak", "title": "Weak Fit", "duration": 40, "files": {"mp3": "weak"}},
+            {"id": "strong", "title": "Strong Fit", "duration": 40, "files": {"mp3": "strong"}},
+        ]
+
+        def fake_download(track_id, track_title="", download_url=None):
+            return {"weak": weak, "strong": strong}[track_id]
+
+        def fake_score(path, target_duration, music_contract, pace, metadata_score=0.0):
+            return {
+                "score": 3.0 if Path(path).stem == "weak" else 9.0,
+                "detected_bpm": 108.0,
+                "strategy": "contract_energy_window",
+                "reject": False,
+            }
+
+        with patch("bgm_client.search_tracks", return_value=tracks), \
+             patch("bgm_client.download_track", side_effect=fake_download), \
+             patch("bgm_client._score_bgm_audio_candidate", side_effect=fake_score), \
+             patch("bgm_client._add_bgm_history"):
+            selected = pick_bgm_for_product(
+                "食品",
+                target_duration=20.0,
+                random_pick=False,
+                pace="medium",
+                music_contract={"energy": "medium", "bpm_min": 96, "bpm_max": 116},
+            )
+
+        assert selected == strong
 
     def test_unique_bgm_randomness_stays_within_best_fit_tier(self):
         from bgm_client import _pick_unique_track

@@ -185,6 +185,8 @@ def _build_contract_term_weights(contract: Dict[str, Any]) -> tuple[Dict[str, fl
         ("semantic_tone", 2.8),
         ("energy", 1.8),
         ("visual_brightness", 0.9),
+        ("video_style_tone", 2.0),
+        ("script_tone", 1.8),
     ):
         value = str(contract.get(key) or "").lower()
         if value:
@@ -214,12 +216,36 @@ def _build_contract_term_weights(contract: Dict[str, Any]) -> tuple[Dict[str, fl
     }
     semantic_tone = str(contract.get("semantic_tone") or "").lower()
     energy = str(contract.get("energy") or "").lower()
+    script_tone = str(contract.get("script_tone") or "").lower()
+    video_style_tone = str(contract.get("video_style_tone") or "").lower()
     if semantic_tone == "natural_origin":
         negative.update({"corporate": 4.0, "epic": 3.2, "rock": 2.8, "intense": 2.4, "hype": 3.2, "edm": 2.4})
     if energy == "low":
         negative.update({"fast": 2.6, "uptempo": 2.6, "energetic": 2.4, "intense": 2.4, "hype": 3.0})
     elif energy == "high":
         negative.update({"sleep": 2.0, "sad": 2.0, "ambient": 1.4})
+    if script_tone == "warm":
+        negative.update({"cold": 1.2, "metal": 1.2})
+    elif script_tone == "cool":
+        negative.update({"warm": 1.0, "folk": 1.0, "acoustic": 0.8})
+    elif script_tone == "cinematic":
+        positive.update({"cinematic": max(positive.get("cinematic", 0.0), 2.0), "build": max(positive.get("build", 0.0), 1.6)})
+    if video_style_tone == "direct_sales":
+        positive.update({"commercial": max(positive.get("commercial", 0.0), 2.2), "promo": max(positive.get("promo", 0.0), 2.0)})
+    elif video_style_tone == "personal_vlog":
+        positive.update({"vlog": max(positive.get("vlog", 0.0), 2.4), "lifestyle": max(positive.get("lifestyle", 0.0), 1.8)})
+    elif video_style_tone == "review":
+        positive.update({"clean": max(positive.get("clean", 0.0), 2.0), "steady": max(positive.get("steady", 0.0), 1.8)})
+
+    for keyword in contract.get("music_keywords") or []:
+        keyword = str(keyword or "").strip().lower()
+        if keyword:
+            positive[keyword] = max(positive.get(keyword, 0.0), 1.4)
+
+    for keyword in contract.get("avoid_keywords") or []:
+        keyword = str(keyword or "").strip().lower()
+        if keyword:
+            negative[keyword] = max(negative.get(keyword, 0.0), 1.6)
 
     return positive, negative
 
@@ -261,6 +287,129 @@ def _bpm_matches_contract(detected_bpm: float, music_contract: Optional[dict], p
         or (pace == "medium" and 80 <= detected_bpm <= 120)
         or pace is None
     )
+
+
+def _score_bgm_audio_candidate(
+    bgm_path: Path,
+    target_duration: float,
+    music_contract: Optional[dict],
+    pace: Optional[str],
+    metadata_score: float = 0.0,
+) -> Optional[Dict[str, Any]]:
+    """Score an actual downloaded BGM file against the current video contract."""
+    if not bgm_path.exists() or bgm_path.stat().st_size <= 8192:
+        return None
+
+    try:
+        from video_merger import (
+            _analyze_loudness,
+            _detect_beats,
+            _estimate_bpm,
+            _get_audio_duration,
+            select_bgm_segment,
+        )
+    except Exception:
+        return {
+            "score": float(metadata_score),
+            "detected_bpm": 0.0,
+            "strategy": "metadata_only",
+            "reject": False,
+            "reason": "audio_analysis_unavailable",
+        }
+
+    try:
+        duration = float(_get_audio_duration(bgm_path))
+        if duration <= 0:
+            return None
+        selected = select_bgm_segment(
+            duration,
+            max(float(target_duration or 0.0), 1.0),
+            bgm_path,
+            music_contract=music_contract,
+        )
+        loudness = _analyze_loudness(bgm_path, 1.0)
+        beats = _detect_beats(bgm_path)
+        detected_bpm = _estimate_bpm(beats)
+    except Exception:
+        return {
+            "score": float(metadata_score),
+            "detected_bpm": 0.0,
+            "strategy": "metadata_only",
+            "reject": False,
+            "reason": "audio_analysis_failed",
+        }
+
+    if not _bpm_matches_contract(detected_bpm, music_contract, pace):
+        return {
+            "score": -100.0,
+            "detected_bpm": detected_bpm,
+            "strategy": selected.get("strategy", "unknown"),
+            "reject": True,
+            "reason": "bpm_mismatch",
+        }
+
+    score = float(metadata_score)
+    score += 2.0 if selected.get("strategy") in {
+        "contract_energy_window",
+        "loudest_chorus",
+        "structural_main_section",
+    } else 0.5
+
+    segment_level = selected.get("average_loudness_db")
+    segment_range = selected.get("loudness_range_db")
+    levels = [float(v) for v in loudness if isinstance(v, (int, float))]
+    if segment_level is None and levels:
+        segment_level = sum(levels) / len(levels)
+    if segment_range is None and levels:
+        segment_range = max(levels) - min(levels)
+
+    energy = str((music_contract or {}).get("energy") or "medium")
+    target_level = {"low": -26.0, "medium": -22.0, "high": -18.0}.get(energy, -22.0)
+    if segment_level is not None:
+        distance = abs(float(segment_level) - target_level)
+        score += max(0.0, 3.0 - distance / 2.5)
+        if float(segment_level) > -12.0:
+            score -= 4.0
+        elif float(segment_level) < -38.0:
+            score -= 3.0
+
+    if segment_range is not None:
+        dynamic_range = float(segment_range)
+        if 4.0 <= dynamic_range <= 18.0:
+            score += 1.5
+        elif dynamic_range > 28.0:
+            score -= 2.0
+        elif dynamic_range < 1.5:
+            score -= 1.0
+
+    if detected_bpm > 0:
+        bpm_min = float((music_contract or {}).get("bpm_min") or 0)
+        bpm_max = float((music_contract or {}).get("bpm_max") or 0)
+        if bpm_min > 0 and bpm_max >= bpm_min:
+            center = (bpm_min + bpm_max) / 2.0
+            half_width = max((bpm_max - bpm_min) / 2.0, 1.0)
+            score += max(0.0, 2.0 - abs(detected_bpm - center) / half_width)
+        else:
+            score += 0.8
+
+    silent_windows = sum(1 for level in levels if level < -45.0)
+    if levels and silent_windows / len(levels) > 0.35:
+        score -= 3.0
+
+    return {
+        "score": round(score, 3),
+        "detected_bpm": round(detected_bpm, 3),
+        "strategy": selected.get("strategy", "unknown"),
+        "reject": False,
+        "reason": "ok",
+        "average_loudness_db": (
+            round(float(segment_level), 3) if segment_level is not None else None
+        ),
+        "loudness_range_db": (
+            round(float(segment_range), 3) if segment_range is not None else None
+        ),
+        "segment_selection": selected,
+    }
 
 
 def _detect_pace_from_clips(clip_structure: list) -> str:
@@ -659,6 +808,10 @@ def pick_bgm_for_product(
         if contract_keywords:
             all_keywords.extend(contract_keywords)
             print(f"  🎵 音乐合同关键词：{contract_keywords}")
+        music_keywords = [str(k).strip() for k in (music_contract.get("music_keywords") or []) if str(k).strip()]
+        if music_keywords:
+            all_keywords.extend(music_keywords)
+            print(f"  🎵 视频风格/脚本关键词：{music_keywords}")
 
     # 1. 电影风格关键词
     if cinematic_style and cinematic_style in CINEMATIC_STYLES:
@@ -750,12 +903,21 @@ def pick_bgm_for_product(
                 continue
             valid_tracks = viable_tracks
 
-        candidates = list(valid_tracks)
-        while candidates:
-            chosen = _pick_unique_track(candidates, random_pick)
+        audition_pool = list(valid_tracks[:8])
+        if random_pick:
+            audition_pool = list(dict.fromkeys(
+                [track["id"] for track in audition_pool]
+                + [track["id"] for track in valid_tracks[:15]]
+            ))
+            track_by_id = {track["id"]: track for track in valid_tracks}
+            audition_pool = [track_by_id[track_id] for track_id in audition_pool if track_id in track_by_id]
+
+        auditioned = []
+        while audition_pool and len(auditioned) < 5:
+            chosen = _pick_unique_track(audition_pool, random_pick)
             if not chosen:
                 break
-            candidates = [track for track in candidates if track["id"] != chosen["id"]]
+            audition_pool = [track for track in audition_pool if track["id"] != chosen["id"]]
             track_id = chosen["id"]
             track_title = chosen.get("title", track_id)
             track_duration = chosen.get("duration", 0)
@@ -768,29 +930,57 @@ def pick_bgm_for_product(
             if not local_path:
                 continue
 
-            bpm_required = bool(
-                pace
-                or (music_contract or {}).get("bpm_min")
-                or (music_contract or {}).get("bpm_max")
+            audio_score = _score_bgm_audio_candidate(
+                local_path,
+                target_duration,
+                music_contract,
+                pace,
+                metadata_score=float(chosen.get("material_fit_score") or 0.0),
             )
-            if bpm_required:
-                try:
-                    from video_merger import _detect_beats, _estimate_bpm
-                    detected_bpm = _estimate_bpm(_detect_beats(local_path))
-                    if not _bpm_matches_contract(detected_bpm, music_contract, pace):
-                        print(f"  ⚠️  实测 BPM {detected_bpm:.0f} 不符合素材合同，继续换")
-                        if material_driven:
-                            local_path.unlink(missing_ok=True)
-                        continue
-                    print(f"  ✅ 实测 BPM {detected_bpm:.0f} 符合素材合同")
-                except Exception as exc:
-                    if material_driven:
-                        print(f"  ⚠️  无法验证真实 BPM（{exc}），拒绝该候选")
-                        continue
-                    print(f"  ⚠️  BPM 检测失败，保留候选：{exc}")
+            if not audio_score:
+                if material_driven:
+                    local_path.unlink(missing_ok=True)
+                continue
+            if audio_score.get("reject"):
+                print(
+                    f"  ⚠️  试听拒绝：{audio_score.get('reason')}，"
+                    f"BPM {float(audio_score.get('detected_bpm') or 0):.0f}"
+                )
+                if material_driven:
+                    local_path.unlink(missing_ok=True)
+                continue
+            chosen = {
+                **chosen,
+                "local_path": local_path,
+                "audio_fit_score": float(audio_score.get("score") or 0.0),
+                "audio_score": audio_score,
+            }
+            auditioned.append(chosen)
+            print(
+                f"  🎧 试听评分 {chosen['audio_fit_score']:.1f}："
+                f"BPM {float(audio_score.get('detected_bpm') or 0):.0f}，"
+                f"{audio_score.get('strategy')}"
+            )
 
-            _add_bgm_history(track_id, track_title)
-            return local_path
+        if auditioned:
+            auditioned.sort(
+                key=lambda item: (
+                    float(item.get("audio_fit_score") or 0.0),
+                    float(item.get("material_fit_score") or 0.0),
+                ),
+                reverse=True,
+            )
+            best = auditioned[0]
+            for loser in auditioned[1:]:
+                loser_path = Path(loser["local_path"])
+                if material_driven and loser_path != Path(best["local_path"]):
+                    loser_path.unlink(missing_ok=True)
+            print(
+                f"✅ 试听级 BGM 定稿：{best.get('title', best['id'])} "
+                f"（综合 {float(best.get('audio_fit_score') or 0):.1f}）"
+            )
+            _add_bgm_history(best["id"], best.get("title", ""))
+            return Path(best["local_path"])
 
     # 所有关键词都失败了，用 default 兜底再试一次
     if product_type != "default" and not material_driven:

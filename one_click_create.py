@@ -240,6 +240,59 @@ VIDEO_STYLE_PRESETS = {
 }
 
 
+VIDEO_STYLE_MUSIC_PROFILES = {
+    "direct_sales": {
+        "mood": "upbeat",
+        "genre": "pop",
+        "energy": "high",
+        "recommended_pace": "fast",
+        "intro_type": "immediate",
+        "keywords": ["advertising", "commercial", "promo", "upbeat", "rhythmic", "fresh"],
+        "avoid": ["ambient", "sleep", "sad", "cinematic", "vocal", "singing"],
+    },
+    "personal_vlog": {
+        "mood": "warm",
+        "genre": "acoustic",
+        "energy": "medium",
+        "recommended_pace": "moderate",
+        "intro_type": "fade_in",
+        "keywords": ["vlog", "lifestyle", "warm", "acoustic", "chill", "authentic"],
+        "avoid": ["corporate", "epic", "intense", "hype", "trap", "vocal"],
+    },
+    "recommendation": {
+        "mood": "warm",
+        "genre": "acoustic",
+        "energy": "medium",
+        "recommended_pace": "moderate",
+        "intro_type": "immediate",
+        "keywords": ["lifestyle", "positive", "fresh", "warm", "upbeat", "acoustic"],
+        "avoid": ["corporate", "epic", "dark", "intense", "hype", "vocal"],
+    },
+    "review": {
+        "mood": "cool",
+        "genre": "lofi",
+        "energy": "medium",
+        "recommended_pace": "moderate",
+        "intro_type": "immediate",
+        "keywords": ["clean", "modern", "steady", "minimal", "lofi", "technology"],
+        "avoid": ["epic", "dramatic", "comedy", "kids", "vocal", "singing"],
+    },
+    "unboxing": {
+        "mood": "upbeat",
+        "genre": "pop",
+        "energy": "medium",
+        "recommended_pace": "moderate",
+        "intro_type": "immediate",
+        "keywords": ["unboxing", "lifestyle", "clean", "fresh", "upbeat", "product"],
+        "avoid": ["epic", "dark", "sad", "vocal", "singing"],
+    },
+    "custom_video_style": {
+        "keywords": ["advertising", "lifestyle", "positive", "modern"],
+        "avoid": ["vocal", "singing", "kids", "comedy"],
+    },
+}
+
+
 def _safe_output_stem(value: str) -> str:
     """生成安全文件名前缀。"""
     return "".join(c for c in value if c.isalnum() or c in "-_").strip() or "product"
@@ -276,6 +329,57 @@ def _video_style_preset(value: str) -> dict:
         "rhythm_style": "moderate",
         "tone": "custom_video_style",
         "prompt_note": f"视频风格参考：{value}。只影响字幕、脚本结构和口播语气，不改写产品事实。",
+    }
+
+
+def _collect_script_music_signals(ad_script: dict) -> dict:
+    segments = ad_script.get("segments") or []
+    text = " ".join(
+        str(part or "").lower()
+        for seg in segments
+        for part in (
+            seg.get("subtitle"),
+            seg.get("voiceover"),
+            seg.get("narrative"),
+            seg.get("marketing_intent"),
+        )
+    )
+
+    keyword_groups = {
+        "warm": ("清爽", "轻盈", "自然", "真实", "日常", "陪伴", "舒服", "无负担", "轻松", "柔和"),
+        "upbeat": ("购买", "点下方", "试试", "种草", "分享", "推荐", "带货", "下单", "转化", "直接"),
+        "cool": ("测评", "对比", "实测", "观察", "数据", "客观", "分析", "专业"),
+        "cinematic": ("故事", "转折", "回忆", "感受", "氛围", "沉浸", "情绪"),
+    }
+    matched = {
+        tone: [kw for kw in keywords if kw in text]
+        for tone, keywords in keyword_groups.items()
+    }
+    tone_scores = {tone: len(values) for tone, values in matched.items()}
+    tone = max(tone_scores, key=tone_scores.get) if any(tone_scores.values()) else "balanced"
+    keywords = []
+    avoid = []
+    if tone == "warm":
+        keywords = ["warm", "acoustic", "fresh", "natural", "lifestyle"]
+        avoid = ["epic", "hard rock", "intense", "vocal"]
+    elif tone == "upbeat":
+        keywords = ["upbeat", "rhythmic", "commercial", "pop", "fresh"]
+        avoid = ["ambient", "slow", "sad", "vocal"]
+    elif tone == "cool":
+        keywords = ["clean", "steady", "lofi", "minimal", "modern"]
+        avoid = ["hype", "kids", "comedy", "singing"]
+    elif tone == "cinematic":
+        keywords = ["cinematic", "emotional", "ambient", "build", "orchestral"]
+        avoid = ["playful", "comic", "kids", "singing"]
+    else:
+        keywords = ["balanced", "modern", "clean", "steady"]
+        avoid = ["vocal", "singing"]
+
+    return {
+        "tone": tone,
+        "keywords": keywords,
+        "avoid": avoid,
+        "matched": matched,
     }
 
 
@@ -5439,12 +5543,23 @@ class MusicContract(TypedDict):
     sfx_intensity: str
     semantic_tone: str
     story_role_counts: Dict[str, int]
+    video_style: str
+    video_style_tone: str
+    script_style: str
+    voiceover_style: str
+    rhythm_style: str
+    music_keywords: List[str]
+    avoid_keywords: List[str]
 
 
 def build_music_contract(
     product_info: dict,
     cinematic_style: str = "none",
     asset_creative_profile: Optional[Dict[str, Any]] = None,
+    script_style: str = "",
+    voiceover_style: str = "",
+    rhythm_style: str = "",
+    script_music_profile: Optional[Dict[str, Any]] = None,
 ) -> MusicContract:
     """
     从产品类型、受众和电影风格构建音乐合同。
@@ -5452,6 +5567,16 @@ def build_music_contract(
     """
     ptype = product_info.get("type", "default")
     audience = product_info.get("audience", "18-35")
+    video_style = str(product_info.get("video_style") or "").strip()
+    video_preset = _video_style_preset(video_style) if video_style else {}
+    video_style_tone = str(video_preset.get("tone") or "custom_video_style")
+    video_music = VIDEO_STYLE_MUSIC_PROFILES.get(
+        video_style_tone,
+        VIDEO_STYLE_MUSIC_PROFILES["custom_video_style"],
+    )
+    script_music_profile = script_music_profile or {}
+    script_music_keywords = list(script_music_profile.get("keywords") or [])
+    script_music_avoid = list(script_music_profile.get("avoid") or [])
 
     # ── 基础映射：产品类型 → mood / genre / energy ──
     _PRODUCT_MUSIC_MAP = {
@@ -5477,12 +5602,17 @@ def build_music_contract(
     }
     style_override = _STYLE_MOOD_OVERRIDE.get(cinematic_style, {})
 
-    mood = style_override.get("mood", base["mood"])
-    genre = style_override.get("genre", base["genre"])
-    energy = str((asset_creative_profile or {}).get("energy") or base["energy"])
+    mood = str(style_override.get("mood") or video_music.get("mood") or base["mood"])
+    genre = str(style_override.get("genre") or video_music.get("genre") or base["genre"])
+    energy = str(
+        (asset_creative_profile or {}).get("energy")
+        or video_music.get("energy")
+        or base["energy"]
+    )
     intro_type = str(
         style_override.get("intro_type")
         or (asset_creative_profile or {}).get("intro_type")
+        or video_music.get("intro_type")
         or "immediate"
     )
 
@@ -5499,6 +5629,7 @@ def build_music_contract(
     _ENERGY_PACE = {"high": "fast", "medium": "moderate", "low": "cinematic"}
     recommended_pace = str(
         (asset_creative_profile or {}).get("recommended_pace")
+        or video_music.get("recommended_pace")
         or _ENERGY_PACE.get(energy, "moderate")
     )
 
@@ -5529,6 +5660,13 @@ def build_music_contract(
         sfx_intensity=str((asset_creative_profile or {}).get("sfx_intensity") or "moderate"),
         semantic_tone=str((asset_creative_profile or {}).get("semantic_tone") or "product_demo"),
         story_role_counts=dict((asset_creative_profile or {}).get("story_role_counts") or {}),
+        video_style=video_style,
+        video_style_tone=video_style_tone,
+        script_style=str(script_style or ""),
+        voiceover_style=str(voiceover_style or ""),
+        rhythm_style=str(rhythm_style or ""),
+        music_keywords=list(dict.fromkeys(list(video_music.get("keywords") or []) + script_music_keywords)),
+        avoid_keywords=list(dict.fromkeys(list(video_music.get("avoid") or []) + script_music_avoid)),
     )
 
 
@@ -5916,15 +6054,24 @@ def run_generation_pipeline(
     # 第二步：生成广告脚本 + 分镜片段
     # ============================================================
 
+    script_music_profile = {}
+
     # ── 音乐合同：脚本阶段确定音乐策略，让分镜、口播、BGM 三方对齐 ──
     music_contract = build_music_contract(
         product_info,
         cinematic_style=style,
         asset_creative_profile=asset_creative_profile,
+        script_style=script_style,
+        voiceover_style=voiceover_style,
+        rhythm_style=rhythm_style,
+        script_music_profile=script_music_profile,
     )
     print(f"🎵 音乐合同：{music_contract['mood']} {music_contract['genre']}")
     print(f"    BPM：{music_contract['bpm_min']}-{music_contract['bpm_max']}，energy：{music_contract['energy']}")
-    print(f"    推荐 pace：{music_contract['recommended_pace']}，intro：{music_contract['intro_type']}")
+    print(
+        f"    推荐 pace：{music_contract['recommended_pace']}，intro：{music_contract['intro_type']}，"
+        f"视频风格：{music_contract['video_style'] or '未指定'}"
+    )
 
     # ── 智能段数推荐（剧情驱动，而非模板驱动）──
     # 根据产品类型、卖点数量、目标时长，智能推荐最合适的片段数量
@@ -6079,6 +6226,16 @@ def run_generation_pipeline(
             hook_type=hook_type,
             num_segments=_num_segs,
         )
+    script_music_profile = _collect_script_music_signals(ad_script)
+    music_contract = build_music_contract(
+        product_info,
+        cinematic_style=style,
+        asset_creative_profile=asset_creative_profile,
+        script_style=script_style,
+        voiceover_style=voiceover_style,
+        rhythm_style=rhythm_style,
+        script_music_profile=script_music_profile,
+    )
     if local_asset_mode:
         for rhythm_segment, script_segment in zip(
             rhythm_template["segments"],
@@ -6107,6 +6264,12 @@ def run_generation_pipeline(
                 "energy": music_contract["energy"],
                 "bpm_range": f"{music_contract['bpm_min']}-{music_contract['bpm_max']}",
                 "intro_type": music_contract["intro_type"],
+                "video_style": music_contract["video_style"],
+                "video_style_tone": music_contract["video_style_tone"],
+                "keywords": music_contract["music_keywords"],
+                "avoid_keywords": music_contract["avoid_keywords"],
+                "script_tone": script_music_profile["tone"],
+                "script_keywords": script_music_profile["keywords"],
             }
     print(f"📝 广告脚本风格：{SCRIPT_STYLES.get(script_style, {}).get('name', script_style)}")
     print(f"    视频标题：{ad_script['title']}")
@@ -7244,6 +7407,10 @@ def run_generation_pipeline(
             product_info,
             cinematic_style=style,
             asset_creative_profile=asset_creative_profile,
+            script_style=script_style,
+            voiceover_style=voiceover_style,
+            rhythm_style=rhythm_style,
+            script_music_profile=script_music_profile,
         )
         scene_cfg["transition_duration"] = float(
             asset_creative_profile["transition_base_duration"]
