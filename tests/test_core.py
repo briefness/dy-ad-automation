@@ -6687,6 +6687,111 @@ class TestReferenceAdAnalysis:
         assert profile["sidechain_ratio"] == 2.5
         assert profile["target_gap_db"] == 6.0
 
+    def test_stabilize_video_uses_ascii_vidstab_transforms(self, tmp_path):
+        import subprocess
+        from unittest.mock import patch
+        from video_merger import stabilize_video
+
+        video = tmp_path / "video.mp4"
+        output = tmp_path / "stabilized.mp4"
+        video.write_bytes(b"fake input video")
+
+        captured = []
+
+        def fake_run(cmd, **kwargs):
+            captured.append(cmd)
+            joined = " ".join(str(part) for part in cmd)
+            if "vidstabdetect=" in joined:
+                result_match = re.search(r"result=([^:]+)", joined)
+                if result_match:
+                    Path(result_match.group(1)).write_text(
+                        "VID.STAB 1\nFrame 1 (List 0 [])\n",
+                        encoding="utf-8",
+                    )
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if "vidstabtransform=" in joined:
+                Path(cmd[-1]).write_bytes(b"0" * 12000)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch("video_merger._has_audio_stream", return_value=False), \
+             patch("video_merger.subprocess.run", side_effect=fake_run):
+            result = stabilize_video(video, output)
+
+        assert result == output
+        detect_cmd = next(cmd for cmd in captured if any("vidstabdetect=" in str(part) for part in cmd))
+        assert any("fileformat=ascii" in str(part) for part in detect_cmd)
+
+    def test_ai_video_enhancer_color_enhance_uses_supported_curves_preset(self, tmp_path):
+        import subprocess
+        from ai_enhancement import AIVideoEnhancer
+
+        input_path = tmp_path / "input.mp4"
+        output_path = tmp_path / "output.mp4"
+
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", "color=c=black:s=64x64:d=1",
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                "-c:v", "libx264", "-c:a", "aac",
+                "-shortest", str(input_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        enhancer = AIVideoEnhancer()
+        result = enhancer.enhance_video(
+            input_path,
+            output_path=output_path,
+            enhancements=["color_enhance"],
+        )
+
+        assert result.success
+        assert output_path.exists() and output_path.stat().st_size > 0
+        chain = enhancer._build_filter_chain(["color_enhance"], "1080p", 30)
+        assert "medium_contrast" in chain
+        assert "filmcontrast" not in chain
+
+    def test_enhancement_only_replaces_final_video_when_quality_improves(self):
+        from types import SimpleNamespace
+        from one_click_create import _should_keep_enhanced_video
+
+        original = SimpleNamespace(
+            passed=True,
+            overall_score=90,
+            flicker_detected=False,
+            face_issue_frames=2,
+            frames_analyzed=10,
+            temporal_consistency_score=0.72,
+            motion_smoothness_score=0.68,
+            object_integrity_score=0.81,
+        )
+        worse = SimpleNamespace(
+            passed=False,
+            overall_score=75,
+            flicker_detected=False,
+            face_issue_frames=10,
+            frames_analyzed=15,
+            temporal_consistency_score=0.00,
+            motion_smoothness_score=0.48,
+            object_integrity_score=0.81,
+        )
+        better = SimpleNamespace(
+            passed=True,
+            overall_score=92,
+            flicker_detected=False,
+            face_issue_frames=1,
+            frames_analyzed=10,
+            temporal_consistency_score=0.80,
+            motion_smoothness_score=0.77,
+            object_integrity_score=0.83,
+        )
+
+        assert not _should_keep_enhanced_video(original, worse)
+        assert _should_keep_enhanced_video(original, better)
+
     def test_voiceover_enabled_reference_outro_requires_cta_audio(self, tmp_path):
         from one_click_create import _validate_cta_voiceover_contract
 

@@ -299,6 +299,26 @@ def _score_candidate_video_quality(
     return score, list(quality_result.issues or [])
 
 
+def _quality_preference_key(quality_result: Any) -> Tuple[int, float, int, float, float, float, float]:
+    """Prefer a passed video, then higher score, then fewer face/time regressions."""
+    frames_analyzed = max(1, int(getattr(quality_result, "frames_analyzed", 0) or 0))
+    face_ratio = float(getattr(quality_result, "face_issue_frames", 0) or 0) / frames_analyzed
+    return (
+        1 if getattr(quality_result, "passed", False) else 0,
+        float(getattr(quality_result, "overall_score", 0.0) or 0.0),
+        0 if getattr(quality_result, "flicker_detected", False) else 1,
+        -face_ratio,
+        float(getattr(quality_result, "temporal_consistency_score", 0.0) or 0.0),
+        float(getattr(quality_result, "motion_smoothness_score", 0.0) or 0.0),
+        float(getattr(quality_result, "object_integrity_score", 0.0) or 0.0),
+    )
+
+
+def _should_keep_enhanced_video(original_quality: Any, enhanced_quality: Any) -> bool:
+    """Only adopt enhancement when it is strictly better on the same gate signals."""
+    return _quality_preference_key(enhanced_quality) > _quality_preference_key(original_quality)
+
+
 # ── 失败原因驱动的精准修复（Issue-Driven Repair）──
 
 _ISSUE_REPAIR_RULES = [
@@ -7896,6 +7916,7 @@ def run_generation_pipeline(
     # 导出最终成片
     # ============================================================
     final_path = final_dir / f"{output_name}_final.mp4"
+    quality_result = None
 
     try:
         # P0-1：消除 trim 的独立重编码
@@ -7951,15 +7972,38 @@ def run_generation_pipeline(
                 _enhancements = ["denoise", "deflicker", "color_enhance"]
                 if mode == "4k":
                     _enhancements.append("deblur")
+                _quality_check_kwargs = {
+                    "num_frames": 15,
+                    "content_focus": "center" if product_image_path else "default",
+                    "require_audio": True,
+                    "product_reference_image": product_image_path if product_image_path else None,
+                    "character_reference_image": main_char_path if main_char_path else None,
+                    "require_semantic_alignment": True,
+                }
+                _original_quality_result = check_video_quality(final_path, **_quality_check_kwargs)
                 _enh_result = _enhancer.enhance_video(
                     final_path,
                     output_path=_enhanced_path,
                     enhancements=_enhancements,
                 )
                 if _enh_result.success and _enhanced_path.exists():
-                    final_path = _enhanced_path
-                    print(f"✅ 视频增强完成：{', '.join(_enhancements)}")
+                    _enhanced_quality_result = check_video_quality(_enhanced_path, **_quality_check_kwargs)
+                    if _should_keep_enhanced_video(_original_quality_result, _enhanced_quality_result):
+                        final_path = _enhanced_path
+                        quality_result = _enhanced_quality_result
+                        print(
+                            f"✅ 视频增强采纳：{', '.join(_enhancements)} "
+                            f"（{_original_quality_result.overall_score:.0f} → {_enhanced_quality_result.overall_score:.0f}）"
+                        )
+                    else:
+                        quality_result = _original_quality_result
+                        print(
+                            f"⚠️  视频增强未采纳：{', '.join(_enhancements)} "
+                            f"（{_original_quality_result.overall_score:.0f} → {_enhanced_quality_result.overall_score:.0f}），"
+                            "保留原片"
+                        )
                 else:
+                    quality_result = _original_quality_result
                     print(f"⚠️  视频增强跳过：{_enh_result.message}")
             except Exception as _enh_err:
                 print(f"⚠️  视频增强失败，使用原片：{_enh_err}")
@@ -7993,20 +8037,20 @@ def run_generation_pipeline(
     # ============================================================
     # 发布级质量门禁：放在 pipeline 内部，保证单条和批量入口都执行
     # ============================================================
-    quality_result = None
     production_quality_report = None
     if not preview:
         print()
         print("🔍 开始发布级视频质量检测（初筛）...")
-        quality_result = check_video_quality(
-            final_path,
-            num_frames=15,
-            content_focus="center" if product_image_path else "default",
-            require_audio=True,
-            product_reference_image=product_image_path if product_image_path else None,
-            character_reference_image=main_char_path if main_char_path else None,
-            require_semantic_alignment=True,
-        )
+        if quality_result is None:
+            quality_result = check_video_quality(
+                final_path,
+                num_frames=15,
+                content_focus="center" if product_image_path else "default",
+                require_audio=True,
+                product_reference_image=product_image_path if product_image_path else None,
+                character_reference_image=main_char_path if main_char_path else None,
+                require_semantic_alignment=True,
+            )
         print_quality_report(quality_result, final_path.name)
         if not quality_result.passed:
             raise RuntimeError("最终成片质量检测未通过，已阻断输出为成功产物")

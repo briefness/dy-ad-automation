@@ -177,7 +177,8 @@ class AIVideoEnhancer:
         # 色彩增强
         if "color_enhance" in enhancements:
             filter_list.append(f"{input_ref}eq=contrast=1.1:saturation=1.1:brightness=0.05[color_enhanced]")
-            filter_list.append(f"[color_enhanced]curves=preset=filmcontrast[curves_enhanced]")
+            # ffmpeg 8.x 不再支持 filmcontrast；medium_contrast 是当前可用且接近的预设
+            filter_list.append(f"[color_enhanced]curves=preset=medium_contrast[curves_enhanced]")
             input_ref = "[curves_enhanced]"
 
         # 帧插值

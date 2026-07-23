@@ -4679,7 +4679,7 @@ def stabilize_video(
                 # 第一步：检测运动向量
                 _detect_cmd = [
                     "ffmpeg", "-y", "-i", str(video),
-                    "-vf", f"vidstabdetect=shakiness=5:accuracy=9:result={_trf_path}",
+                    "-vf", f"vidstabdetect=shakiness=5:accuracy=9:fileformat=ascii:result={_trf_path}",
                     "-f", "null", "-",
                 ]
                 subprocess.run(_detect_cmd, capture_output=True, timeout=120, check=True)
