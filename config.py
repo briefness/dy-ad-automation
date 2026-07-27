@@ -112,6 +112,23 @@ VISION_MODEL = os.getenv("VISION_MODEL", "")
 VISION_TIMEOUT = int(os.getenv("VISION_TIMEOUT", "60"))
 VISION_MAX_RETRIES = int(os.getenv("VISION_MAX_RETRIES", "2"))
 
+# 原始素材口播理解（OpenAI-compatible 或火山豆包录音文件识别极速版）
+ASR_PROVIDER = os.getenv("ASR_PROVIDER", "openai").strip().lower()
+ASR_BASE_URL = os.getenv(
+    "ASR_BASE_URL",
+    "" if ASR_PROVIDER == "volcengine" else VISION_BASE_URL,
+)
+ASR_API_KEY = os.getenv("ASR_API_KEY", "") or (
+    os.getenv("VOLC_API_KEY", "") if ASR_PROVIDER == "volcengine" else VISION_API_KEY
+)
+ASR_MODEL = os.getenv(
+    "ASR_MODEL",
+    "volc.bigasr.auc_turbo" if ASR_PROVIDER == "volcengine" else "",
+)
+ASR_LANGUAGE = os.getenv("ASR_LANGUAGE", "zh-CN" if ASR_PROVIDER == "volcengine" else "zh")
+ASR_TIMEOUT = int(os.getenv("ASR_TIMEOUT", "90"))
+ASR_MAX_RETRIES = int(os.getenv("ASR_MAX_RETRIES", "1"))
+
 LOCAL_ASSET_WINDOW_SECONDS = float(os.getenv("LOCAL_ASSET_WINDOW_SECONDS", "4"))
 LOCAL_ASSET_WINDOW_STRIDE = float(os.getenv("LOCAL_ASSET_WINDOW_STRIDE", "2"))
 LOCAL_ASSET_CONTACT_SHEET_FRAMES = int(os.getenv("LOCAL_ASSET_CONTACT_SHEET_FRAMES", "12"))

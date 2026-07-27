@@ -215,7 +215,11 @@ from quality_contracts import (
     _is_product_required_narrative,
     _single_line_subtitle_capacity,
 )
-from interactive_prompts import input_with_default, prompt_video_style_if_needed
+from interactive_prompts import (
+    ensure_interactive_terminal_sane,
+    input_with_default,
+    prompt_video_style_if_needed,
+)
 
 
 def _validate_storyboard_quality(storyboard, product_info: dict) -> List[str]:
@@ -4923,6 +4927,7 @@ def run_generation_pipeline(
     local_asset_mode = local_assets is not None
     client = None if local_asset_mode else KlingClient()
     local_asset_index = None
+    local_planning_asset_index = None
     local_asset_edit_report = None
     local_asset_frame_evidence_report = None
     asset_creative_profile = None
@@ -4932,6 +4937,12 @@ def run_generation_pipeline(
     local_one_take_timeline = None
     local_one_take_master: Optional[Path] = None
     local_edit_semantic_indices: List[int] = []
+    selected_material_segments: List[Dict[str, Any]] = []
+    from personal_vlog_audio import is_personal_vlog_style
+    _personal_vlog_audio_mode = local_asset_mode and is_personal_vlog_style(product_info)
+    _personal_vlog_hybrid = False
+    _vlog_dialogue_plan: List[Dict[str, Any]] = []
+    _vlog_dialogue_track: Optional[Path] = None
     if local_asset_mode:
         print(f"🎞️ 本地视频混剪：{Path(local_assets).expanduser()}")
         print("   素材理解驱动脚本、口播、选片与后期配置")
@@ -5119,14 +5130,45 @@ def run_generation_pipeline(
             build_material_constrained_script,
         )
         local_asset_index = build_local_asset_index(Path(local_assets))
+        local_planning_asset_index = local_asset_index
         coverage = local_asset_index.get("coverage", {})
         asset_creative_profile = build_local_asset_creative_profile(local_asset_index)
-        local_story_contract = build_local_asset_story_contract(
-            local_asset_index,
-            product_info,
-            requested_duration=target_duration,
-            preview=preview,
-        )
+        if _personal_vlog_audio_mode:
+            from personal_vlog_planner import (
+                PersonalVlogPlanningError,
+                build_personal_vlog_story_plan,
+            )
+            try:
+                local_planning_asset_index, local_story_contract = build_personal_vlog_story_plan(
+                    local_asset_index,
+                    product_info,
+                    requested_duration=target_duration,
+                    preview=preview,
+                )
+                _vlog_selection = local_story_contract.get("selection_summary") or {}
+                print(
+                    "   个人 Vlog 独立规划："
+                    f"{_vlog_selection.get('source_dialogue_events', 0)} 个原声事件 + "
+                    f"{_vlog_selection.get('supplemental_visual_events', 0)} 个增益画面 / "
+                    f"{local_story_contract['natural_main_duration']:.2f}s 自然时间轴"
+                )
+                print(
+                    "   视听联合筛选："
+                    f"去除 {_vlog_selection.get('audio_visual_duplicates_removed', 0)} 个重复事件，"
+                    "仅保留增加新场景、动作或叙事信息的素材"
+                )
+            except PersonalVlogPlanningError as exc:
+                raise RuntimeError(
+                    "个人 Vlog 需要至少一段事实安全、画面可读且完整的原素材口播；"
+                    f"不会回退到广告规划流程：{exc}"
+                ) from exc
+        else:
+            local_story_contract = build_local_asset_story_contract(
+                local_asset_index,
+                product_info,
+                requested_duration=target_duration,
+                preview=preview,
+            )
         print(f"✅ 本地素材分析完成：可用窗口 {coverage.get('usable_windows', 0)}/{coverage.get('total_windows', 0)}")
         story_role_scores = coverage.get("story_role_scores", {})
         if story_role_scores:
@@ -5305,25 +5347,29 @@ def run_generation_pipeline(
             requested_voice=voice,
             creative_profile=asset_creative_profile,
         )
-        _script_voice_rate = int(VOICE_PRESETS[voice]["rate"])
-        ad_script = build_material_constrained_script(
-            product_info=product_info,
-            coverage=local_asset_index.get("coverage", {}) if local_asset_index else {},
-            num_segments=_num_segs,
-            script_style=script_style,
-            asset_index=local_asset_index,
-            segment_durations={
-                int(segment["index"]): float(segment["duration"])
-                for segment in rhythm_template["segments"]
-            },
-            narrative_plan_override=local_story_contract["narrative_plan"],
-            narration_contract={
-                "voice": voice,
-                "rate": _script_voice_rate,
-                "max_units_per_second": _script_voice_rate / 50.0,
-                "transition_duration": float(rhythm_template["transition_duration"]),
-            },
-        )
+        if _personal_vlog_audio_mode:
+            from personal_vlog_planner import build_personal_vlog_script
+            ad_script = build_personal_vlog_script(local_story_contract, product_info)
+        else:
+            _script_voice_rate = int(VOICE_PRESETS[voice]["rate"])
+            ad_script = build_material_constrained_script(
+                product_info=product_info,
+                coverage=local_asset_index.get("coverage", {}) if local_asset_index else {},
+                num_segments=_num_segs,
+                script_style=script_style,
+                asset_index=local_asset_index,
+                segment_durations={
+                    int(segment["index"]): float(segment["duration"])
+                    for segment in rhythm_template["segments"]
+                },
+                narrative_plan_override=local_story_contract["narrative_plan"],
+                narration_contract={
+                    "voice": voice,
+                    "rate": _script_voice_rate,
+                    "max_units_per_second": _script_voice_rate / 50.0,
+                    "transition_duration": float(rhythm_template["transition_duration"]),
+                },
+            )
     else:
         ad_script = generate_ad_script(
             product_info,
@@ -5376,7 +5422,10 @@ def run_generation_pipeline(
                 "script_tone": script_music_profile["tone"],
                 "script_keywords": script_music_profile["keywords"],
             }
-    print(f"📝 广告脚本风格：{SCRIPT_STYLES.get(script_style, {}).get('name', script_style)}")
+    if _personal_vlog_audio_mode:
+        print("📝 个人 Vlog 叙事：原素材口播主线 + 叙事增益画面 + 稀疏间隙旁白")
+    else:
+        print(f"📝 广告脚本风格：{SCRIPT_STYLES.get(script_style, {}).get('name', script_style)}")
     print(f"    视频标题：{ad_script['title']}")
     print(f"    话题标签：{' '.join(ad_script['hashtags'])}")
 
@@ -5402,41 +5451,47 @@ def run_generation_pipeline(
             # medium 风险：提示但不拦截
             print("⚠️  检测到中风险合规问题，建议修改后再发布（当前继续处理）。")
     else:
-        print("✅ 广告合规检测通过")
+        print("✅ 内容合规检测通过" if _personal_vlog_audio_mode else "✅ 广告合规检测通过")
 
     # 剧情完整性校验
-    _story_check = check_story_completeness(ad_script)
-    _story_score_pct = int(_story_check["score"] * 100)
-    print(f"🎬 剧情完整性：{_story_score_pct}%（{_story_check['total_segments']} 段）")
-    if _story_check["passed"]:
-        print("    ✅ 叙事弧完整：hook → turning → showcase → result → cta")
+    if _personal_vlog_audio_mode:
+        print("🎬 个人 Vlog 连续性：按日常叙事事件顺序保留，不应用广告叙事节拍与 CTA 校验")
     else:
-        print(f"    ⚠️  缺失叙事节拍：{', '.join(_story_check['missing_beats'])}")
-    if _story_check["warnings"]:
-        for _w in _story_check["warnings"]:
-            print(f"    ⚠️  {_w}")
-    if not _story_check["passed"] and strict_mode and not preview and not local_asset_mode:
-        raise RuntimeError(
-            f"剧情完整性校验失败（{_story_score_pct}%）：缺失叙事节拍 {_story_check['missing_beats']}。"
-            "请优化脚本后重新生成，或使用 --no-strict 跳过校验。"
-        )
+        _story_check = check_story_completeness(ad_script)
+        _story_score_pct = int(_story_check["score"] * 100)
+        print(f"🎬 剧情完整性：{_story_score_pct}%（{_story_check['total_segments']} 段）")
+        if _story_check["passed"]:
+            print("    ✅ 叙事弧完整：hook → turning → showcase → result → cta")
+        else:
+            print(f"    ⚠️  缺失叙事节拍：{', '.join(_story_check['missing_beats'])}")
+        if _story_check["warnings"]:
+            for _w in _story_check["warnings"]:
+                print(f"    ⚠️  {_w}")
+        if not _story_check["passed"] and strict_mode and not preview and not local_asset_mode:
+            raise RuntimeError(
+                f"剧情完整性校验失败（{_story_score_pct}%）：缺失叙事节拍 {_story_check['missing_beats']}。"
+                "请优化脚本后重新生成，或使用 --no-strict 跳过校验。"
+            )
 
     # ── 节奏曲线分析：基于脚本段落情绪 + 音乐合同 BPM 生成逐段节奏参数 ──
     rhythm_curve = None
-    try:
-        from rhythm_controller import RhythmController
-        _rc = RhythmController()
-        _segments_for_rhythm = ad_script.get("segments", []) if isinstance(ad_script, dict) else []
-        if _segments_for_rhythm:
-            rhythm_curve = _rc.analyze_script_rhythm(
-                segments=_segments_for_rhythm,
-                product_category=product_info.get("type", "default"),
-            )
-            print(f"🎼 节奏曲线分析完成：整体 BPM {rhythm_curve.overall_bpm}，共 {len(rhythm_curve.segments)} 段")
-            for _rs in rhythm_curve.segments[:6]:
-                print(f"    [{_rs.segment_index + 1}] {_rs.narrative_type:<12s}  BPM:{_rs.bpm:>3d}  强度:{_rs.emotion_level.value:<9s}  {_rs.duration:.1f}s")
-    except Exception as _rhythm_err:
-        print(f"⚠️  节奏曲线分析跳过：{_rhythm_err}")
+    if _personal_vlog_audio_mode:
+        print("🎼 个人 Vlog 节奏：服从原素材事件时长，不应用广告情绪节拍曲线")
+    else:
+        try:
+            from rhythm_controller import RhythmController
+            _rc = RhythmController()
+            _segments_for_rhythm = ad_script.get("segments", []) if isinstance(ad_script, dict) else []
+            if _segments_for_rhythm:
+                rhythm_curve = _rc.analyze_script_rhythm(
+                    segments=_segments_for_rhythm,
+                    product_category=product_info.get("type", "default"),
+                )
+                print(f"🎼 节奏曲线分析完成：整体 BPM {rhythm_curve.overall_bpm}，共 {len(rhythm_curve.segments)} 段")
+                for _rs in rhythm_curve.segments[:6]:
+                    print(f"    [{_rs.segment_index + 1}] {_rs.narrative_type:<12s}  BPM:{_rs.bpm:>3d}  强度:{_rs.emotion_level.value:<9s}  {_rs.duration:.1f}s")
+        except Exception as _rhythm_err:
+            print(f"⚠️  节奏曲线分析跳过：{_rhythm_err}")
 
     # ── 故事板预可视化验证：生成分镜结构并校验质量 ──
     storyboard = None
@@ -5494,7 +5549,12 @@ def run_generation_pipeline(
         and bool(ad_script.get("story_world"))
     )
 
-    if _use_story_driven:
+    if _personal_vlog_audio_mode:
+        clip_prompts = [
+            str(segment.get("source_dialogue") or segment.get("voiceover") or "现场连续事件")
+            for segment in ad_script.get("segments", [])
+        ]
+    elif _use_story_driven:
         clip_prompts = build_story_driven_prompts(
             ad_script=ad_script,
             product_info=product_info,
@@ -5537,14 +5597,18 @@ def run_generation_pipeline(
                 clip_prompts.append(styled)
 
     if local_asset_mode:
-        clip_prompts = [
-            seg.get("visual_requirement") or seg.get("scene_prompt") or seg.get("subtitle") or "local product ad material"
-            for seg in ad_script.get("segments", [])
-        ]
+        if not _personal_vlog_audio_mode:
+            clip_prompts = [
+                seg.get("visual_requirement") or seg.get("scene_prompt") or seg.get("subtitle") or "local product ad material"
+                for seg in ad_script.get("segments", [])
+            ]
         storyboard = None
-        print(f"🎯 本地选片查询已生成（{len(clip_prompts)} 段）")
+        if _personal_vlog_audio_mode:
+            print(f"🎯 个人 Vlog 视听叙事时间线已生成（{len(clip_prompts)} 段）")
+        else:
+            print(f"🎯 本地选片查询已生成（{len(clip_prompts)} 段）")
 
-    if style != DEFAULT_CINEMATIC_STYLE:
+    if style != DEFAULT_CINEMATIC_STYLE and not _personal_vlog_audio_mode:
         style_name = CINEMATIC_STYLES.get(style, {}).get("name", style)
         print(f"🎬 电影风格注入：{style_name}（影响 {len(clip_prompts)} 个片段的运镜与光影）")
 
@@ -5638,7 +5702,10 @@ def run_generation_pipeline(
             reference_sort_notes=[],
             passed=True,
         )
-        print("🔍 本地选片按素材语义证据与匹配置信度执行")
+        if _personal_vlog_audio_mode:
+            print("🔍 个人 Vlog 按已核验原声事件与日常叙事顺序执行")
+        else:
+            print("🔍 本地选片按素材语义证据与匹配置信度执行")
     else:
         quality_gate_result = run_quality_gate(
             ad_script=ad_script,
@@ -6436,7 +6503,37 @@ def run_generation_pipeline(
         return clip_path
 
     if local_asset_mode:
-        if use_voiceover:
+        from local_asset_pipeline import LocalAssetError, plan_and_materialize_local_clips
+        from personal_vlog_audio import collect_source_dialogue_candidates
+        if _personal_vlog_audio_mode:
+            from personal_vlog_planner import materialize_personal_vlog_clips
+
+        if _personal_vlog_audio_mode:
+            _personal_vlog_hybrid = not use_voiceover
+            if use_voiceover:
+                try:
+                    _vlog_preview = materialize_personal_vlog_clips(
+                        planning_asset_index=local_planning_asset_index or {},
+                        story_contract=local_story_contract,
+                        vlog_script=ad_script,
+                        clips_dir=clips_dir / f"{output_name}_local_assets",
+                        final_dir=final_dir,
+                        output_name=output_name,
+                        plan_only=True,
+                    )
+                    _personal_vlog_hybrid = bool(collect_source_dialogue_candidates(
+                        _vlog_preview.get("selected_segments") or [],
+                        local_asset_index or {},
+                        product_info,
+                    ))
+                except LocalAssetError as exc:
+                    print(f"⚠️  个人 Vlog 原声预规划不可用，回退间隔旁白：{exc}")
+            print(
+                "🎙️ 个人 Vlog 音频策略："
+                + ("原素材口播 + 间隔旁白" if _personal_vlog_hybrid else "间隔旁白回退")
+            )
+
+        if use_voiceover and not _personal_vlog_audio_mode:
             local_one_take_master = final_dir / f"{output_name}_voiceover_master.m4a"
             local_one_take_timeline = _prepare_local_one_take_master(
                 ad_script=ad_script,
@@ -6468,8 +6565,10 @@ def run_generation_pipeline(
                 print(
                     f"    [{line['segment']}] {line['start']:.2f}-{line['end']:.2f}s  {line['text']}"
                 )
-        print("\n🎞️ 本地素材选片：根据素材约束脚本自动匹配片段")
-        from local_asset_pipeline import LocalAssetError, plan_and_materialize_local_clips
+        if _personal_vlog_audio_mode:
+            print("\n🎞️ 个人 Vlog 裁片：按视听叙事顺序保留连续上下文")
+        else:
+            print("\n🎞️ 本地素材选片：根据素材约束脚本自动匹配片段")
 
         if local_one_take_timeline:
             plan_and_materialize_local_clips(
@@ -6484,15 +6583,25 @@ def run_generation_pipeline(
                 record_failure=False,
             )
 
-        local_asset_result = plan_and_materialize_local_clips(
-            asset_index=local_asset_index or {},
-            ad_script=ad_script,
-            rhythm_template=rhythm_template,
-            clips_dir=clips_dir / f"{output_name}_local_assets",
-            final_dir=final_dir,
-            output_name=output_name,
-            product_info=product_info,
-        )
+        if _personal_vlog_audio_mode:
+            local_asset_result = materialize_personal_vlog_clips(
+                planning_asset_index=local_planning_asset_index or {},
+                story_contract=local_story_contract,
+                vlog_script=ad_script,
+                clips_dir=clips_dir / f"{output_name}_local_assets",
+                final_dir=final_dir,
+                output_name=output_name,
+            )
+        else:
+            local_asset_result = plan_and_materialize_local_clips(
+                asset_index=local_planning_asset_index or local_asset_index or {},
+                ad_script=ad_script,
+                rhythm_template=rhythm_template,
+                clips_dir=clips_dir / f"{output_name}_local_assets",
+                final_dir=final_dir,
+                output_name=output_name,
+                product_info=product_info,
+            )
         clip_paths = local_asset_result["clip_paths"]
         successful_clip_indices = local_asset_result.get(
             "edit_indices",
@@ -7007,6 +7116,8 @@ def run_generation_pipeline(
             work_dir=clips_dir / f"{output_name}_transition_previews",
             learning_store=_transition_learning_store,
             verification_id=output_name,
+            preferred_transition=scene_cfg.get("transition_type"),
+            video_style_tone=str(music_contract.get("video_style_tone") or ""),
             max_total_overlap=(
                 max(
                     0.0,
@@ -7290,6 +7401,61 @@ def run_generation_pipeline(
             "rendered_segments": _rendered_segment_timeline,
         })
 
+    if _personal_vlog_hybrid and selected_material_segments:
+        from personal_vlog_audio import (
+            collect_source_dialogue_candidates,
+            place_source_dialogue,
+            render_source_dialogue_track,
+        )
+
+        _vlog_dialogue_plan = place_source_dialogue(
+            collect_source_dialogue_candidates(
+                selected_material_segments,
+                local_asset_index or {},
+                product_info,
+            ),
+            _actual_segment_timeline,
+            trim_start=_trim_start,
+            total_duration=_rendered_main_duration,
+        )
+        if _vlog_dialogue_plan:
+            try:
+                _vlog_dialogue_track = render_source_dialogue_track(
+                    _vlog_dialogue_plan,
+                    final_dir / f"{output_name}_original_dialogue.m4a",
+                    _rendered_main_duration,
+                )
+                _dialogue_seconds = sum(float(item["duration"]) for item in _vlog_dialogue_plan)
+                print(
+                    f"🎙️ 个人 Vlog 原声：保留 {len(_vlog_dialogue_plan)} 段完整口播 / "
+                    f"{_dialogue_seconds:.2f}s，旁白仅填补其余段落"
+                )
+            except Exception as exc:
+                _vlog_dialogue_plan = []
+                _vlog_dialogue_track = None
+                print(f"⚠️  个人 Vlog 原声轨渲染失败，回退旁白：{exc}")
+        else:
+            print("ℹ️  个人 Vlog 选中镜头没有完整且可核验的原口播，回退旁白")
+        if postproduction_contract:
+            postproduction_contract["voice"].update({
+                "strategy": (
+                    "personal_vlog_source_dialogue_with_narration"
+                    if _vlog_dialogue_track else
+                    "personal_vlog_narration_fallback"
+                ),
+                "source_dialogue": [
+                    {
+                        key: item[key]
+                        for key in (
+                            "edit_index", "semantic_segment", "source_path",
+                            "source_start", "source_end", "timeline_start",
+                            "timeline_end", "text", "confidence",
+                        )
+                    }
+                    for item in _vlog_dialogue_plan
+                ],
+            })
+
     # ============================================================
     # 第五步：添加字幕 + 口播配音
     # ============================================================
@@ -7319,7 +7485,7 @@ def run_generation_pipeline(
     if bgm_file and bgm_file.exists():
         # P0-3：仅在无口播时做 beat 对齐；有口播时字幕对齐交给 voiceover 接管
         # 两次对齐叠加会导致时间轴累计偏移 0.1~0.3s，口播场景字幕明显滞后
-        _beat_align_needed = not use_voiceover
+        _beat_align_needed = not use_voiceover and not _vlog_dialogue_track
         if _beat_align_needed:
             subtitles = align_subtitles_to_beats(subtitles, bgm_file)
 
@@ -7337,6 +7503,7 @@ def run_generation_pipeline(
     voiceover_audio = final_dir / f"{output_name}_voiceover.m4a"
     voice_performance: Dict[str, Any] = {}
     voiceover_subs: List[Dict[str, Any]] = []
+    _planned_vlog_narration_count = 0
     if use_voiceover:
         try:
             print(
@@ -7384,19 +7551,91 @@ def run_generation_pipeline(
                         outro_duration=float(reference_profile["outro_duration"]),
                     )
                 total_duration += float(reference_profile["outro_duration"])
+            if _personal_vlog_audio_mode:
+                from personal_vlog_audio import (
+                    ensure_planned_narration_survived,
+                    narration_lines_without_dialogue,
+                    place_narration_in_dialogue_gaps,
+                )
+                narrative_by_segment = {
+                    int(item.get("segment", index)): str(item.get("narrative") or "")
+                    for index, item in enumerate(ad_script.get("segments") or [])
+                }
+                for line in voiceover_script:
+                    line["narrative"] = narrative_by_segment.get(int(line.get("segment", -1)), "")
+                _vlog_narration_candidates = narration_lines_without_dialogue(
+                    voiceover_script,
+                    _vlog_dialogue_plan,
+                )
+                _planned_vlog_narration_count = len(_vlog_narration_candidates)
+                voiceover_script = place_narration_in_dialogue_gaps(
+                    _vlog_narration_candidates,
+                    _vlog_dialogue_plan,
+                    total_duration=total_duration,
+                    style_hint="auto" if voiceover_style in {"", "standard"} else voiceover_style,
+                )
+                ensure_planned_narration_survived(
+                    _planned_vlog_narration_count,
+                    voiceover_script,
+                    stage="间隙放置",
+                )
+                _vlog_narration_style = (
+                    str(voiceover_script[0].get("narration_style") or "storytelling")
+                    if voiceover_script else "none"
+                )
+                print(
+                    f"  🎙️ 个人 Vlog 间隙旁白：{len(voiceover_script)} 段"
+                    f"（风格：{_vlog_narration_style}）"
+                )
             continuous_voiceover_text = None
-            if local_asset_mode:
+            if local_asset_mode and not _personal_vlog_audio_mode:
                 continuous_voiceover_text = str(ad_script.get("voiceover_full") or "").strip()
-            voiceover_audio, voiceover_subs = generate_full_voiceover(
-                voiceover_script,
-                voiceover_audio,
-                voice=voice,
-                total_duration=total_duration,
-                continuous_narration=local_asset_mode,
-                continuous_text=continuous_voiceover_text,
-                performance_profile=voice_performance,
-                pre_generated_audio=local_one_take_master,
-            )
+            _generated_narration = bool(voiceover_script)
+            if _generated_narration:
+                voiceover_audio, voiceover_subs = generate_full_voiceover(
+                    voiceover_script,
+                    voiceover_audio,
+                    voice=voice,
+                    total_duration=total_duration,
+                    max_rate_multiplier=1.15 if _personal_vlog_audio_mode else 1.6,
+                    continuous_narration=local_asset_mode and not _personal_vlog_audio_mode,
+                    continuous_text=continuous_voiceover_text,
+                    performance_profile=voice_performance,
+                    pre_generated_audio=local_one_take_master,
+                    allow_sparse_narration=_personal_vlog_audio_mode,
+                )
+                if _personal_vlog_audio_mode:
+                    ensure_planned_narration_survived(
+                        _planned_vlog_narration_count,
+                        voiceover_subs,
+                        stage="语音生成",
+                    )
+            if _vlog_dialogue_track:
+                from personal_vlog_audio import dialogue_subtitles, mix_speech_tracks
+                _tts_track = voiceover_audio if _generated_narration else None
+                voiceover_audio = mix_speech_tracks(
+                    _vlog_dialogue_track,
+                    _tts_track,
+                    final_dir / f"{output_name}_vlog_speech.m4a",
+                    total_duration,
+                )
+                voiceover_subs = sorted(
+                    [*dialogue_subtitles(_vlog_dialogue_plan), *voiceover_subs],
+                    key=lambda item: float(item.get("start") or 0.0),
+                )
+                voice_performance.update({
+                    "mode": "personal_vlog_hybrid",
+                    "source_dialogue_count": len(_vlog_dialogue_plan),
+                    "narration_line_count": len(voiceover_script),
+                })
+            elif not _generated_narration:
+                raise RuntimeError("个人 Vlog 没有可用原声或旁白")
+            elif _personal_vlog_audio_mode:
+                voice_performance.update({
+                    "mode": "personal_vlog_segmented_narration",
+                    "source_dialogue_count": 0,
+                    "narration_line_count": len(voiceover_script),
+                })
             if local_one_take_timeline:
                 voice_performance.update({
                     "source_tempo_multiplier": float(
@@ -7428,12 +7667,45 @@ def run_generation_pipeline(
                     "selection_reason": _voice_reason,
                     "performance": voice_performance,
                 })
+                if _personal_vlog_audio_mode and not _vlog_dialogue_track:
+                    postproduction_contract["voice"]["strategy"] = (
+                        "personal_vlog_segmented_narration_fallback"
+                    )
             print(f"✅ 口播生成完成：{voiceover_audio.name}")
         except Exception as e:
             print(f"⚠️  口播生成失败：{e}")
             voiceover_enabled = False
-            if strict_mode or fallback_audio_used:
+            if _personal_vlog_audio_mode and _planned_vlog_narration_count:
+                raise RuntimeError(
+                    "个人 Vlog 已计划间隙旁白但未能生成，已阻断纯拼接成片"
+                ) from e
+            if _vlog_dialogue_track:
+                from personal_vlog_audio import dialogue_subtitles, mix_speech_tracks
+                voiceover_audio = mix_speech_tracks(
+                    _vlog_dialogue_track,
+                    None,
+                    final_dir / f"{output_name}_vlog_speech.m4a",
+                    _rendered_main_duration,
+                )
+                voiceover_subs = dialogue_subtitles(_vlog_dialogue_plan)
+                subtitles = align_subtitles_to_voiceover(subtitles, voiceover_subs)
+                voiceover_enabled = True
+                print("✅ 已回退为个人 Vlog 原素材口播")
+            elif strict_mode or fallback_audio_used:
                 raise RuntimeError("请求了口播但未生成有效口播音频，已阻断不可发布成片") from e
+
+    if _vlog_dialogue_track and not voiceover_enabled:
+        from personal_vlog_audio import dialogue_subtitles, mix_speech_tracks
+        voiceover_audio = mix_speech_tracks(
+            _vlog_dialogue_track,
+            None,
+            final_dir / f"{output_name}_vlog_speech.m4a",
+            _rendered_main_duration,
+        )
+        voiceover_subs = dialogue_subtitles(_vlog_dialogue_plan)
+        subtitles = align_subtitles_to_voiceover(subtitles, voiceover_subs)
+        voiceover_enabled = True
+        print("✅ 个人 Vlog 原素材口播已进入最终音轨")
 
     # ============================================================
     # 无声视频检测（兜底音频已在拼接前生成，此处仅处理口播补充场景）
@@ -8266,15 +8538,18 @@ def run_one_click_create(
         args.video_style_source = video_style_resolution.get("video_style_source", "auto")
         source_label = "用户指定" if args.video_style_source == "user" else "智能推荐"
         print(f"🎭 视频风格：{args.video_style}（{source_label}）")
-        applied_labels = []
-        if "script_style" in video_style_resolution:
-            applied_labels.append(f"脚本={video_style_resolution['script_style']}")
-        if "hook" in video_style_resolution:
-            applied_labels.append(f"钩子={video_style_resolution['hook']}")
-        if "voiceover_style" in video_style_resolution:
-            applied_labels.append(f"口播={video_style_resolution['voiceover_style']}")
-        if "rhythm_style" in video_style_resolution:
-            applied_labels.append(f"节奏={video_style_resolution['rhythm_style']}")
+        if video_style_resolution.get("tone") == "personal_vlog":
+            applied_labels = ["叙事=原素材口播事件", "旁白=原声间隙稀疏补充", "节奏=素材自然时长"]
+        else:
+            applied_labels = []
+            if "script_style" in video_style_resolution:
+                applied_labels.append(f"脚本={video_style_resolution['script_style']}")
+            if "hook" in video_style_resolution:
+                applied_labels.append(f"钩子={video_style_resolution['hook']}")
+            if "voiceover_style" in video_style_resolution:
+                applied_labels.append(f"口播={video_style_resolution['voiceover_style']}")
+            if "rhythm_style" in video_style_resolution:
+                applied_labels.append(f"节奏={video_style_resolution['rhythm_style']}")
         if applied_labels:
             print(f"   已映射：{', '.join(applied_labels)}")
         style_prompt_note = video_style_resolution.get("prompt_note", "")
@@ -8321,6 +8596,13 @@ def run_one_click_create(
     product_info["ambient_entities"] = resolved_cast_plan.get("ambient_entities", [])
 
     local_asset_mode = bool(getattr(args, "local_assets", None))
+    if (
+        local_asset_mode
+        and video_style_resolution.get("tone") == "personal_vlog"
+        and "voiceover" not in set(getattr(args, "_explicit_args", set()) or set())
+    ):
+        use_voiceover = True
+        print("🎙️ 个人 Vlog 默认启用稀疏间隙旁白；原素材口播仍优先保留")
     # 目标总时长适配：通过节奏模板动态调整每段时长
     target_duration = getattr(args, "target_duration", None)
     rhythm_style = getattr(args, "rhythm_style", "moderate")
@@ -8659,6 +8941,8 @@ def main():
             print()
 
         sys.exit(0)
+
+    ensure_interactive_terminal_sane()
 
     # 如果指定了 --load，直接从模板加载
     if args.load:

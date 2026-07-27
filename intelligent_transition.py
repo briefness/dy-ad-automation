@@ -227,9 +227,82 @@ def _candidate_names(features: Dict[str, Any]) -> List[str]:
     ]))
 
 
+def _narrative_phase(value: str) -> str:
+    phase = str(value or "").strip().lower()
+    for prefix in ("source_dialogue_", "visual_support_"):
+        if phase.startswith(prefix):
+            phase = phase[len(prefix):]
+            break
+    return {
+        "opening_context": "opening",
+        "turning_point": "turning",
+        "product_showcase": "showcase",
+        "source_context": "context",
+    }.get(phase, phase)
+
+
+def _preferred_candidate_types(preferred_transition: str, direction: str) -> set[str]:
+    preferred = str(preferred_transition or "").strip().lower()
+    if preferred == "push":
+        return {"zoomin"}
+    if preferred == "whip_pan":
+        return set({
+            "left": ("slideleft", "wipeleft"),
+            "right": ("slideright", "wiperight"),
+            "up": ("slideup",),
+            "down": ("slidedown",),
+        }.get(direction, ()))
+    return {preferred} if preferred else set()
+
+
+def _personal_vlog_narrative_fit(
+    transition_type: str,
+    from_phase: str,
+    to_phase: str,
+) -> float:
+    if from_phase == to_phase:
+        return 0.5
+    if to_phase == "outcome":
+        if transition_type in {"fade", "dissolve", "fadeblack", "rectcrop"}:
+            return 0.74
+        return 0.50 if transition_type in {"none", "cut"} else 0.56
+    if (from_phase, to_phase) == ("process", "interaction"):
+        if transition_type in {"fade", "dissolve", "rectcrop"}:
+            return 0.70
+        return 0.52 if transition_type in {"none", "cut"} else 0.56
+    if transition_type in {"fade", "dissolve"}:
+        return 0.68
+    if transition_type in {"cut", "rectcrop"}:
+        return 0.58
+    return 0.52 if transition_type == "none" else 0.55
+
+
+def _direct_sales_narrative_fit(
+    transition_type: str,
+    from_phase: str,
+    to_phase: str,
+    fallback: float,
+) -> float:
+    pair = (from_phase, to_phase)
+    if pair in {("hook", "turning"), ("turning", "showcase")}:
+        if transition_type in {"zoomin", "circlecrop", "rectcrop"}:
+            return 0.74
+        if transition_type.startswith(("slide", "wipe")):
+            return 0.64
+        return 0.58 if transition_type in {"cut", "dissolve"} else 0.50
+    if pair in {("hook", "showcase"), ("showcase", "result")}:
+        return 0.72 if transition_type in {"zoomin", "circlecrop", "rectcrop"} else 0.58
+    if to_phase == "cta" and from_phase in {"showcase", "result"}:
+        return 0.75 if transition_type in {"fadeblack", "dissolve", "rectcrop"} else 0.48
+    return fallback
+
+
 def score_transition_candidates(
     features: Dict[str, Any],
     learning_bonuses: Optional[Dict[str, float]] = None,
+    *,
+    preferred_transition: Optional[str] = None,
+    video_style_tone: str = "",
 ) -> List[Dict[str, Any]]:
     """Score candidates deterministically from content, narrative, rhythm and verified history."""
     learning_bonuses = learning_bonuses or {}
@@ -243,6 +316,15 @@ def score_transition_candidates(
     pair = str(features["narrative_pair"])
     style = str(features["style"])
     direction = str(features["motion_direction"])
+    pair_parts = pair.split("->", 1)
+    phase_changed = (
+        len(pair_parts) == 2
+        and _narrative_phase(pair_parts[0]) != _narrative_phase(pair_parts[1])
+    )
+    from_phase = _narrative_phase(pair_parts[0]) if pair_parts else ""
+    to_phase = _narrative_phase(pair_parts[1]) if len(pair_parts) == 2 else ""
+    tone = str(video_style_tone or "").strip().lower()
+    preferred_types = _preferred_candidate_types(preferred_transition or "", direction)
 
     scores = []
     for name in _candidate_names(features):
@@ -279,6 +361,10 @@ def score_transition_candidates(
             narrative = 0.75 if name in {"fadeblack", "dissolve", "rectcrop"} else 0.48
         elif pair == "showcase->showcase":
             narrative = 0.72 if name in {"cut", "dissolve", "fade"} else 0.52
+        if tone == "personal_vlog":
+            narrative = _personal_vlog_narrative_fit(name, from_phase, to_phase)
+        elif tone == "direct_sales":
+            narrative = _direct_sales_narrative_fit(name, from_phase, to_phase, narrative)
 
         rhythm = 0.55
         if style == "fast":
@@ -289,13 +375,20 @@ def score_transition_candidates(
             rhythm = 0.70 if name in {"none", "cut", "dissolve", "fade", "rectcrop"} else 0.55
 
         learned = max(-0.12, min(0.12, float(learning_bonuses.get(name, 0.0))))
-        total = max(0.0, min(1.0, 0.58 * visual + 0.24 * narrative + 0.18 * rhythm + learned))
+        style_preference = 0.025 if phase_changed and name in preferred_types else 0.0
+        total = max(0.0, min(
+            1.0,
+            0.58 * visual + 0.24 * narrative + 0.18 * rhythm + learned + style_preference,
+        ))
         details = {
             "visual_fit": round(visual, 4),
             "narrative_fit": round(narrative, 4),
             "rhythm_fit": round(rhythm, 4),
             "verified_learning_bonus": round(learned, 4),
         }
+        if style_preference:
+            details["style_preference_bonus"] = round(style_preference, 4)
+        preference_reason = f", style={style_preference:+.3f}" if style_preference else ""
         scores.append({
             "type": name,
             "score": round(total, 4),
@@ -303,6 +396,7 @@ def score_transition_candidates(
             "reason": (
                 f"visual={details['visual_fit']:.2f}, narrative={details['narrative_fit']:.2f}, "
                 f"rhythm={details['rhythm_fit']:.2f}, learned={details['verified_learning_bonus']:+.2f}"
+                f"{preference_reason}"
             ),
         })
     return sorted(scores, key=lambda item: (-item["score"], item["type"]))
@@ -531,6 +625,8 @@ def plan_intelligent_transitions(
     max_render_candidates: int = 5,
     verification_id: Optional[str] = None,
     max_total_overlap: Optional[float] = None,
+    preferred_transition: Optional[str] = None,
+    video_style_tone: str = "",
 ) -> Dict[str, Any]:
     if len(clips) < 2:
         return {"transitions": [], "boundaries": [], "policy": "verified_content_aware_v1"}
@@ -548,7 +644,12 @@ def plan_intelligent_transitions(
         )
         bucket = feature_bucket(features)
         bonuses = learning_store.get_verified_bonuses(bucket) if learning_store else {}
-        ranked = score_transition_candidates(features, bonuses)
+        ranked = score_transition_candidates(
+            features,
+            bonuses,
+            preferred_transition=preferred_transition,
+            video_style_tone=video_style_tone,
+        )
         evaluated = []
         render_candidates = ranked[:max(1, max_render_candidates)]
         if not any(candidate["type"] == "none" for candidate in render_candidates):
@@ -653,6 +754,8 @@ def plan_intelligent_transitions(
 
     return {
         "policy": "verified_content_aware_v1",
+        "preferred_transition": str(preferred_transition or ""),
+        "video_style_tone": str(video_style_tone or ""),
         "max_total_overlap": max_total_overlap,
         "selected_total_overlap": round(
             sum(float(item.get("duration") or 0.0) for item in selected),

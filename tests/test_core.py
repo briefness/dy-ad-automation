@@ -1795,6 +1795,92 @@ class TestFifthReviewFixes:
         assert all(item["score_details"] for item in first)
         assert all("reason" in item for item in first)
 
+    def test_direct_sales_transition_preference_breaks_only_a_close_narrative_tie(self):
+        from intelligent_transition import score_transition_candidates
+
+        features = {
+            "subject_distance": 0.08,
+            "subject_centeredness": 0.95,
+            "composition_similarity": 0.72,
+            "motion_alignment": 0.80,
+            "motion_speed": 0.35,
+            "motion_direction": "right",
+            "brightness_delta": 0.06,
+            "color_delta": 0.08,
+            "scene_difference": 0.45,
+            "narrative_pair": "hook->showcase",
+            "style": "fast",
+        }
+
+        baseline = score_transition_candidates(features)
+        preferred = score_transition_candidates(
+            features,
+            preferred_transition="push",
+            video_style_tone="direct_sales",
+        )
+
+        assert baseline[0]["type"] == "none"
+        assert preferred[0]["type"] == "zoomin"
+        assert 0 < preferred[0]["score_details"]["style_preference_bonus"] <= 0.03
+
+    def test_direct_sales_transition_scoring_understands_turning_point_structure(self):
+        from intelligent_transition import score_transition_candidates
+
+        features = {
+            "subject_distance": 0.08,
+            "subject_centeredness": 0.95,
+            "composition_similarity": 0.72,
+            "motion_alignment": 0.80,
+            "motion_speed": 0.35,
+            "motion_direction": "right",
+            "brightness_delta": 0.06,
+            "color_delta": 0.08,
+            "scene_difference": 0.45,
+            "narrative_pair": "hook->turning",
+            "style": "fast",
+        }
+
+        baseline = score_transition_candidates(features)
+        direct_sales = score_transition_candidates(features, video_style_tone="direct_sales")
+        baseline_zoom = next(item for item in baseline if item["type"] == "zoomin")
+        styled_zoom = next(item for item in direct_sales if item["type"] == "zoomin")
+
+        assert baseline_zoom["score_details"]["narrative_fit"] == 0.5
+        assert styled_zoom["score_details"]["narrative_fit"] > 0.5
+        assert styled_zoom["score"] > baseline_zoom["score"]
+
+    def test_personal_vlog_transition_scoring_changes_only_at_story_phase_boundaries(self):
+        from intelligent_transition import score_transition_candidates
+
+        features = {
+            "subject_distance": 0.1462,
+            "subject_centeredness": 0.5654,
+            "composition_similarity": 0.795,
+            "motion_alignment": 0.45,
+            "motion_speed": 0.0829,
+            "motion_direction": "static",
+            "brightness_delta": 0.0171,
+            "color_delta": 0.0278,
+            "scene_difference": 0.1051,
+            "narrative_pair": "source_dialogue_process->visual_support_process",
+            "style": "moderate",
+        }
+
+        same_phase = score_transition_candidates(
+            features,
+            preferred_transition="dissolve",
+            video_style_tone="personal_vlog",
+        )
+        outcome_boundary = score_transition_candidates(
+            {**features, "narrative_pair": "source_dialogue_interaction->source_dialogue_outcome"},
+            preferred_transition="dissolve",
+            video_style_tone="personal_vlog",
+        )
+
+        assert same_phase[0]["type"] == "none"
+        assert outcome_boundary[0]["type"] == "dissolve"
+        assert outcome_boundary[0]["score_details"]["narrative_fit"] > 0.5
+
     def test_legacy_transition_selector_is_also_deterministic(self):
         """旧入口不能残留随机选择，避免非主流程调用产生漂移。"""
         from video_merger import select_transition
@@ -1839,6 +1925,59 @@ class TestFifthReviewFixes:
                     base_duration=0.3,
                     work_dir=tmp_path / "previews",
                 )
+
+    def test_transition_preference_never_bypasses_render_quality_gate(self, tmp_path):
+        from intelligent_transition import plan_intelligent_transitions
+
+        clips = [tmp_path / "left.mp4", tmp_path / "right.mp4"]
+        for clip in clips:
+            clip.write_bytes(b"fixture")
+        features = {
+            "subject_distance": 0.08,
+            "subject_centeredness": 0.95,
+            "composition_similarity": 0.72,
+            "motion_alignment": 0.80,
+            "motion_speed": 0.35,
+            "motion_direction": "right",
+            "brightness_delta": 0.06,
+            "color_delta": 0.08,
+            "scene_difference": 0.45,
+            "narrative_pair": "hook->showcase",
+            "style": "fast",
+        }
+
+        def render(_left, _right, candidate, _work_dir, _boundary):
+            if candidate["type"] == "zoomin":
+                return {"passed": False, "quality_score": 0.2, "metrics": {"max_frame_jump": 0.9}}
+            return {"passed": True, "quality_score": 0.95, "metrics": {}}
+
+        with patch("intelligent_transition.analyze_transition_boundary", return_value=features), patch(
+            "intelligent_transition.render_and_evaluate_transition",
+            side_effect=render,
+        ), patch("intelligent_transition._duration", return_value=3.0):
+            result = plan_intelligent_transitions(
+                clips,
+                ["hook", "showcase"],
+                style="fast",
+                base_duration=0.3,
+                work_dir=tmp_path / "previews",
+                preferred_transition="push",
+                video_style_tone="direct_sales",
+            )
+
+        assert result["transitions"][0]["type"] == "none"
+        assert result["preferred_transition"] == "push"
+        assert result["video_style_tone"] == "direct_sales"
+
+    def test_main_pipeline_passes_existing_av_style_context_to_transition_planner(self):
+        source = Path("one_click_create.py").read_text(encoding="utf-8")
+        call = source[
+            source.index("transition_decision_report = plan_intelligent_transitions("):
+            source.index("scene_transitions = normalize_transition_decisions(")
+        ]
+
+        assert 'preferred_transition=scene_cfg.get("transition_type")' in call
+        assert 'video_style_tone=str(music_contract.get("video_style_tone") or "")' in call
 
     def test_transition_learning_uses_only_verified_minimum_samples(self, tmp_path):
         """自学习权重只接受达到样本量的已验证结果，拒绝单次或未验证数据。"""
@@ -4856,6 +4995,37 @@ class TestPostProcessingP0Fixes:
                     max_rate_multiplier=1.6,
                 )
 
+    def test_sparse_voiceover_skips_only_measured_overflow_segment(self, tmp_path):
+        import tts_client
+
+        def fake_tts(_text, path, **_kwargs):
+            path.write_bytes(b"audio")
+
+        def fake_duration(path):
+            name = Path(path).name
+            if name == "seg_000.m4a":
+                return 3.0
+            return 0.8 if name.startswith("fast_") else 1.0
+
+        lines = [
+            {"text": "这一句实测放不下", "start": 0.0, "end": 1.6, "segment": 0},
+            {"text": "这一句能自然放下", "start": 2.2, "end": 4.8, "segment": 1},
+        ]
+        with patch.object(tts_client, "generate_tts_audio", side_effect=fake_tts), \
+             patch.object(tts_client, "_get_audio_duration", side_effect=fake_duration), \
+             patch.object(tts_client.shutil, "which", return_value="/usr/bin/ffmpeg"), \
+             patch.object(tts_client.subprocess, "run", return_value=MagicMock(returncode=0)), \
+             patch.object(tts_client, "_mix_audio_segments"):
+            _, subtitles = tts_client.generate_full_voiceover(
+                lines,
+                tmp_path / "voice.m4a",
+                total_duration=5.0,
+                max_rate_multiplier=1.6,
+                allow_sparse_narration=True,
+            )
+
+        assert [item["segment"] for item in subtitles] == [1]
+
 
 class TestFrameEvidenceSelection:
     """素材理解输入必须保留变化证据，同时删除无信息重复帧。"""
@@ -5092,6 +5262,54 @@ class TestMaterialDrivenPostProduction:
         assert contract["natural_main_duration"] == pytest.approx(20.0)
         assert contract["requested_duration"] == 15
         assert contract["requested_duration_applied"] is False
+
+    def test_requested_duration_expands_abundant_vlog_material_beyond_visual_role_count(self):
+        from local_asset_pipeline import build_local_asset_story_contract
+
+        windows = []
+        roles = ("production", "finished_product", "usage")
+        for index in range(40):
+            role = roles[index % len(roles)]
+            transcript = f"第{index + 1}段摊主讲述当天摆摊经历"
+            windows.append({
+                "window_id": f"vlog-{index}",
+                "source_path": f"/tmp/vlog-{index}.mp4",
+                "source_video": f"vlog-{index}.mp4",
+                "start": 0.0,
+                "end": 4.0,
+                "duration": 4.0,
+                "analysis": {
+                    "usable_for_ad": True,
+                    "product_story_role": role,
+                    "product_visibility": 5 if role in {"finished_product", "usage"} else 1,
+                    "confidence": 0.95,
+                    "visible_text": [],
+                    "visible_objects": ["摊位", "人物"],
+                    "narrative_roles": ["personal_vlog"],
+                    "spoken_summary": transcript,
+                    "spoken_intents": ["experience"],
+                },
+                "audio_context": {
+                    "has_speech": True,
+                    "transcript": transcript,
+                    "speech_ratio": 0.8,
+                    "confidence": 0.95,
+                    "semantic_key": f"story-{index}",
+                },
+                "motion": {"motion_class": "static", "stability": 0.95},
+                "frame_quality": {"readable_ratio": 0.95, "passed": True},
+            })
+
+        contract = build_local_asset_story_contract(
+            {"windows": windows, "asset_folder": "/tmp/vlog-materials"},
+            {"name": "面包", "type": "食品"},
+            requested_duration=15,
+        )
+
+        assert contract["recommended_segments"] == 4
+        assert contract["natural_main_duration"] == pytest.approx(16.0)
+        assert contract["requested_duration_applied"] is True
+        assert len(set(contract["selected_window_ids"])) == 4
 
     def test_four_segment_plan_uses_available_ingredient_and_origin_without_forcing_proof(self):
         from local_asset_pipeline import _build_coverage_driven_narrative_plan
@@ -8594,6 +8812,210 @@ class TestLocalMultiClipPlanning:
         assert result["selected_segments"][0]["source_end"] == pytest.approx(4.0)
         assert sum(item["target_duration"] for item in result["selected_segments"]) == pytest.approx(4.0)
         assert asset_index == original_index
+
+    def test_shared_ad_planner_has_no_personal_vlog_take_preference(self, tmp_path):
+        import local_asset_pipeline
+
+        def window(window_id, duration):
+            return {
+                "window_id": window_id,
+                "source_video": f"{window_id}.mp4",
+                "source_path": str(tmp_path / f"{window_id}.mp4"),
+                "start": 0.0,
+                "end": duration,
+                "duration": duration,
+                "analysis": {"usable_for_ad": True, "product_story_role": "finished_product"},
+            }
+
+        kwargs = {
+            "asset_index": {"windows": [window("partial", 3.6), window("full", 4.0)], "coverage": {}},
+            "ad_script": {"segments": [{
+                "segment": 0,
+                "narrative": "product_showcase",
+                "voiceover": "展示面包",
+                "subtitle": "展示面包",
+                "claims": [],
+            }]},
+            "rhythm_template": {"segments": [{"index": 0, "duration": 4.0}]},
+            "clips_dir": tmp_path / "clips",
+            "final_dir": tmp_path / "final",
+            "output_name": "vlog-continuity",
+            "plan_only": True,
+            "record_failure": False,
+        }
+
+        def score(_segment, candidate, _selected, **_kwargs):
+            value = 0.95 if candidate["window_id"] == "partial" else 0.85
+            return value, {"visual_intent_alignment": 0.0}
+
+        with patch.object(local_asset_pipeline, "_score_window", side_effect=score), \
+             patch.object(local_asset_pipeline, "_validate_derived_material_segment", return_value={"supported": True}), \
+             patch.object(local_asset_pipeline, "_hard_segment_ok", return_value=(True, "")), \
+             patch.object(local_asset_pipeline, "_narrative_role_affinity", return_value=1.0):
+            standard = local_asset_pipeline.plan_and_materialize_local_clips(
+                **kwargs,
+                product_info={"name": "面包", "video_style": "产品展示"},
+            )
+            personal_vlog = local_asset_pipeline.plan_and_materialize_local_clips(
+                **kwargs,
+                product_info={"name": "面包", "video_style": "个人 Vlog"},
+            )
+
+        assert [item["source_video"] for item in standard["selected_segments"]] == [
+            "partial.mp4", "full.mp4",
+        ]
+        assert [item["source_video"] for item in personal_vlog["selected_segments"]] == [
+            "partial.mp4", "full.mp4",
+        ]
+
+    def test_shared_ad_planner_has_no_personal_vlog_dialogue_bonus(self, tmp_path):
+        import local_asset_pipeline
+
+        def window(window_id):
+            return {
+                "window_id": window_id,
+                "source_video": f"{window_id}.mp4",
+                "source_path": str(tmp_path / f"{window_id}.mp4"),
+                "start": 0.0,
+                "end": 4.0,
+                "duration": 4.0,
+                "analysis": {
+                    "usable_for_ad": True,
+                    "product_story_role": "usage",
+                    "speech_visual_relation": "aligned",
+                },
+            }
+
+        visual_only = window("visual-only")
+        with_dialogue = window("with-dialogue")
+        kwargs = {
+            "asset_index": {
+                "sources": [{
+                    "path": with_dialogue["source_path"],
+                    "duration": 4.0,
+                    "audio_understanding": {
+                        "has_speech": True,
+                        "segments": [{
+                            "start": 0.6,
+                            "end": 1.7,
+                            "text": "哎呀，滚歪了",
+                            "confidence": 0.95,
+                        }],
+                    },
+                }],
+                "windows": [visual_only, with_dialogue],
+                "coverage": {},
+            },
+            "ad_script": {"segments": [{
+                "segment": 0,
+                "narrative": "usage_demo",
+                "voiceover": "看看今天怎么摆摊",
+                "subtitle": "看看今天怎么摆摊",
+                "claims": [],
+            }]},
+            "rhythm_template": {"segments": [{"index": 0, "duration": 4.0}]},
+            "clips_dir": tmp_path / "clips-dialogue",
+            "final_dir": tmp_path / "final-dialogue",
+            "output_name": "vlog-dialogue-selection",
+            "plan_only": True,
+            "record_failure": False,
+        }
+
+        def score(_segment, candidate, _selected, **_kwargs):
+            value = 0.95 if candidate["window_id"] == "visual-only" else 0.75
+            return value, {"visual_intent_alignment": 0.0}
+
+        with patch.object(local_asset_pipeline, "_score_window", side_effect=score), \
+             patch.object(local_asset_pipeline, "_validate_derived_material_segment", return_value={"supported": True}), \
+             patch.object(local_asset_pipeline, "_hard_segment_ok", return_value=(True, "")), \
+             patch.object(local_asset_pipeline, "_narrative_role_affinity", return_value=1.0):
+            standard = local_asset_pipeline.plan_and_materialize_local_clips(
+                **kwargs,
+                product_info={"name": "面包", "video_style": "产品展示"},
+            )
+            personal_vlog = local_asset_pipeline.plan_and_materialize_local_clips(
+                **kwargs,
+                product_info={"name": "面包", "video_style": "个人 Vlog"},
+            )
+
+        assert standard["selected_segments"][0]["source_video"] == "visual-only.mp4"
+        assert personal_vlog["selected_segments"][0]["source_video"] == "visual-only.mp4"
+        assert "source_dialogue_count" not in personal_vlog["selected_segments"][0]["score_details"]
+
+    def test_shared_ad_planner_does_not_enforce_vlog_event_bindings(self, tmp_path):
+        import local_asset_pipeline
+
+        def window(window_id):
+            return {
+                "window_id": window_id,
+                "source_video": f"{window_id}.mp4",
+                "source_path": str(tmp_path / f"{window_id}.mp4"),
+                "start": 0.0,
+                "end": 4.0,
+                "duration": 4.0,
+                "analysis": {"usable_for_ad": True, "product_story_role": "usage"},
+            }
+
+        kwargs = {
+            "asset_index": {"windows": [window("bound"), window("unbound")], "coverage": {}},
+            "ad_script": {"segments": [{
+                "segment": 0,
+                "narrative": "usage_demo",
+                "voiceover": "记录摆摊过程",
+                "subtitle": "记录摆摊过程",
+                "claims": [],
+                "asset_window_ids": ["bound"],
+            }]},
+            "rhythm_template": {"segments": [{"index": 0, "duration": 4.0}]},
+            "clips_dir": tmp_path / "clips-bound",
+            "final_dir": tmp_path / "final-bound",
+            "output_name": "vlog-event-binding",
+            "plan_only": True,
+            "record_failure": False,
+        }
+
+        def score(_segment, candidate, _selected, *, allow_replan=False):
+            if not allow_replan and candidate["window_id"] != "bound":
+                return 0.0, {"asset_binding_mismatch": 1.0}
+            value = 0.75 if candidate["window_id"] == "bound" else 0.95
+            return value, {"visual_intent_alignment": 0.0}
+
+        with patch.object(local_asset_pipeline, "_score_window", side_effect=score), \
+             patch.object(local_asset_pipeline, "_validate_derived_material_segment", return_value={"supported": True}), \
+             patch.object(local_asset_pipeline, "_hard_segment_ok", side_effect=lambda _segment, _window, score: (score > 0, "")), \
+             patch.object(local_asset_pipeline, "_narrative_role_affinity", return_value=1.0):
+            standard = local_asset_pipeline.plan_and_materialize_local_clips(
+                **kwargs,
+                product_info={"name": "面包", "video_style": "产品展示"},
+            )
+            personal_vlog = local_asset_pipeline.plan_and_materialize_local_clips(
+                **kwargs,
+                product_info={"name": "面包", "video_style": "个人 Vlog"},
+            )
+
+        assert standard["selected_segments"][0]["source_video"] == "unbound.mp4"
+        assert personal_vlog["selected_segments"][0]["source_video"] == "unbound.mp4"
+
+    def test_vlog_metadata_does_not_bypass_shared_ad_key_scene_confidence(self):
+        from local_asset_pipeline import _hard_segment_ok
+
+        segment = {"narrative": "result"}
+        ordinary = {
+            "analysis": {
+                "confidence": 0.70,
+                "product_story_role": "result",
+                "product_visibility": 0,
+            },
+        }
+        personal_vlog_event = {
+            "analysis": {
+                **ordinary["analysis"],
+                "usable_for_personal_vlog": True,
+            },
+        }
+
+        assert _hard_segment_ok(segment, ordinary, 0.95)[0] is False
+        assert _hard_segment_ok(segment, personal_vlog_event, 0.95)[0] is False
 
     def test_visual_story_role_is_the_semantic_boundary_for_every_fill_clip(self):
         from local_asset_pipeline import _desired_product_story_role, _story_role_supported

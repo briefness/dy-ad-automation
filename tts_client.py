@@ -743,6 +743,7 @@ def generate_full_voiceover(
     continuous_text: Optional[str] = None,
     performance_profile: Optional[Dict[str, Any]] = None,
     pre_generated_audio: Optional[Path] = None,
+    allow_sparse_narration: bool = False,
 ) -> Tuple[Path, List[Dict[str, any]]]:
     """
     生成完整的口播音频（智能断句 + 多段拼接 + 自动时间对齐）
@@ -847,6 +848,7 @@ def generate_full_voiceover(
             for segment in audio_segments:
                 segment_groups.setdefault(segment.get("segment"), []).append(segment)
             rate_by_segment: Dict[Any, float] = {}
+            skipped_segments = set()
             for segment_id, group in segment_groups.items():
                 line_start = float(group[0]["line_start"])
                 line_end = float(group[0]["line_end"])
@@ -855,11 +857,29 @@ def generate_full_voiceover(
                 spoken += pause_between_sentences * max(0, len(group) - 1)
                 required_rate = max(1.0, spoken / available)
                 if required_rate > max_rate_multiplier:
+                    if allow_sparse_narration:
+                        skipped_segments.add(segment_id)
+                        continue
                     raise RuntimeError(
                         f"口播段 {segment_id} 在最大 {max_rate_multiplier:.1f}x 语速下仍无法装入镜头："
                         f"需要 {required_rate:.2f}x"
                     )
                 rate_by_segment[segment_id] = required_rate
+
+            if skipped_segments:
+                kept = [
+                    (segment, subtitle)
+                    for segment, subtitle in zip(audio_segments, aligned_subtitles)
+                    if segment.get("segment") not in skipped_segments
+                ]
+                audio_segments = [item[0] for item in kept]
+                aligned_subtitles = [item[1] for item in kept]
+                if not audio_segments:
+                    raise RuntimeError("个人 Vlog 没有能自然放入原声间隙的旁白")
+                skipped = sorted(skipped_segments, key=str)
+                print(f"  ℹ️  个人 Vlog 跳过 {len(skipped)} 段放不下的旁白：{skipped}")
+                if performance_profile is not None:
+                    performance_profile["skipped_narration_segments"] = skipped
 
             max_rate = max(rate_by_segment.values(), default=1.0)
             print(f"  ⚡ 口播时长溢出，按镜头段独立加速（最高 {max_rate:.2f}x）")

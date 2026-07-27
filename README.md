@@ -526,6 +526,11 @@ python one_click_create.py --ab-versions 2 --product-image product.jpg --style k
 | `LLM_API_KEY`            | `.env`               | -                                 | LLM 文案生成 API Key（可选）                 |
 | `LLM_BASE_URL`           | `.env`               | -                                 | LLM 接口地址（OpenAI 兼容）                  |
 | `LLM_MODEL`              | `.env`               | -                                 | LLM 模型名称                                 |
+| `ASR_PROVIDER`           | `.env` / `config.py` | `openai`                          | `openai` 或火山语音 `volcengine`             |
+| `ASR_MODEL`              | `.env` / `config.py` | -                                 | 火山极速版使用 `volc.bigasr.auc_turbo`       |
+| `ASR_API_KEY`            | `.env` / `config.py` | `VOLC_API_KEY`（火山 provider）   | 可选的独立 ASR `X-Api-Key`                   |
+| `ASR_BASE_URL`           | `.env` / `config.py` | -                                 | ASR 接口地址；火山使用极速版 recognize URL   |
+| `ASR_LANGUAGE`           | `.env` / `config.py` | provider 默认值                   | 火山中文使用 `zh-CN`                         |
 | `DEFAULT_VIDEO_DURATION` | `config.py`          | `5`                               | 单片段时长（秒）                             |
 | `DEFAULT_ASPECT_RATIO`   | `config.py`          | `9:16`                            | 画面比例（竖屏）                             |
 | `DEFAULT_MODE`           | `config.py`          | `std`                             | 生成模式（std/pro/4k）                       |

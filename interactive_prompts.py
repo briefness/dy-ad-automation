@@ -1,8 +1,32 @@
 """Interactive CLI prompts."""
 
 import argparse
+import sys
 
 from video_style import _recommend_video_style, apply_video_style_to_args
+
+
+def ensure_interactive_terminal_sane(stream=None) -> bool:
+    """Restore the terminal flags required by Python's line-based input()."""
+    stream = stream or sys.stdin
+    if not getattr(stream, "isatty", lambda: False)():
+        return False
+    try:
+        import termios
+
+        fd = stream.fileno()
+        current = termios.tcgetattr(fd)
+        repaired = current.copy()
+        repaired[0] = (repaired[0] | termios.ICRNL) & ~(
+            termios.IGNCR | termios.INLCR
+        )
+        repaired[3] |= termios.ICANON | termios.ECHO | termios.ISIG
+        if repaired == current:
+            return False
+        termios.tcsetattr(fd, termios.TCSANOW, repaired)
+        return True
+    except (AttributeError, ImportError, OSError, ValueError):
+        return False
 
 
 def input_with_default(prompt: str, default: str = "") -> str:

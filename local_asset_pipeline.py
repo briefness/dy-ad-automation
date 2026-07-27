@@ -21,6 +21,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
@@ -31,8 +32,16 @@ from frame_evidence import (
     write_frame_evidence_artifacts,
 )
 from script_feedback import ScriptFeedbackStore, candidate_preference_score
+from source_audio_understanding import (
+    analyze_source_audio,
+    audio_context_for_window,
+    audio_understanding_signature,
+)
 
 from config import (
+    ASR_API_KEY,
+    ASR_BASE_URL,
+    ASR_MODEL,
     LOCAL_ASSET_CONTACT_SHEET_FRAMES,
     LOCAL_ASSET_INDEX_PATH,
     LOCAL_ASSET_MAX_WINDOWS,
@@ -49,7 +58,7 @@ from config import (
 )
 
 
-INDEX_VERSION = 5
+INDEX_VERSION = 6
 VISION_ANALYSIS_VERSION = 1
 REFERENCE_PROFILE_VERSION = 5
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
@@ -275,6 +284,7 @@ def _signatures_match(old: List[Dict[str, Any]], new: List[Dict[str, Any]]) -> b
 def _load_reusable_window_analyses(
     index_path: Path,
     signatures: List[Dict[str, Any]],
+    audio_backend_signature: str = "",
 ) -> Dict[str, Dict[str, Any]]:
     """Reuse semantic analysis when only downstream evidence/index formats changed."""
     if not index_path.exists():
@@ -286,6 +296,10 @@ def _load_reusable_window_analyses(
     if (
         cached.get("build_complete") is not True
         or int(cached.get("vision_analysis_version") or 1) != VISION_ANALYSIS_VERSION
+        or (
+            audio_backend_signature
+            and cached.get("audio_understanding_signature") != audio_backend_signature
+        )
         or not _signatures_match(cached.get("sources") or [], signatures)
     ):
         return {}
@@ -1378,7 +1392,8 @@ class VisionAnalyzer:
             "你是严格的逐帧视频素材分析员。只描述画面直接可见事实，不推断产品配方、具体产地、"
             "感官、功效或人物身份。必须识别素材在商品叙事中可能承担的成品、原料、产地环境、"
             "生产过程、使用、结果或背景角色，但关系候选只能描述画面本身，不能断言其属于某产品。"
-            "必须区分桌面/柜台/货架，倒入/摆放/指向等动作。只返回有效 JSON。"
+            "必须区分桌面/柜台/货架，倒入/摆放/指向等动作。窗口口播仅用于理解说话内容和叙事意图，"
+            "不能改变任何可见事实、产品关系或事实证据判断。只返回有效 JSON。"
         )
         user_text = f"""
 Analyze this contact sheet for a local product ad edit.
@@ -1390,6 +1405,7 @@ Window metadata:
 - duration: {metadata.get("duration")}
 - frame_count: {metadata.get("frame_count")}
 - computed_motion: {json.dumps(metadata.get("motion") or {}, ensure_ascii=False)}
+- original_audio_context: {json.dumps(metadata.get("audio_context") or {}, ensure_ascii=False)}
 
 Return this exact JSON shape:
 {{
@@ -1411,6 +1427,10 @@ Return this exact JSON shape:
   "product_visibility": 0,
   "camera_scale": "wide|medium|closeup|macro|unknown",
   "emotion": "pain|curiosity|relief|excitement|calm|unknown",
+  "spoken_summary": "只概括窗口口播实际说了什么，无口播时为空",
+  "spoken_intents": ["hook|experience|product_claim|instruction|cta|conversation|other"],
+  "spoken_claim_candidates": ["逐条保留口播中的产品事实或功效主张，仅作为待核验候选"],
+  "speech_visual_relation": "aligned|complementary|unrelated|unknown",
   "usable_for_ad": true,
   "confidence": 0.0,
   "evidence": "用中文逐字描述画面证据，不写推断"
@@ -1432,6 +1452,9 @@ Rules:
 - visible_frame_count must be counted from the contact sheet and cannot exceed frame_count.
 - Report visible text only when the same text is legible in at least two timestamped frames. Never guess a blurred label.
 - computed_motion is independent optical-flow evidence. Do not claim an action when both the frames and motion evidence are static.
+- original_audio_context 仅用于 spoken_*、speech_visual_relation 和 narrative_roles。口播不能证明画面事实或产品事实。
+- 不得把口播内容写入 visible_subjects、literal_actions、visible_objects、visible_text、relation_candidates、relation_evidence 或 evidence。
+- spoken_claim_candidates 必须保留为待核验候选，不得据此断言产品关系、功效、配方、产地或人物身份。
 """
         payload = {
             "model": self.model,
@@ -1865,6 +1888,12 @@ def _normalize_analysis(raw: Dict[str, Any]) -> Dict[str, Any]:
     relation_candidates = raw.get("relation_candidates") or []
     if isinstance(relation_candidates, str):
         relation_candidates = [relation_candidates]
+    spoken_intents = raw.get("spoken_intents") or []
+    if isinstance(spoken_intents, str):
+        spoken_intents = [spoken_intents]
+    spoken_claim_candidates = raw.get("spoken_claim_candidates") or []
+    if isinstance(spoken_claim_candidates, str):
+        spoken_claim_candidates = [spoken_claim_candidates]
     try:
         relation_confidence = max(0.0, min(1.0, float(raw.get("relation_confidence", 0))))
     except (TypeError, ValueError):
@@ -1888,6 +1917,12 @@ def _normalize_analysis(raw: Dict[str, Any]) -> Dict[str, Any]:
         "product_visibility": product_visibility,
         "camera_scale": str(raw.get("camera_scale") or "unknown"),
         "emotion": str(raw.get("emotion") or "unknown"),
+        "spoken_summary": str(raw.get("spoken_summary") or ""),
+        "spoken_intents": [str(value) for value in spoken_intents if str(value).strip()],
+        "spoken_claim_candidates": [
+            str(value) for value in spoken_claim_candidates if str(value).strip()
+        ],
+        "speech_visual_relation": str(raw.get("speech_visual_relation") or "unknown"),
         "usable_for_ad": bool(raw.get("usable_for_ad", False)),
         "confidence": confidence,
         "evidence": str(raw.get("evidence") or ""),
@@ -2346,6 +2381,38 @@ def build_local_asset_index(asset_folder: Path) -> Dict[str, Any]:
         return _build_local_asset_index_locked(ctx)
 
 
+def _warn_source_audio_understanding_status(sources: List[Dict[str, Any]]) -> None:
+    audio_sources = [source for source in sources if source.get("has_audio")]
+    if not audio_sources:
+        return
+    unavailable = [
+        source for source in audio_sources
+        if (source.get("audio_understanding") or {}).get("status") == "unavailable"
+    ]
+    if unavailable:
+        missing = [
+            name for name, value in (
+                ("ASR_BASE_URL", ASR_BASE_URL),
+                ("ASR_API_KEY", ASR_API_KEY),
+                ("ASR_MODEL", ASR_MODEL),
+            ) if not value
+        ]
+        detail = "、".join(missing) if missing else "ASR 配置不可用"
+        print(
+            f"⚠️  原始素材有音轨，但口播理解未启用（{detail}）；本次继续按纯视觉理解",
+            flush=True,
+        )
+    failed = [
+        source for source in audio_sources
+        if (source.get("audio_understanding") or {}).get("status") == "failed"
+    ]
+    if failed:
+        print(
+            f"⚠️  {len(failed)} 个原始视频口播转写失败；对应素材继续按纯视觉理解",
+            flush=True,
+        )
+
+
 def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
     ensure_vision_backend_available()
     files = _scan_video_files(ctx.folder)
@@ -2353,6 +2420,7 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
         raise LocalAssetError(f"素材文件夹中没有可用视频文件：{ctx.folder}")
 
     signatures = [_source_signature(path) for path in files]
+    audio_backend_signature = audio_understanding_signature()
     evidence_manifest_path = ctx.cache_dir / "frame_evidence.json"
     evidence_report_path = ctx.cache_dir / "frame_evidence_report.html"
     if ctx.index_path.exists():
@@ -2362,6 +2430,7 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
                 cached.get("index_version") == INDEX_VERSION
                 and cached.get("build_complete") is True
                 and cached.get("frame_evidence_version") == FRAME_EVIDENCE_VERSION
+                and cached.get("audio_understanding_signature") == audio_backend_signature
                 and _signatures_match(cached.get("sources", []), signatures)
                 and evidence_manifest_path.exists()
                 and evidence_report_path.exists()
@@ -2380,12 +2449,17 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
                         encoding="utf-8",
                     )
                     tmp_index.replace(ctx.index_path)
+                _warn_source_audio_understanding_status(cached.get("sources") or [])
                 return cached
         except Exception:
             pass
 
     analyzer = VisionAnalyzer()
-    reusable_analyses = _load_reusable_window_analyses(ctx.index_path, signatures)
+    reusable_analyses = _load_reusable_window_analyses(
+        ctx.index_path,
+        signatures,
+        audio_backend_signature,
+    )
     sheets_dir = ctx.cache_dir / "contact_sheets"
     sources = []
     for source_idx, path in enumerate(files):
@@ -2397,7 +2471,19 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
             "name": path.name,
             **probe,
         }
+        audio_understanding = analyze_source_audio(
+            path,
+            duration=float(source.get("duration") or 0.0),
+            has_audio=bool(source.get("has_audio")),
+        )
+        source["audio_understanding"] = audio_understanding
+        if audio_understanding.get("has_speech"):
+            print(
+                f"   {path.name}：识别到 {len(audio_understanding.get('segments') or [])} 段原始口播",
+                flush=True,
+            )
         sources.append(source)
+    _warn_source_audio_understanding_status(sources)
 
     draft_path = ctx.cache_dir / "index.building.json"
     windows: List[Dict[str, Any]] = []
@@ -2407,6 +2493,7 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
             if (
                 draft.get("index_version") == INDEX_VERSION
                 and draft.get("frame_evidence_version") == FRAME_EVIDENCE_VERSION
+                and draft.get("audio_understanding_signature") == audio_backend_signature
                 and _signatures_match(draft.get("sources", []), signatures)
             ):
                 windows = list(draft.get("windows") or [])
@@ -2419,6 +2506,7 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
             "index_version": INDEX_VERSION,
             "frame_evidence_version": FRAME_EVIDENCE_VERSION,
             "vision_analysis_version": VISION_ANALYSIS_VERSION,
+            "audio_understanding_signature": audio_backend_signature,
             "build_complete": False,
             "asset_folder": str(ctx.folder),
             "created_at": time.time(),
@@ -2479,6 +2567,12 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
                 "duration": round(win["end"] - win["start"], 3),
                 "frame_count": max(4, LOCAL_ASSET_CONTACT_SHEET_FRAMES),
             }
+            audio_context = audio_context_for_window(
+                source.get("audio_understanding") or {},
+                float(win["start"]),
+                float(win["end"]),
+            )
+            metadata["audio_context"] = audio_context
             motion = _analyze_window_motion(path, win["start"], win["end"])
             frame_quality = _analyze_window_frame_quality(path, win["start"], win["end"])
             motion_peaks = sorted(
@@ -2549,6 +2643,7 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
                 "frame_quality": frame_quality,
                 "frame_evidence": frame_evidence,
                 "motion_consistency": consistency,
+                "audio_context": audio_context,
             })
             completed_window_ids.add(window_id)
             _write_draft()
@@ -2566,6 +2661,7 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
         "index_version": INDEX_VERSION,
         "frame_evidence_version": FRAME_EVIDENCE_VERSION,
         "vision_analysis_version": VISION_ANALYSIS_VERSION,
+        "audio_understanding_signature": audio_backend_signature,
         "build_complete": True,
         "asset_folder": str(ctx.folder),
         "created_at": time.time(),
@@ -2612,6 +2708,11 @@ def _material_catalog(asset_index: Optional[Dict[str, Any]]) -> List[Dict[str, A
             "relation_evidence": analysis.get("relation_evidence") or "",
             "product_visibility": analysis.get("product_visibility"),
             "evidence": analysis.get("evidence"),
+            "spoken_summary": analysis.get("spoken_summary") or "",
+            "spoken_intents": analysis.get("spoken_intents") or [],
+            "spoken_claim_candidates": analysis.get("spoken_claim_candidates") or [],
+            "speech_visual_relation": analysis.get("speech_visual_relation") or "unknown",
+            "audio_context": window.get("audio_context") or {},
             "motion": {
                 key: value
                 for key, value in (window.get("motion") or {}).items()
@@ -2683,12 +2784,19 @@ def _material_attention_score(item: Dict[str, Any]) -> float:
     motion_class = {"static": 0.08, "semi_dynamic": 0.55, "dynamic": 1.0}.get(
         str(motion.get("motion_class") or "static"), 0.08,
     )
-    return min(1.0, (
+    visual_score = min(1.0, (
         0.52 * motion_class
         + 0.18 * min(1.0, float(motion.get("camera_speed") or 0.0) / 0.04)
         + 0.20 * min(1.0, float(motion.get("subject_motion_ratio") or 0.0) / 0.16)
         + 0.10 * min(1.0, float(motion.get("temporal_change") or 0.0) / 0.12)
     ))
+    audio = item.get("audio_context") or {}
+    if not audio.get("has_speech") or not str(audio.get("transcript") or "").strip():
+        return visual_score
+    speech_signal = min(1.0, float(audio.get("speech_ratio") or 0.0)) * min(
+        1.0, float(audio.get("confidence") or 0.0)
+    )
+    return min(1.0, max(visual_score, 0.25 + 0.65 * speech_signal))
 
 
 def _story_transition_score(previous_role: str, current_role: str) -> float:
@@ -2734,7 +2842,7 @@ def _optimize_material_story_sequence(
                 ),
                 reverse=True,
             )
-            candidates.extend(role_items[:3])
+            candidates.extend(role_items[:max(3, num_segments)])
 
     identity_candidates = [item for item in candidates if item.get("product_identity_supported")]
     beam: List[Tuple[float, List[Dict[str, Any]]]] = [(0.0, [])]
@@ -2896,7 +3004,21 @@ def build_local_asset_story_contract(
         if str(item.get("product_story_role") or "unknown") not in {"unknown", "context"}
     }
     identity_count = sum(1 for item in material_catalog if item.get("product_identity_supported"))
-    desired_segments = 1 if preview else max(3, len(roles) + int(identity_count >= 2 and len(roles) > 1))
+    coverage_segments = max(3, len(roles) + int(identity_count >= 2 and len(roles) > 1))
+    requested = float(requested_duration) if requested_duration is not None else None
+    window_durations = [
+        float(item.get("end") or 0.0) - float(item.get("start") or 0.0)
+        for item in material_catalog
+        if float(item.get("end") or 0.0) > float(item.get("start") or 0.0)
+    ]
+    representative_duration = median(window_durations) if window_durations else 0.0
+    duration_target_segments = (
+        math.ceil(requested / representative_duration)
+        if requested is not None and requested > 0 and representative_duration > 0 else 0
+    )
+    desired_segments = (
+        1 if preview else max(coverage_segments, duration_target_segments)
+    )
     desired_segments = min(7, desired_segments, len(material_catalog))
 
     narrative_plan = None
@@ -2927,7 +3049,6 @@ def build_local_asset_story_contract(
         selected_windows.append(window_id)
 
     natural_main_duration = round(sum(segment_durations.values()), 3)
-    requested = float(requested_duration) if requested_duration is not None else None
     return {
         "source": "local_video_understanding",
         "duration_source": "selected_local_asset_windows",
@@ -2938,7 +3059,15 @@ def build_local_asset_story_contract(
         "natural_main_duration": natural_main_duration,
         "requested_duration": requested,
         "requested_duration_applied": bool(
-            requested is not None and abs(requested - natural_main_duration) <= 0.25
+            requested is not None
+            and (
+                abs(requested - natural_main_duration) <= 0.25
+                or (
+                    not preview
+                    and duration_target_segments > coverage_segments
+                    and len(narrative_plan) >= duration_target_segments
+                )
+            )
         ),
     }
 
@@ -3002,12 +3131,16 @@ def _global_material_capability_pool(
             "literal_actions": [],
             "visible_text": [],
             "verified_facts": [],
+            "spoken_summaries": [],
+            "spoken_intents": [],
         })
         group["window_count"] += 1
         append_unique(group["visual_concepts"], material.get("visible_objects"), 8)
         append_unique(group["literal_actions"], material.get("literal_actions"), 6)
         append_unique(group["visible_text"], material.get("visible_text"), 6)
         append_unique(group["verified_facts"], material.get("matched_product_facts"), 6)
+        append_unique(group["spoken_summaries"], [material.get("spoken_summary")], 6)
+        append_unique(group["spoken_intents"], material.get("spoken_intents"), 6)
 
         aggregate_analysis["product_relationship_verified"] = bool(
             aggregate_analysis["product_relationship_verified"]
@@ -3277,6 +3410,7 @@ def _build_compact_script_prompt(
             "每段返回一个语义节拍和 cue，按 segment 顺序拼接为一条连续口播",
             "各 cue 只作语义锚点，不按镜头限字；narration_guidance 仅为非阻断性精炼建议",
             "只引用全局 evidence_anchors id，不得虚构事实或感官",
+            "spoken_summaries 和 spoken_intents 只用于理解原素材表达与叙事，不是事实来源，不得复制其中未经核验的主张",
             "product_story_role 由素材理解确定，不得改写",
             "cue 只推进购买理由；visual_query 只能取本段 visual_capability，不得含素材 ID 或文件名",
             "cue 可跨段成句，标点供单次 TTS 断句",
@@ -4385,7 +4519,8 @@ def plan_and_materialize_local_clips(
                 key=lambda item: (
                     item[0]
                     + 0.25 * item[1]
-                    + 0.35 * item[3].get("visual_intent_alignment", 0.0),
+                    + 0.35 * item[3].get("visual_intent_alignment", 0.0)
+                    ,
                     min(
                         remaining_duration,
                         float(item[2]["end"]) - float(item[2]["start"]),
