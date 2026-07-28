@@ -138,6 +138,7 @@ def recommend_voice_for_narration(
     script_lines: List[Dict[str, any]],
     requested_voice: str = "auto",
     creative_profile: Optional[Dict[str, Any]] = None,
+    voiceover_style: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Select a stable commercial voice from product type and final spoken copy."""
     material_driven = str((creative_profile or {}).get("source") or "") in {
@@ -146,6 +147,8 @@ def recommend_voice_for_narration(
     }
     if requested_voice in VOICE_PRESETS and not material_driven:
         return requested_voice, "用户显式指定音色"
+    if str(voiceover_style or "").strip().lower() == "energetic":
+        return "energetic_female", "带货高能口播优先有推动力的活力女声"
     category = str(product_info.get("type") or product_info.get("category") or "default")
     text = "".join(str(line.get("text") or "") for line in script_lines)
     visual_energy = str((creative_profile or {}).get("energy") or "medium")

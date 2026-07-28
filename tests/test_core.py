@@ -5507,6 +5507,24 @@ class TestMaterialDrivenPostProduction:
         assert voice == "female_young"
         assert "素材" in reason
 
+    def test_energetic_sales_style_drives_voice_performance_for_source_story_material(self):
+        from tts_client import recommend_voice_for_narration
+
+        voice, reason = recommend_voice_for_narration(
+            {"type": "食品"},
+            [{"text": "从茉莉原料到一杯茶咖，现在就去试试"}],
+            requested_voice="female_warm",
+            creative_profile={
+                "source": "selected_local_assets",
+                "energy": "medium",
+                "story_role_counts": {"ingredient": 1, "origin": 1, "finished_product": 2},
+            },
+            voiceover_style="energetic",
+        )
+
+        assert voice == "energetic_female"
+        assert "带货" in reason
+
     def test_unspecified_pipeline_and_batch_voice_defaults_remain_auto(self):
         import inspect
         from batch import create_task_args
@@ -6265,6 +6283,50 @@ class TestReferenceAdAnalysis:
         assert first["tts_cache_hit"] is False
         assert second["tts_cache_hit"] is True
         assert second["tts_external_requests"] == 0
+
+    def test_local_one_take_master_uses_energetic_sales_voice(self, tmp_path):
+        import one_click_create
+
+        output = tmp_path / "final" / "voiceover_master.m4a"
+        output.parent.mkdir(parents=True)
+        script = {
+            "voiceover_full": "从茉莉原料到一杯茶咖，现在就去试试。",
+            "segments": [{
+                "segment": 0,
+                "voiceover": "从茉莉原料到一杯茶咖，现在就去试试。",
+                "product_story_role": "ingredient",
+            }],
+        }
+        asset_index = {"windows": [{
+            "source_path": str(tmp_path / "ingredient.mp4"),
+            "start": 0.0,
+            "end": 8.0,
+            "analysis": {"usable_for_ad": True, "product_story_role": "ingredient"},
+        }]}
+
+        def fake_tts(_text, path, voice=None, rate=None):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"audio-master")
+
+        with patch.object(one_click_create, "generate_tts_audio", side_effect=fake_tts) as generate, \
+             patch.object(one_click_create, "_validate_voiceover_audio", return_value=4.0):
+            timeline = one_click_create._prepare_local_one_take_master(
+                ad_script=script,
+                asset_index=asset_index,
+                product_info={"name": "茶咖", "type": "食品"},
+                requested_voice="female_warm",
+                creative_profile={
+                    "source": "selected_local_assets",
+                    "story_role_counts": {"ingredient": 1, "origin": 1},
+                },
+                reference_profile={},
+                transition_duration=0.0,
+                output_path=output,
+                voiceover_style="energetic",
+            )
+
+        assert generate.call_args.kwargs["voice"] == "energetic_female"
+        assert timeline["voice"] == "energetic_female"
 
     def test_unspecified_visual_roles_use_global_usable_material_capacity(self, tmp_path):
         import one_click_create

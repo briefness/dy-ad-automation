@@ -1025,6 +1025,7 @@ def _prepare_local_one_take_master(
     reference_profile: Optional[Dict[str, Any]],
     transition_duration: float,
     output_path: Path,
+    voiceover_style: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generate the only TTS request, then derive the edit timeline from its real duration."""
     from local_asset_pipeline import build_one_take_timeline
@@ -1043,6 +1044,7 @@ def _prepare_local_one_take_master(
         provisional_lines,
         requested_voice=requested_voice,
         creative_profile=creative_profile,
+        voiceover_style=voiceover_style,
     )
     full_text = str(ad_script.get("voiceover_full") or "").strip()
     if not full_text:
@@ -5346,6 +5348,7 @@ def run_generation_pipeline(
             [],
             requested_voice=voice,
             creative_profile=asset_creative_profile,
+            voiceover_style=voiceover_style,
         )
         if _personal_vlog_audio_mode:
             from personal_vlog_planner import build_personal_vlog_script
@@ -6544,6 +6547,7 @@ def run_generation_pipeline(
                 reference_profile=reference_profile,
                 transition_duration=float(scene_cfg.get("transition_duration") or 0.0),
                 output_path=local_one_take_master,
+                voiceover_style=voiceover_style,
             )
             voice = str(local_one_take_timeline["voice"])
             def _apply_one_take_timeline() -> None:
@@ -7534,6 +7538,7 @@ def run_generation_pipeline(
                     voiceover_script,
                     requested_voice=voice,
                     creative_profile=asset_creative_profile if local_asset_mode else None,
+                    voiceover_style=voiceover_style,
                 )
             print(f"  🎙️ 智能音色：{voice}（{_voice_reason}）")
             _actual_video_dur = _rendered_main_duration
