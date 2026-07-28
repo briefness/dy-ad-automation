@@ -1389,9 +1389,10 @@ class VisionAnalyzer:
 
     def analyze_window(self, sheet_path: Path, metadata: Dict[str, Any]) -> Dict[str, Any]:
         system_prompt = (
-            "你是严格的逐帧视频素材分析员。只描述画面直接可见事实，不推断产品配方、具体产地、"
-            "感官、功效或人物身份。必须识别素材在商品叙事中可能承担的成品、原料、产地环境、"
-            "生产过程、使用、结果或背景角色，但关系候选只能描述画面本身，不能断言其属于某产品。"
+            "你是严格的逐帧视频素材分析员。只描述画面直接可见事实；允许依据可见对象和环境做有证据的"
+            "商品叙事角色归类，但不能据此断言它与当前产品存在事实关系，也不能推断产品配方、具体地名、"
+            "感官、功效或人物身份。必须识别素材在商品叙事中可能承担的成品、原料、产地环境、生产过程、"
+            "使用、结果或背景角色，但关系候选只能描述画面本身，不能断言其属于某产品。"
             "必须区分桌面/柜台/货架，倒入/摆放/指向等动作。窗口口播仅用于理解说话内容和叙事意图，"
             "不能改变任何可见事实、产品关系或事实证据判断。只返回有效 JSON。"
         )
@@ -1438,9 +1439,11 @@ Return this exact JSON shape:
 
 Rules:
 - product_visibility is 0-5.
+- product_visibility 只统计可见的成品商品本体；散装原料、种植环境、工艺器具和容器本身必须记为 0，除非画面同时清楚出现独立成品。
 - confidence and relation_confidence are 0-1.
 - product_story_role describes what the footage itself depicts, not an asserted relationship to the advertised product.
-- A field, plantation or landscape may be origin footage, but never infer its geographic name.
+- 不要只按关键词字面匹配；应根据连续画面中可辨认的对象、环境和动作做有证据约束的语义归类。
+- 可辨认的茶园、茶山、咖啡种植园、果园或其他种植场景应归类为 origin；这只表示素材的商品叙事角色，不得据此断言它就是当前产品的产地，也不得猜测具体地名。
 - Loose leaves, flowers, fruit, beans or other materials may be ingredient footage, but never infer that the product uses them.
 - A filename is metadata only and cannot prove an ingredient, origin or production relationship.
 - Use unknown/none when not visually supported.
@@ -2799,6 +2802,21 @@ def _material_attention_score(item: Dict[str, Any]) -> float:
     return min(1.0, max(visual_score, 0.25 + 0.65 * speech_signal))
 
 
+def _is_hook_capable_material(item: Dict[str, Any]) -> bool:
+    role = str(item.get("product_story_role") or "unknown")
+    narrative_roles = {
+        str(value).strip().lower()
+        for value in item.get("narrative_roles") or []
+        if str(value).strip()
+    }
+    explicit_hook = bool(narrative_roles & {"hook", "pain_point", "result"})
+    product_facing = (
+        role in {"finished_product", "usage", "result"}
+        and int(item.get("product_visibility") or 0) >= 3
+    )
+    return explicit_hook or product_facing
+
+
 def _story_transition_score(previous_role: str, current_role: str) -> float:
     if previous_role == current_role:
         return -0.20
@@ -2845,6 +2863,11 @@ def _optimize_material_story_sequence(
             candidates.extend(role_items[:max(3, num_segments)])
 
     identity_candidates = [item for item in candidates if item.get("product_identity_supported")]
+    hook_candidate_ids = {
+        str(item.get("window_id"))
+        for item in candidates
+        if _is_hook_capable_material(item)
+    }
     beam: List[Tuple[float, List[Dict[str, Any]]]] = [(0.0, [])]
     for position in range(num_segments):
         next_beam: List[Tuple[float, List[Dict[str, Any]]]] = []
@@ -2860,6 +2883,12 @@ def _optimize_material_story_sequence(
                     for chosen in selected
                 ):
                     continue
+                if (
+                    position == 0
+                    and hook_candidate_ids
+                    and str(item.get("window_id")) not in hook_candidate_ids
+                ):
+                    continue
                 is_last = position == num_segments - 1
                 if is_last and not external_cta and identity_candidates and not item.get("product_identity_supported"):
                     continue
@@ -2870,7 +2899,10 @@ def _optimize_material_story_sequence(
                 readability = max(0.0, min(1.0, float(frame_quality.get("readable_ratio") or 0.75)))
                 motion = item.get("motion") or {}
                 stability = max(0.0, min(1.0, float(motion.get("stability") or 0.75)))
-                visibility = max(0.0, min(1.0, float(item.get("product_visibility") or 0.0) / 5.0))
+                visibility = (
+                    max(0.0, min(1.0, float(item.get("product_visibility") or 0.0) / 5.0))
+                    if role in {"finished_product", "usage", "result"} else 0.0
+                )
                 attention = _material_attention_score(item)
                 identity = float(bool(item.get("product_identity_supported")))
                 verified = float(bool(

@@ -436,6 +436,11 @@ def test_window_understanding_keeps_spoken_claims_separate_from_visual_facts(tmp
     user_text = captured_payload["messages"][1]["content"][0]["text"]
     assert "喝了这个可以治疗失眠" in user_text
     assert "口播不能证明画面事实或产品事实" in user_text
+    assert "不要只按关键词字面匹配" in user_text
+    assert "茶园、茶山、咖啡种植园" in user_text
+    assert "这只表示素材的商品叙事角色" in user_text
+    assert "不得据此断言它就是当前产品的产地" in user_text
+    assert "product_visibility 只统计可见的成品商品本体" in user_text
 
 
 def test_story_contract_prefers_distinct_spoken_vlog_windows_over_silent_duplicate():

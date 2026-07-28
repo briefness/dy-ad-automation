@@ -5371,11 +5371,62 @@ class TestMaterialDrivenPostProduction:
             if item["product_story_role"] in {"ingredient", "origin"}
         )
 
+    def test_story_contract_prioritizes_hook_capability_over_motion_alone(self):
+        from local_asset_pipeline import build_local_asset_story_contract
+
+        def window(window_id, role, motion_class, *, identity=False, narrative_roles=None):
+            return {
+                "window_id": window_id,
+                "source_path": f"/tmp/{window_id}.mp4",
+                "source_video": f"{window_id}.mp4",
+                "start": 0.0,
+                "end": 4.0,
+                "analysis": {
+                    "usable_for_ad": True,
+                    "product_story_role": role,
+                    "product_visibility": 5,
+                    "confidence": 0.95,
+                    "visible_text": ["茶咖"] if identity else [],
+                    "visible_objects": ["瓶装茶咖"] if identity else ["竹匾中的混合原料"],
+                    "narrative_roles": narrative_roles or ["product_showcase"],
+                },
+                "motion": {
+                    "motion_class": motion_class,
+                    "camera_speed": 0.05 if motion_class == "dynamic" else 0.0,
+                    "subject_motion_ratio": 0.18 if motion_class == "dynamic" else 0.01,
+                    "stability": 0.9,
+                },
+                "frame_quality": {"readable_ratio": 1.0, "passed": True},
+            }
+
+        contract = build_local_asset_story_contract(
+            {
+                "asset_folder": "/tmp/hook-capability",
+                "windows": [
+                    window("production", "production", "dynamic"),
+                    window("product", "finished_product", "static", identity=True),
+                    window(
+                        "usage",
+                        "usage",
+                        "semi_dynamic",
+                        identity=True,
+                        narrative_roles=["usage_demo"],
+                    ),
+                ],
+            },
+            {"name": "茶咖", "type": "食品"},
+        )
+
+        assert contract["narrative_plan"][0]["product_story_role"] in {
+            "finished_product",
+            "usage",
+        }
+
     def test_material_story_order_changes_when_visual_attention_changes(self):
         from copy import deepcopy
         from local_asset_pipeline import _build_coverage_driven_narrative_plan
 
-        def item(window_id, role, motion_class, *, identity=False):
+        def item(window_id, role, motion_class, *, identity=False, narrative_roles=None):
             return {
                 "window_id": window_id,
                 "source_path": f"/tmp/{window_id}.mp4",
@@ -5386,6 +5437,7 @@ class TestMaterialDrivenPostProduction:
                 "product_relationship_verified": identity,
                 "product_visibility": 5 if identity else 1,
                 "confidence": 0.95,
+                "narrative_roles": narrative_roles or [],
                 "motion": {
                     "motion_class": motion_class,
                     "camera_speed": 0.04 if motion_class == "dynamic" else 0.0,
@@ -5398,7 +5450,7 @@ class TestMaterialDrivenPostProduction:
         ingredient_hook = [
             item("product-a", "finished_product", "static", identity=True),
             item("product-b", "finished_product", "static", identity=True),
-            item("ingredient", "ingredient", "dynamic"),
+            item("ingredient", "ingredient", "dynamic", narrative_roles=["hook"]),
             item("origin", "origin", "semi_dynamic"),
         ]
         product_hook = deepcopy(ingredient_hook)
