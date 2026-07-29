@@ -38,3 +38,9 @@
 - 格式：PNG，透明背景
 - 尺寸：建议 400×400px 以上
 - 启用方式：在 `config.py` 中设置 `BRAND_CONFIG["logo_watermark"]["enabled"] = True`
+
+---
+
+### `stickers/` — 语义贴图图标（可选）
+
+不提供文件时使用内置文字图标。需要替换时可放入透明背景的 PNG 或 WebP，文件名为 `purchase_reason`、`ingredient`、`origin`、`craft`、`usage`、`proof`、`cta`，例如 `stickers/origin.png`。

@@ -499,6 +499,7 @@ python one_click_create.py --ab-versions 2 --product-image product.jpg --style k
 | `--no-llm`                 | -            | 禁用 LLM 文案生成，强制走内置模板                              |
 | `--brand-intro-outro`      | -            | 在成片首尾加入品牌开场（2s）和收尾动画（1.5s）                 |
 | `--local-assets`           | 交互默认 `y` | 指定本地视频素材文件夹；交互运行时直接回车默认进入本地素材模式 |
+| `--stickers`               | `auto`       | 语义贴图：`auto` / `on` / `off`                               |
 
 ### 模板与其他
 
@@ -591,6 +592,22 @@ python script_feedback.py \
 ```
 
 同一规则必须获得至少两个不同成片的明确使用者反馈后才成为 active 规则。相同成片重复反馈不会提升可信度。自动评分、LLM 判断和参考视频分析不能创建或晋升规则；参考视频只提供生成时可观察的结构和语气。
+
+### 语义贴图与反馈学习
+
+`--stickers auto` 只为带货风格自动启用贴图。系统以字幕和脚本为语义来源，用已选素材角色或可信产品事实校验，不满足证据或没有安全展示区域时直接跳过。每次会在成片旁保存可审计的 `_sticker_plan.json`。
+
+贴图反馈只接受使用者明确录入；同一规则至少覆盖两个不同视频后才参与后续候选排序：
+
+```bash
+python sticker_feedback.py \
+  --video output/final/示例_final.mp4 \
+  --plan-json output/final/示例_sticker_plan.json \
+  --sticker-id sticker-segment-3-origin \
+  --rule "产地贴图不要连续出现" \
+  --verdict violated \
+  --comment "这一处遮挡了主体"
+```
 
 内置完整的 5 段式广告脚本生成引擎，根据产品信息自动生成：
 

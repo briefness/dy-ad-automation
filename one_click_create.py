@@ -4561,6 +4561,12 @@ def parse_args():
         help="视频风格（默认 auto 智能推荐；可输入带货/个人vlog/种草/测评/开箱或自定义文本）",
     )
     parser.add_argument(
+        "--stickers",
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="语义贴图：auto 按视频风格启停，on 强制启用，off 关闭（默认 auto）",
+    )
+    parser.add_argument(
         "--product-image",
         metavar="PATH",
         default=None,
@@ -4868,6 +4874,7 @@ def run_generation_pipeline(
     image_first_variants: int = 2,
     local_assets: Optional[Path] = None,
     reference_video: Optional[Path] = None,
+    stickers: str = "auto",
 ) -> dict:
     """
     核心生成流水线（无交互逻辑）
@@ -4904,6 +4911,7 @@ def run_generation_pipeline(
         keep_candidates: 是否保留未被选中的候选片段（默认 False）
         preview: 预览模式：仅生成第 1 段（std 模式），保留完整后期效果（字幕/口播/BGM）
         max_workers: 并行生成时的最大线程数（默认 4）
+        stickers: 语义贴图模式：auto / on / off
 
     Returns:
         {
@@ -4915,6 +4923,11 @@ def run_generation_pipeline(
     Raises:
         RuntimeError: 任何步骤失败时抛出异常
     """
+    from semantic_stickers import VALID_STICKER_MODES
+
+    stickers = str(stickers or "auto").strip().lower()
+    if stickers not in VALID_STICKER_MODES:
+        raise ValueError(f"贴图模式必须是 {sorted(VALID_STICKER_MODES)}")
     if output_name is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = _safe_output_stem(product_info.get("name", "product"))
@@ -8311,6 +8324,74 @@ def run_generation_pipeline(
             print(f"⚠️ 16:9 版本生成失败：{e}")
             raise RuntimeError("已请求 dual_output，但 16:9 版本生成失败") from e
 
+    # 证据约束语义贴图：各画幅独立布局，失败时保留原片。
+    sticker_plan_path = final_dir / f"{output_name}_sticker_plan.json"
+    sticker_plan: Dict[str, Any]
+    try:
+        from semantic_stickers import apply_sticker_plan_to_videos, build_semantic_sticker_plan
+        from sticker_feedback import StickerFeedbackStore
+
+        video_style = str(product_info.get("video_style") or "")
+        sticker_policy = StickerFeedbackStore().build_policy(
+            str(product_info.get("type") or ""),
+            video_style,
+        )
+        sticker_plan = build_semantic_sticker_plan(
+            ad_script=ad_script,
+            subtitles=subtitles,
+            selected_segments=selected_material_segments if local_asset_mode else None,
+            segment_timeline=_semantic_segment_timeline,
+            product_info=product_info,
+            requested_mode=stickers,
+            video_style=video_style,
+            voiceover_style=voiceover_style,
+            script_style=script_style,
+            preference_policy=sticker_policy,
+        )
+        sticker_videos = {"9:16": final_path}
+        if wide_path:
+            sticker_videos["16:9"] = wide_path
+        sticker_plan = apply_sticker_plan_to_videos(
+            videos=sticker_videos,
+            plan=sticker_plan,
+            plan_path=sticker_plan_path,
+            render_config={
+                "primary_color": BRAND_CONFIG.get("primary_color", "#FF6B6B"),
+                "accent_color": BRAND_CONFIG.get("accent_color", "#4ECDC4"),
+                "subtitle_bottom_ratio": bottom_margin_ratio,
+                "logo_position": logo_cfg.get("position", "top_right"),
+                "logo_enabled": bool(logo_enabled),
+                "asset_dir": PROJECT_ROOT / "assets" / "stickers",
+            },
+        )
+        rendered_count = sum(
+            len(items) for items in (sticker_plan.get("layouts") or {}).values()
+        )
+        if rendered_count:
+            quality_result = None
+            print(f"✅ 智能语义贴图：渲染 {rendered_count} 个画幅贴图实例")
+        else:
+            reason = "当前风格关闭" if not sticker_plan.get("enabled") else "无安全或有证据的贴图"
+            print(f"ℹ️  智能语义贴图跳过：{reason}")
+        if postproduction_contract and postproduction_contract_path:
+            postproduction_contract["stickers"] = sticker_plan
+            write_postproduction_contract(postproduction_contract, postproduction_contract_path)
+    except Exception as sticker_error:
+        sticker_plan = {
+            "version": 1,
+            "requested_mode": stickers,
+            "enabled": False,
+            "items": [],
+            "layouts": {},
+            "skipped": [{"reason": "planning_failure", "error": str(sticker_error)}],
+            "learning": {"source": "explicit_user_feedback_only"},
+        }
+        sticker_plan_path.write_text(
+            json.dumps(sticker_plan, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"⚠️  智能语义贴图失败，保留原片：{sticker_error}")
+
     # ============================================================
     # 发布级质量门禁：放在 pipeline 内部，保证单条和批量入口都执行
     # ============================================================
@@ -8509,6 +8590,7 @@ def run_generation_pipeline(
         "edit_decision_report": local_asset_edit_report,
         "frame_evidence_report": local_asset_frame_evidence_report,
         "postproduction_contract": postproduction_contract_path,
+        "sticker_plan": sticker_plan_path,
         "transition_decision_report": locals().get("transition_report_path"),
     }
 
@@ -8661,6 +8743,7 @@ def run_one_click_create(
             image_first_variants=getattr(args, "image_first_variants", 2),
             local_assets=Path(args.local_assets).expanduser() if getattr(args, "local_assets", None) else None,
             reference_video=Path(args.reference_video).expanduser() if getattr(args, "reference_video", None) else None,
+            stickers=getattr(args, "stickers", "auto"),
         )
 
         final_path = result["final_path"]

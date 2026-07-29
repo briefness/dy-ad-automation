@@ -211,6 +211,7 @@ def create_task_args(task: dict, global_defaults: dict) -> dict:
         "image_first": _coerce_bool(_get_config_value(task, global_defaults, "image_first", True), True),
         "image_first_mode": task.get("image_first_mode", global_defaults.get("image_first_mode", "standard")),
         "image_first_variants": _coerce_int(_get_config_value(task, global_defaults, "image_first_variants", 2), 2),
+        "stickers": task.get("stickers", global_defaults.get("stickers", "auto")),
         "resume": _coerce_bool(_get_config_value(task, global_defaults, "resume", True), True),
     }
 
@@ -333,6 +334,7 @@ def run_batch(config: dict):
         "image_first": config.get("default_image_first", True),
         "image_first_mode": config.get("default_image_first_mode", "standard"),
         "image_first_variants": config.get("default_image_first_variants", 2),
+        "stickers": config.get("default_stickers", "auto"),
         "resume": config.get("default_resume", True),
         "hook_type": config.get("default_hook_type", "question"),
         "use_voiceover": config.get("default_use_voiceover", False),

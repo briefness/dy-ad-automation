@@ -1590,6 +1590,7 @@ class TestBatchGlobalDefaults:
             "image_first": True,
             "image_first_mode": "standard",
             "image_first_variants": 2,
+            "stickers": "auto",
             "hook_type": "question",
             "use_voiceover": False,
             "voiceover_style": "standard",
