@@ -71,6 +71,118 @@ def test_builtin_sticker_uses_a_lightweight_surface_instead_of_a_black_box(tmp_p
     assert (red + green + blue) / 3 > 180
 
 
+@pytest.mark.parametrize(("video_width", "video_height"), [(360, 640), (640, 360)])
+def test_sticker_visual_contract_holds_across_aspect_ratios(
+    tmp_path,
+    video_width,
+    video_height,
+):
+    import numpy as np
+    from PIL import Image, ImageColor
+
+    output = tmp_path / f"ingredient-{video_width}x{video_height}.png"
+    sticker_width, sticker_height, _ = _render_label_image(
+        "自然茉莉花原料",
+        "ingredient",
+        video_width,
+        video_height,
+        "#FF6B6B",
+        "#4ECDC4",
+        output,
+    )
+    image = Image.open(output).convert("RGBA")
+    alpha_bounds = image.getchannel("A").getbbox()
+    assert alpha_bounds is not None
+    assert alpha_bounds[0] > 0 and alpha_bounds[1] > 0
+    assert alpha_bounds[2] < image.width and alpha_bounds[3] < image.height
+    max_width_ratio = 0.48 if video_height >= video_width else 0.36
+    assert sticker_width <= round(video_width * max_width_ratio) + 8
+    assert sticker_height < video_height * 0.2
+
+    accent = ImageColor.getrgb("#4ECDC4")
+    accent_pixels = sum(
+        pixel[:3] == accent and pixel[3] > 200
+        for pixel in image.getdata()
+    )
+    assert accent_pixels > 20
+    assert image.getpixel((0, 0))[3] == 0
+    center = image.getpixel((image.width // 2, image.height // 2))
+    assert center[3] > 180 and sum(center[:3]) / 3 > 120
+
+    frame = np.full((video_height, video_width, 3), 96, dtype=np.uint8)
+    placement = _safe_position(
+        [frame, frame, frame],
+        sticker_width,
+        sticker_height,
+        video_width,
+        video_height,
+        subtitle_bottom_ratio=0.22,
+        logo_position="top_right",
+        logo_enabled=False,
+    )
+    assert placement is not None
+    x, y, width, height = placement["rect"]
+    assert 0 <= x < 1 and 0 <= y < 1
+    assert x + width <= 1 and y + height < 1 - 0.22 - 0.04
+
+
+@pytest.mark.parametrize(("video_width", "video_height"), [(1080, 1920), (1920, 1080)])
+def test_long_fancy_subtitle_keeps_only_concrete_terms_inside_safe_width(
+    tmp_path,
+    video_width,
+    video_height,
+):
+    from video_merger import add_fancy_subtitles
+
+    source = tmp_path / f"source-{video_width}x{video_height}.mp4"
+    source.write_bytes(b"video")
+    output = tmp_path / f"output-{video_width}x{video_height}.mp4"
+    captured = {}
+
+    def capture_ass(_cmd, timeout=300):
+        ass_path = next(tmp_path.glob(f"{output.stem}_fancy_subs.ass"))
+        captured["content"] = ass_path.read_text(encoding="utf-8")
+
+    probe = SimpleNamespace(
+        returncode=0,
+        stdout=f"{video_width}\n{video_height}\n2.0\n",
+        stderr="",
+    )
+    with (
+        patch("video_merger.subprocess.run", return_value=probe),
+        patch("video_merger._has_audio_stream", return_value=False),
+        patch("video_merger.run_ffmpeg", side_effect=capture_ass),
+    ):
+        add_fancy_subtitles(
+            source,
+            [{
+                "text": "精选茉莉花采用高温烘焙工艺",
+                "start": 0.0,
+                "end": 2.0,
+                "animation": "fade",
+                "fancy": True,
+                "highlight": ["茉莉花", "高温烘焙"],
+            }],
+            output,
+            accent_color="#4ECDC4",
+        )
+
+    default_style = next(
+        line for line in captured["content"].splitlines()
+        if line.startswith("Style: Default,")
+    ).split(",")
+    font_size = int(default_style[2])
+    margin_left = int(default_style[-4])
+    dialogue = next(
+        line for line in captured["content"].splitlines()
+        if line.startswith("Dialogue:")
+    )
+    assert len("精选茉莉花采用高温烘焙工艺") * font_size <= video_width - 2 * margin_left
+    assert r"{\rHighlight}茉莉花" in dialogue
+    assert r"{\rHighlight}高温烘焙" in dialogue
+    assert "Style: Special" not in captured["content"]
+
+
 def test_portrait_placement_skips_when_only_the_subject_center_looks_available():
     import numpy as np
 

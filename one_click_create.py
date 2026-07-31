@@ -4950,6 +4950,11 @@ def run_generation_pipeline(
     local_story_contract = None
     postproduction_contract = None
     postproduction_contract_path = None
+    local_production_plan = None
+    production_plan_path = None
+    timeline_review_path = None
+    run_manifest_path = None
+    product_entity_ledger = None
     local_one_take_timeline = None
     local_one_take_master: Optional[Path] = None
     local_edit_semantic_indices: List[int] = []
@@ -6658,6 +6663,47 @@ def run_generation_pipeline(
             reference_profile=reference_profile or {},
         )
         postproduction_contract["story_contract"] = local_story_contract
+        from production_plan import (
+            build_local_production_plan,
+            build_product_entity_ledger,
+            ensure_valid_local_production_plan,
+            sanitize_postproduction_contract,
+            write_production_plan_artifacts,
+        )
+        postproduction_contract, _contract_emphasis_violations = sanitize_postproduction_contract(
+            postproduction_contract,
+            ad_script,
+        )
+        if _contract_emphasis_violations:
+            print(
+                f"ℹ️  后期合同校验：降级 {len(_contract_emphasis_violations)} 个无具体重点的花字"
+            )
+        product_entity_ledger = build_product_entity_ledger(
+            product_info,
+            selected_material_segments,
+        )
+        ad_script["product_entity_ledger"] = product_entity_ledger
+        local_production_plan = ensure_valid_local_production_plan(
+            build_local_production_plan(
+                ad_script=ad_script,
+                selected_segments=selected_material_segments,
+                postproduction_contract=postproduction_contract,
+                entity_ledger=product_entity_ledger,
+            )
+        )
+        production_plan_path = final_dir / f"{output_name}_production_plan.json"
+        timeline_review_path = final_dir / f"{output_name}_timeline_review.html"
+        write_production_plan_artifacts(
+            local_production_plan,
+            production_plan_path,
+            timeline_review_path,
+        )
+        postproduction_contract["entity_ledger"] = product_entity_ledger
+        postproduction_contract["production_plan"] = {
+            "version": local_production_plan["version"],
+            "path": str(production_plan_path),
+            "timeline_review": str(timeline_review_path),
+        }
         postproduction_contract_path = write_postproduction_contract(
             postproduction_contract,
             final_dir / f"{output_name}_postproduction_contract.json",
@@ -6701,6 +6747,7 @@ def run_generation_pipeline(
         if local_asset_frame_evidence_report:
             print(f"🔬 素材帧证据审计：{Path(local_asset_frame_evidence_report).name}")
         print(f"🎛️ 素材驱动后期合同：{Path(postproduction_contract_path).name}")
+        print(f"🧭 成片时间线审阅：{timeline_review_path.name}")
     else:
         # ── 第 1 段：串行生成，用于提取全局场景锚点 ──
         # P1 #2（v2）：用 1-based 的 i 追踪成功段，段索引 = i-1（0-based）
@@ -7784,6 +7831,27 @@ def run_generation_pipeline(
         subtitle["emphasis_topic"] = str(subtitle_contract.get("emphasis_topic") or "")
         subtitle["emphasis_terms"] = list(subtitle_contract.get("emphasis_terms") or [])
     subtitles = select_fancy_subtitles(subtitles)
+    if local_asset_mode:
+        from production_plan import (
+            sanitize_subtitle_emphasis,
+            update_local_production_plan,
+            write_production_plan_artifacts,
+        )
+        subtitles, _subtitle_plan_violations = sanitize_subtitle_emphasis(subtitles)
+        if _subtitle_plan_violations:
+            print(
+                f"ℹ️  花字语义校验：移除 {len(_subtitle_plan_violations)} 个无具体重点的花字"
+            )
+        if local_production_plan and production_plan_path and timeline_review_path:
+            local_production_plan = update_local_production_plan(
+                local_production_plan,
+                subtitles=subtitles,
+            )
+            write_production_plan_artifacts(
+                local_production_plan,
+                production_plan_path,
+                timeline_review_path,
+            )
     if postproduction_contract:
         postproduction_contract["subtitles"] = [
             {
@@ -8357,6 +8425,30 @@ def run_generation_pipeline(
             script_style=script_style,
             preference_policy=sticker_policy,
         )
+        if local_asset_mode and product_entity_ledger:
+            from production_plan import (
+                sanitize_sticker_plan,
+                update_local_production_plan,
+                write_production_plan_artifacts,
+            )
+            sticker_plan, _sticker_plan_violations = sanitize_sticker_plan(
+                sticker_plan,
+                product_entity_ledger,
+            )
+            if _sticker_plan_violations:
+                print(
+                    f"ℹ️  贴图语义校验：跳过 {len(_sticker_plan_violations)} 个复述或分类错误贴图"
+                )
+            if local_production_plan and production_plan_path and timeline_review_path:
+                local_production_plan = update_local_production_plan(
+                    local_production_plan,
+                    sticker_plan=sticker_plan,
+                )
+                write_production_plan_artifacts(
+                    local_production_plan,
+                    production_plan_path,
+                    timeline_review_path,
+                )
         sticker_videos = {"9:16": final_path}
         if wide_path:
             sticker_videos["16:9"] = wide_path
@@ -8385,6 +8477,22 @@ def run_generation_pipeline(
         if postproduction_contract and postproduction_contract_path:
             postproduction_contract["stickers"] = sticker_plan
             write_postproduction_contract(postproduction_contract, postproduction_contract_path)
+        if (
+            local_asset_mode
+            and local_production_plan
+            and production_plan_path
+            and timeline_review_path
+        ):
+            from production_plan import update_local_production_plan, write_production_plan_artifacts
+            local_production_plan = update_local_production_plan(
+                local_production_plan,
+                sticker_plan=sticker_plan,
+            )
+            write_production_plan_artifacts(
+                local_production_plan,
+                production_plan_path,
+                timeline_review_path,
+            )
     except Exception as sticker_error:
         sticker_plan = {
             "version": 1,
@@ -8399,6 +8507,22 @@ def run_generation_pipeline(
             json.dumps(sticker_plan, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        if (
+            local_asset_mode
+            and local_production_plan
+            and production_plan_path
+            and timeline_review_path
+        ):
+            from production_plan import update_local_production_plan, write_production_plan_artifacts
+            local_production_plan = update_local_production_plan(
+                local_production_plan,
+                sticker_plan=sticker_plan,
+            )
+            write_production_plan_artifacts(
+                local_production_plan,
+                production_plan_path,
+                timeline_review_path,
+            )
         print(f"⚠️  智能语义贴图失败，保留原片：{sticker_error}")
 
     # ============================================================
@@ -8581,6 +8705,49 @@ def run_generation_pipeline(
             encoding="utf-8",
         )
 
+    if local_asset_mode:
+        from run_manifest import (
+            build_local_pipeline_manifest,
+            load_run_manifest,
+            write_run_manifest,
+        )
+
+        run_manifest_path = final_dir / f"{output_name}_run_manifest.json"
+        previous_run_manifest = load_run_manifest(run_manifest_path)
+        asset_review_artifacts = [
+            (local_asset_index or {}).get("frame_evidence_manifest"),
+            (local_asset_index or {}).get("frame_evidence_report"),
+        ]
+        run_manifest = build_local_pipeline_manifest(
+            asset_index=local_asset_index or {},
+            entity_ledger=product_entity_ledger or {},
+            ad_script=ad_script,
+            selected_segments=selected_material_segments,
+            postproduction_contract=postproduction_contract or {},
+            subtitles=subtitles,
+            sticker_plan=sticker_plan,
+            render_settings={
+                "aspect_ratio": aspect_ratio,
+                "dual_output": dual_output,
+                "preview": preview,
+                "stabilize": stabilize,
+                "brand_intro_outro": brand_intro_outro,
+                "subtitle_bottom_ratio": bottom_margin_ratio,
+            },
+            stage_artifacts={
+                "asset_understanding": asset_review_artifacts,
+                "product_entities": [production_plan_path],
+                "script": [final_script_sidecar],
+                "edit_plan": [postproduction_contract_path],
+                "subtitles": [production_plan_path],
+                "stickers": [sticker_plan_path],
+                "render": [final_path, wide_path] if wide_path else [final_path],
+            },
+            previous_manifest=previous_run_manifest,
+            review_artifact=timeline_review_path,
+        )
+        write_run_manifest(run_manifest, run_manifest_path)
+
     return {
         "final_path": final_path,
         "wide_path": wide_path,
@@ -8599,6 +8766,9 @@ def run_generation_pipeline(
         "edit_decision_report": local_asset_edit_report,
         "frame_evidence_report": local_asset_frame_evidence_report,
         "postproduction_contract": postproduction_contract_path,
+        "production_plan": production_plan_path,
+        "timeline_review": timeline_review_path,
+        "run_manifest": run_manifest_path,
         "sticker_plan": sticker_plan_path,
         "transition_decision_report": locals().get("transition_report_path"),
     }

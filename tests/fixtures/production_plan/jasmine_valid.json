@@ -1,0 +1,126 @@
+{
+  "product_info": {
+    "name": "清醒茶咖",
+    "ingredients": ["茉莉花", "咖啡豆"],
+    "production_process": ["高温烘焙"],
+    "selling_point": ["茉莉香气", "茶咖融合"]
+  },
+  "ad_script": {
+    "segments": [
+      {
+        "segment": 0,
+        "narrative": "hook",
+        "product_story_role": "finished_product",
+        "subtitle": "这瓶茶咖为什么值得看"
+      },
+      {
+        "segment": 1,
+        "narrative": "ingredient_proof",
+        "product_story_role": "ingredient",
+        "subtitle": "原料里能看到茉莉花"
+      }
+    ]
+  },
+  "selected_segments": [
+    {
+      "semantic_segment": 0,
+      "edit_index": 0,
+      "clip_path": "/tmp/product.mp4",
+      "source_video": "product.mp4",
+      "source_start": 0.0,
+      "source_end": 2.4,
+      "target_duration": 2.4,
+      "product_story_role": "finished_product",
+      "product_identity_supported": true,
+      "contact_sheet": "/tmp/product.jpg",
+      "analysis": {
+        "matched_product_entities": []
+      }
+    },
+    {
+      "semantic_segment": 1,
+      "edit_index": 1,
+      "clip_path": "/tmp/jasmine.mp4",
+      "source_video": "jasmine.mp4",
+      "source_start": 1.2,
+      "source_end": 3.8,
+      "target_duration": 2.6,
+      "product_story_role": "ingredient",
+      "product_relationship_verified": true,
+      "product_relationship_source": "product_info.ingredients+visual.entity",
+      "product_relationship_confidence": 0.92,
+      "matched_product_entities": ["茉莉花植株"],
+      "matched_product_facts": ["茉莉花"],
+      "contact_sheet": "/tmp/jasmine.jpg",
+      "analysis": {
+        "matched_product_entities": ["茉莉花植株"],
+        "matched_product_facts": ["茉莉花"]
+      }
+    }
+  ],
+  "postproduction_contract": {
+    "version": 5,
+    "segments": [
+      {
+        "semantic_segment": 0,
+        "edit_index": 0,
+        "subtitle": {
+          "emphasis": false,
+          "emphasis_kind": "normal",
+          "emphasis_terms": []
+        }
+      },
+      {
+        "semantic_segment": 1,
+        "edit_index": 1,
+        "subtitle": {
+          "emphasis": true,
+          "emphasis_kind": "product_fact",
+          "emphasis_topic": "ingredient",
+          "emphasis_terms": ["茉莉花"]
+        }
+      }
+    ]
+  },
+  "subtitles": [
+    {
+      "segment": 0,
+      "text": "这瓶茶咖为什么值得看",
+      "start": 0.0,
+      "end": 2.4,
+      "fancy": false,
+      "emphasis": false,
+      "emphasis_terms": []
+    },
+    {
+      "segment": 1,
+      "text": "原料里能看到茉莉花",
+      "start": 2.4,
+      "end": 5.0,
+      "fancy": true,
+      "emphasis": true,
+      "emphasis_kind": "product_fact",
+      "emphasis_topic": "ingredient",
+      "emphasis_terms": ["茉莉花"]
+    }
+  ],
+  "sticker_plan": {
+    "version": 1,
+    "enabled": true,
+    "items": [
+      {
+        "id": "sticker-segment-1-ingredient",
+        "segment": 1,
+        "kind": "ingredient",
+        "text": "茉莉花",
+        "source_subtitle": "原料里能看到茉莉花",
+        "start": 2.45,
+        "end": 4.8,
+        "evidence_refs": ["subtitle:segment:1", "material_role:ingredient"]
+      }
+    ],
+    "skipped": [],
+    "layouts": {}
+  },
+  "expected_blocking_codes": []
+}

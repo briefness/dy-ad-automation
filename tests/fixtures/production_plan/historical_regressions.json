@@ -1,0 +1,81 @@
+{
+  "product_info": {
+    "name": "清醒茶咖",
+    "ingredients": ["茉莉花"]
+  },
+  "ad_script": {
+    "segments": [
+      {
+        "segment": 0,
+        "narrative": "hook",
+        "product_story_role": "finished_product",
+        "subtitle": "这瓶茶咖为什么值得看"
+      }
+    ]
+  },
+  "selected_segments": [
+    {
+      "semantic_segment": 0,
+      "edit_index": 0,
+      "clip_path": "/tmp/jasmine.mp4",
+      "source_video": "jasmine.mp4",
+      "source_start": 0.0,
+      "source_end": 2.4,
+      "target_duration": 2.4,
+      "product_story_role": "ingredient",
+      "product_relationship_verified": true,
+      "matched_product_entities": ["茉莉花"],
+      "matched_product_facts": ["茉莉花"]
+    }
+  ],
+  "postproduction_contract": {
+    "version": 5,
+    "segments": [
+      {
+        "semantic_segment": 0,
+        "edit_index": 0,
+        "subtitle": {
+          "emphasis": true,
+          "emphasis_kind": "product_fact",
+          "emphasis_topic": "ingredient",
+          "emphasis_terms": ["成分"]
+        }
+      }
+    ]
+  },
+  "subtitles": [
+    {
+      "segment": 0,
+      "text": "这瓶茶咖为什么值得看",
+      "start": 0.0,
+      "end": 2.4,
+      "fancy": true,
+      "emphasis": true,
+      "emphasis_kind": "product_fact",
+      "emphasis_terms": ["成分"]
+    }
+  ],
+  "sticker_plan": {
+    "version": 1,
+    "enabled": true,
+    "items": [
+      {
+        "id": "sticker-segment-0-ingredient",
+        "segment": 0,
+        "kind": "ingredient",
+        "text": "这瓶茶咖为什么值得看",
+        "source_subtitle": "这瓶茶咖为什么值得看",
+        "start": 0.1,
+        "end": 2.2,
+        "evidence_refs": ["subtitle:segment:0", "material_role:ingredient"]
+      }
+    ],
+    "skipped": [],
+    "layouts": {}
+  },
+  "expected_blocking_codes": [
+    "opening_role_mismatch",
+    "generic_emphasis_term",
+    "sticker_repeats_subtitle"
+  ]
+}
