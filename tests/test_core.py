@@ -3352,6 +3352,248 @@ class TestPostProcessingP0Fixes:
         assert "typewriter" not in animations
         assert len(set(animations)) >= 2
 
+    def test_subtitle_emphasis_is_limited_to_product_information(self):
+        """只有产地、原料、工艺和卖点等产品信息有花字资格。"""
+        from postproduction_contract import build_local_postproduction_contract
+
+        selected = [
+            {
+                "script_segment": 0,
+                "narrative": "hook",
+                "product_story_role": "finished_product",
+                "motion": {"motion_class": "dynamic"},
+            },
+            {
+                "script_segment": 1,
+                "narrative": "usage_demo",
+                "product_story_role": "usage",
+                "motion": {"motion_class": "dynamic"},
+            },
+            {
+                "script_segment": 2,
+                "narrative": "source_context",
+                "product_story_role": "ingredient",
+                "analysis": {"matched_product_entities": ["茉莉花"]},
+                "motion": {"motion_class": "dynamic"},
+            },
+            {
+                "script_segment": 3,
+                "narrative": "cta",
+                "product_story_role": "finished_product",
+                "motion": {"motion_class": "dynamic"},
+            },
+            {
+                "script_segment": 4,
+                "narrative": "source_context",
+                "product_story_role": "production",
+                "emphasis_terms": ["高温烘焙"],
+                "motion": {"motion_class": "dynamic"},
+            },
+            {
+                "script_segment": 5,
+                "narrative": "source_context",
+                "product_story_role": "origin",
+                "motion": {"motion_class": "dynamic"},
+            },
+            {
+                "script_segment": 6,
+                "narrative": "selling_point",
+                "product_story_role": "finished_product",
+                "emphasis_terms": ["0糖"],
+                "motion": {"motion_class": "dynamic"},
+            },
+            {
+                "script_segment": 7,
+                "narrative": "source_context",
+                "product_story_role": "origin",
+                "emphasis_terms": ["大理"],
+                "motion": {"motion_class": "dynamic"},
+            },
+        ]
+
+        contract = build_local_postproduction_contract(selected, {}, {}, {})
+        subtitles = contract["semantic_subtitles"]
+
+        assert [item["emphasis"] for item in subtitles] == [
+            False, False, True, False, True, False, True, True,
+        ]
+        assert [item["emphasis_kind"] for item in subtitles] == [
+            "normal", "normal", "product_fact", "normal",
+            "product_fact", "normal", "selling_point", "product_fact",
+        ]
+        assert [item["emphasis_topic"] for item in subtitles] == [
+            "", "", "ingredient", "", "production", "", "", "origin",
+        ]
+        assert [item["emphasis_terms"] for item in subtitles] == [
+            [], [], ["茉莉花"], [], ["高温烘焙"], [], ["0糖"], ["大理"],
+        ]
+        assert all(item["animation"] == "fade" for item in subtitles)
+
+    def test_select_fancy_subtitles_keeps_only_one_special_cue_per_segment(self):
+        """特殊语义段只挑一条花字，普通说明句和同段其余字幕保持普通样式。"""
+        from video_merger import select_fancy_subtitles
+
+        selected = select_fancy_subtitles([
+            {
+                "segment": 0,
+                "text": "喝过纯茶喝过黑咖",
+                "animation": "fade",
+                "emphasis": False,
+                "emphasis_kind": "normal",
+            },
+            {
+                "segment": 0,
+                "text": "你喝过茶咖吗",
+                "animation": "fade",
+                "emphasis": False,
+                "emphasis_kind": "normal",
+            },
+            {
+                "segment": 1,
+                "text": "开瓶即饮",
+                "animation": "fade",
+                "emphasis": False,
+                "emphasis_kind": "normal",
+            },
+            {
+                "segment": 2,
+                "text": "茶香和咖啡香都保留得很完整",
+                "animation": "fade",
+                "emphasis": True,
+                "emphasis_kind": "product_fact",
+                "emphasis_topic": "ingredient",
+            },
+            {
+                "segment": 2,
+                "text": "精选茉莉花茶作为原料",
+                "animation": "fade",
+                "emphasis": True,
+                "emphasis_kind": "product_fact",
+                "emphasis_topic": "ingredient",
+                "emphasis_terms": ["茉莉花茶"],
+            },
+            {
+                "segment": 3,
+                "text": "想要换个下午茶口味的",
+                "animation": "fade",
+                "emphasis": False,
+                "emphasis_kind": "normal",
+            },
+            {
+                "segment": 3,
+                "text": "点进来了解一下",
+                "animation": "fade",
+                "emphasis": False,
+                "emphasis_kind": "normal",
+            },
+        ])
+
+        assert [item["fancy"] for item in selected] == [
+            False, False, False, False, True, False, False,
+        ]
+        assert all(item["animation"] == "fade" for item in selected)
+        assert [item["text"] for item in selected if item["fancy"]] == [
+            "精选茉莉花茶作为原料",
+        ]
+        assert [item["highlight"] for item in selected if item["fancy"]] == [
+            ["茉莉花茶"],
+        ]
+
+    def test_generic_origin_category_is_not_a_fancy_subtitle_feature(self):
+        from video_merger import select_fancy_subtitles
+
+        selected = select_fancy_subtitles([{
+            "segment": 0,
+            "text": "原料都来自生态优质种植区",
+            "animation": "fade",
+            "emphasis": True,
+            "emphasis_kind": "product_fact",
+            "emphasis_topic": "origin",
+        }])
+
+        assert selected[0]["fancy"] is False
+        assert selected[0]["highlight"] == []
+
+    @pytest.mark.parametrize(("text", "topic", "term"), [
+        ("好风味来自大理", "origin", "大理"),
+        ("精选茉莉花作为原料", "ingredient", "茉莉花"),
+        ("采用高温烘焙工艺", "production", "高温烘焙"),
+    ])
+    def test_fancy_subtitle_requires_a_concrete_evidence_term(self, text, topic, term):
+        from video_merger import select_fancy_subtitles
+
+        selected = select_fancy_subtitles([{
+            "segment": 0,
+            "text": text,
+            "animation": "fade",
+            "emphasis": True,
+            "emphasis_kind": "product_fact",
+            "emphasis_topic": topic,
+            "emphasis_terms": [term],
+        }])
+
+        assert selected[0]["fancy"] is True
+        assert selected[0]["highlight"] == [term]
+
+    @pytest.mark.parametrize(("text", "term", "highlight"), [
+        ("自带自然茉莉香气", "茉莉花", "茉莉香气"),
+        ("玫瑰香味清新", "玫瑰花", "玫瑰香味"),
+        ("咖啡风味浓郁", "咖啡豆", "咖啡风味"),
+    ])
+    def test_fancy_subtitle_aligns_verified_ingredient_entity_with_spoken_variant(
+        self,
+        text,
+        term,
+        highlight,
+    ):
+        """已验证原料可对齐正文简称，但突出内容必须仍是正文中的具体特点。"""
+        from video_merger import select_fancy_subtitles
+
+        selected = select_fancy_subtitles([{
+            "segment": 0,
+            "text": text,
+            "animation": "fade",
+            "emphasis": True,
+            "emphasis_kind": "product_fact",
+            "emphasis_topic": "ingredient",
+            "emphasis_terms": [term],
+        }])
+
+        assert selected[0]["fancy"] is True
+        assert selected[0]["highlight"] == [highlight]
+
+    def test_fancy_subtitle_rejects_unanchored_generic_fragment(self):
+        from video_merger import select_fancy_subtitles
+
+        selected = select_fancy_subtitles([{
+            "segment": 0,
+            "text": "自然花香清新",
+            "animation": "fade",
+            "emphasis": True,
+            "emphasis_kind": "product_fact",
+            "emphasis_topic": "ingredient",
+            "emphasis_terms": ["茉莉花"],
+        }])
+
+        assert selected[0]["fancy"] is False
+        assert selected[0]["highlight"] == []
+
+    def test_fancy_subtitle_stays_normal_when_no_specific_feature_can_be_extracted(self):
+        from video_merger import select_fancy_subtitles
+
+        selected = select_fancy_subtitles([{
+            "segment": 0,
+            "text": "原料底子就是不一样",
+            "animation": "fade",
+            "emphasis": True,
+            "emphasis_kind": "product_fact",
+            "emphasis_topic": "ingredient",
+            "emphasis_terms": [],
+        }])
+
+        assert selected[0]["fancy"] is False
+        assert selected[0]["highlight"] == []
+
     def test_fancy_subtitles_disable_automatic_wrapping(self):
         """单行字幕合同必须由 ASS 渲染层强制执行。"""
         src = Path("video_merger.py").read_text(encoding="utf-8")
@@ -3568,6 +3810,107 @@ class TestPostProcessingP0Fixes:
         assert post.call_args.kwargs["stream"] is True
         assert post.call_args.kwargs["json"]["stream"] is True
 
+    def test_streamed_vision_response_decodes_utf8_bytes_without_charset_guessing(self):
+        """SSE 未声明 charset 时仍必须按 UTF-8 保留中文视觉事实。"""
+        import json
+        from local_asset_pipeline import _streamed_chat_json
+
+        class ByteStreamResponse:
+            def iter_lines(self, decode_unicode=False):
+                assert decode_unicode is False
+                content = json.dumps({
+                    "visible_objects": ["盛开的茉莉花"],
+                    "product_story_role": "ingredient",
+                }, ensure_ascii=False)
+                event = json.dumps({
+                    "choices": [{"delta": {"content": content}}],
+                }, ensure_ascii=False)
+                yield f"data: {event}".encode("utf-8")
+                yield b"data: [DONE]"
+
+        result = _streamed_chat_json(ByteStreamResponse())
+
+        assert result["visible_objects"] == ["盛开的茉莉花"]
+        assert result["product_story_role"] == "ingredient"
+
+    def test_cached_visual_text_repairs_only_strict_utf8_mojibake(self):
+        """旧缓存只在可严格还原且中文增加时做内存修复。"""
+        from local_asset_pipeline import _repair_cached_utf8
+
+        broken = "茉莉花".encode("utf-8").decode("latin-1")
+        original = {
+            "analysis": {"visible_objects": [broken, "正确中文", "plain text"]},
+            "source_path": "/tmp/material.mp4",
+        }
+
+        repaired = _repair_cached_utf8(original)
+
+        assert repaired["analysis"]["visible_objects"] == ["茉莉花", "正确中文", "plain text"]
+        assert repaired["source_path"] == "/tmp/material.mp4"
+        assert original["analysis"]["visible_objects"][0] == broken
+
+    def test_window_understanding_requests_grounded_specific_entity_candidates(self, tmp_path):
+        """初次视频理解应输出具体实体候选、形态证据和置信度，而非只写通用花草。"""
+        import json
+        from unittest.mock import patch
+        from PIL import Image
+        from local_asset_pipeline import VisionAnalyzer
+
+        class StreamResponse:
+            def raise_for_status(self):
+                return None
+
+            def iter_lines(self, decode_unicode=False):
+                assert decode_unicode is False
+                content = json.dumps({
+                    "product_story_role": "ingredient",
+                    "visible_objects": ["成片白色小花"],
+                    "visual_entity_candidates": [
+                        {
+                            "entity": "茉莉花",
+                            "confidence": 0.86,
+                            "evidence": "连续帧可见白色小花、椭圆叶与灌木状枝条",
+                        },
+                        {
+                            "entity": "栀子花",
+                            "confidence": 0.41,
+                            "evidence": "花色接近但叶片与花型证据不足",
+                        },
+                    ],
+                    "confidence": 0.9,
+                    "usable_for_ad": True,
+                }, ensure_ascii=False)
+                event = json.dumps({
+                    "choices": [{"delta": {"content": content}}],
+                }, ensure_ascii=False)
+                yield f"data: {event}".encode("utf-8")
+                yield b"data: [DONE]"
+
+            def close(self):
+                return None
+
+        sheet = tmp_path / "sheet.jpg"
+        Image.new("RGB", (32, 32), "white").save(sheet)
+        with patch("local_asset_pipeline.requests.post", return_value=StreamResponse()) as post:
+            result = VisionAnalyzer().analyze_window(sheet, {"frame_count": 4})
+
+        prompt = post.call_args.kwargs["json"]["messages"][1]["content"][0]["text"]
+        assert "visual_entity_candidates" in prompt
+        assert "形态" in prompt
+        assert "产品资料" in prompt
+        assert result["visual_entity_candidates"] == [
+            {
+                "entity": "茉莉花",
+                "confidence": 0.86,
+                "evidence": "连续帧可见白色小花、椭圆叶与灌木状枝条",
+            },
+            {
+                "entity": "栀子花",
+                "confidence": 0.41,
+                "evidence": "花色接近但叶片与花型证据不足",
+            },
+        ]
+
     def test_window_analysis_retries_read_timeout_then_succeeds(self, tmp_path):
         """可恢复的读取超时只做有界重试，成功响应仍被正常使用。"""
         import json
@@ -3758,6 +4101,32 @@ class TestPostProcessingP0Fixes:
 
         assert _marketing_claim_violations(segment, {"name": "茶咖"}, analysis) == {}
 
+    def test_verified_visual_entity_supports_only_its_ingredient_identity(self):
+        """双证据推断只支持具体原料身份，不外推产地、工艺、感官或功效。"""
+        from local_asset_pipeline import _marketing_claim_violations
+
+        analysis = {
+            "product_relationship_verified": True,
+            "matched_product_facts": [],
+            "matched_product_entities": ["茉莉花"],
+        }
+
+        assert _marketing_claim_violations(
+            {"subtitle": "采用茉莉花作为原料", "voiceover": "采用茉莉花作为原料"},
+            {"name": "清润饮"},
+            analysis,
+        ) == {}
+        assert _marketing_claim_violations(
+            {"subtitle": "采用玫瑰花作为原料", "voiceover": "采用玫瑰花作为原料"},
+            {"name": "清润饮"},
+            analysis,
+        )
+        assert _marketing_claim_violations(
+            {"subtitle": "来自大理核心产区", "voiceover": "来自大理核心产区"},
+            {"name": "清润饮"},
+            analysis,
+        )
+
     def test_origin_and_effect_claims_require_matching_trusted_facts(self):
         """产地与功效不能由相似画面或通用卖点臆测。"""
         from local_asset_pipeline import _marketing_claim_violations
@@ -3809,6 +4178,550 @@ class TestPostProcessingP0Fixes:
         _annotate_product_relationships(catalog, {"name": "茶咖", "ingredients": ["茉莉花茶"]})
         assert catalog[0]["product_relationship_verified"] is True
         assert catalog[0]["matched_product_facts"] == ["茉莉花茶"]
+
+    @pytest.mark.parametrize(
+        ("product_info", "visual_entity", "expected_entity", "expected_fact"),
+        [
+            ({"name": "茶咖", "ingredients": ["茉莉花茶"]}, "盛开的白色花朵", "茉莉花", "茉莉花茶"),
+            ({"name": "芦荟凝胶", "raw_materials": ["库拉索芦荟"]}, "厚实多汁的绿色叶片", "库拉索芦荟", "库拉索芦荟"),
+        ],
+    )
+    def test_product_anchored_visual_entity_infers_ingredient_role(
+        self,
+        product_info,
+        visual_entity,
+        expected_entity,
+        expected_fact,
+    ):
+        """产品事实与可见实体双向吻合时，模糊素材可归为原料，且不绑定具体品类。"""
+        from local_asset_pipeline import _annotate_product_relationships
+
+        catalog = [{
+            "product_story_role": "context",
+            "setting": "室内",
+            "visible_objects": [visual_entity],
+            "object_tracks": [{"object": visual_entity, "visible_frame_count": 6}],
+            "visual_entity_candidates": [{
+                "entity": expected_entity,
+                "confidence": 0.9,
+                "evidence": f"跨帧形态支持识别为{expected_entity}",
+            }],
+            "relation_candidates": [],
+            "visible_text": [],
+            "evidence": f"画面连续可见{visual_entity}特写",
+        }]
+
+        _annotate_product_relationships(catalog, product_info)
+
+        assert catalog[0]["product_story_role"] == "ingredient"
+        assert catalog[0]["product_relationship_verified"] is True
+        assert catalog[0]["matched_product_facts"] == [expected_fact]
+        assert catalog[0]["matched_product_entities"] == [expected_entity]
+
+    @pytest.mark.parametrize(
+        ("product_info", "setting", "visual_objects", "candidate", "expected_fact"),
+        [
+            (
+                {"name": "茉莉饮", "ingredients": ["茉莉花"]},
+                "山地花卉种植园",
+                ["成片生长的茉莉花", "规则排列的花田"],
+                "茉莉花",
+                "茉莉花",
+            ),
+            (
+                {"name": "咖啡液", "ingredients": ["阿拉比卡咖啡豆"]},
+                "山坡咖啡种植园",
+                ["成排咖啡树", "树上的咖啡果"],
+                "阿拉比卡咖啡豆",
+                "阿拉比卡咖啡豆",
+            ),
+        ],
+    )
+    def test_matching_ingredient_in_cultivation_scene_infers_origin_role(
+        self,
+        product_info,
+        setting,
+        visual_objects,
+        candidate,
+        expected_fact,
+    ):
+        """同一原料实体处于成片培育环境时表达产地角色，但不猜具体地名。"""
+        from local_asset_pipeline import _annotate_product_relationships
+
+        catalog = [{
+            "product_story_role": "context",
+            "setting": setting,
+            "visible_objects": visual_objects,
+            "relation_candidates": [candidate],
+            "visible_text": [],
+            "evidence": f"画面可见{setting}与{candidate}",
+        }]
+
+        _annotate_product_relationships(catalog, product_info)
+
+        assert catalog[0]["product_story_role"] == "origin"
+        assert catalog[0]["product_relationship_verified"] is True
+        assert catalog[0]["matched_product_facts"] == []
+        assert catalog[0]["matched_product_entities"] == [expected_fact]
+        assert "visual.cultivation_scene" in catalog[0]["product_relationship_source"]
+
+    def test_stable_product_label_entity_can_anchor_matching_visual_material(self):
+        """成品包装与素材都稳定出现同一实体时可建立弱关系，不升级为可信配料事实。"""
+        from local_asset_pipeline import _annotate_product_relationships
+
+        catalog = [
+            {
+                "product_story_role": "finished_product",
+                "visible_text": ["清润饮", "茉莉"],
+                "visible_objects": ["瓶装清润饮"],
+                "relation_candidates": [],
+                "evidence": "瓶身正面标签连续清晰可见",
+            },
+            {
+                "product_story_role": "context",
+                "setting": "室内",
+                "visible_text": [],
+                "visible_objects": ["盛开的白色茉莉花"],
+                "relation_candidates": ["茉莉花"],
+                "evidence": "连续画面可见白色茉莉花特写",
+            },
+        ]
+
+        _annotate_product_relationships(catalog, {"name": "清润饮"})
+
+        material = catalog[1]
+        assert material["product_story_role"] == "ingredient"
+        assert material["product_relationship_verified"] is True
+        assert material["product_relationship_source"] == "visual.product_label+visual.entity"
+        assert material["matched_product_facts"] == []
+
+    @pytest.mark.parametrize(
+        ("product_name", "strong_entity", "supporting_entity", "expected_entity"),
+        [
+            ("清润饮", "茉莉花植株", "茉莉花", "茉莉花"),
+            ("修护凝胶", "库拉索芦荟植株", "库拉索芦荟", "库拉索芦荟"),
+        ],
+    )
+    def test_curated_cross_source_entity_consensus_recovers_missing_label_ocr(
+        self,
+        product_name,
+        strong_entity,
+        supporting_entity,
+        expected_entity,
+    ):
+        """包装小字漏识别时，成品身份与跨来源实体共识可建立受限关系。"""
+        from local_asset_pipeline import (
+            _annotate_product_relationships,
+            _global_material_capability_pool,
+        )
+
+        catalog = [
+            {
+                "window_id": "product",
+                "source_path": "/tmp/product.mp4",
+                "product_story_role": "finished_product",
+                "visible_text": [product_name],
+                "visible_objects": [f"瓶装{product_name}"],
+                "relation_candidates": [],
+                "evidence": f"成品标签清晰可见{product_name}",
+            },
+            {
+                "window_id": "cultivation",
+                "source_path": "/tmp/cultivation.mp4",
+                "product_story_role": "origin",
+                "product_relevance_prior": "high",
+                "product_relevance_source": "curated_local_asset_folder",
+                "confidence": 0.94,
+                "setting": "成片种植环境",
+                "visual_entity_candidates": [{
+                    "entity": strong_entity,
+                    "confidence": 0.82,
+                    "evidence": f"跨帧形态支持{strong_entity}",
+                }],
+                "visible_objects": [strong_entity],
+                "relation_candidates": [strong_entity],
+                "visible_text": [],
+                "evidence": f"连续画面可见{strong_entity}",
+            },
+            {
+                "window_id": "ingredient",
+                "source_path": "/tmp/ingredient.mp4",
+                "product_story_role": "ingredient",
+                "product_relevance_prior": "high",
+                "product_relevance_source": "curated_local_asset_folder",
+                "confidence": 0.92,
+                "visual_entity_candidates": [{
+                    "entity": supporting_entity,
+                    "confidence": 0.70,
+                    "evidence": f"跨帧形态基本支持{supporting_entity}",
+                }],
+                "visible_objects": [supporting_entity],
+                "relation_candidates": [supporting_entity],
+                "visible_text": [],
+                "evidence": f"连续画面可见{supporting_entity}",
+            },
+        ]
+
+        _annotate_product_relationships(catalog, {"name": product_name})
+        pool = _global_material_capability_pool(catalog, {"name": product_name})
+
+        assert catalog[1]["product_relationship_verified"] is True
+        assert catalog[1]["matched_product_entities"] == [expected_entity]
+        assert catalog[1]["product_relationship_source"].startswith(
+            "curated_cross_source_visual_consensus"
+        )
+        assert any(
+            anchor["text"] == expected_entity
+            and anchor.get("evidence_source") == "verified_visual_relationship"
+            for anchor in pool["evidence_anchors"]
+        )
+
+    def test_uneditable_window_can_support_relationship_but_never_enter_planning_catalog(self):
+        """技术上不可剪的窗口可贡献语义证据，但必须与可剪素材集合隔离。"""
+        from local_asset_pipeline import (
+            _annotated_material_catalog,
+            _global_material_capability_pool,
+        )
+
+        def window(window_id, source, usable, role, entity="", confidence=0.0):
+            return {
+                "window_id": window_id,
+                "source_video": source,
+                "source_path": f"/tmp/{source}",
+                "start": 0.0,
+                "end": 3.0,
+                "analysis": {
+                    "usable_for_ad": usable,
+                    "confidence": 0.9,
+                    "product_story_role": role,
+                    "visible_text": ["清润饮"] if role == "finished_product" else [],
+                    "visible_objects": [entity] if entity else ["瓶装清润饮"],
+                    "visual_entity_candidates": ([{
+                        "entity": entity,
+                        "confidence": confidence,
+                        "evidence": f"跨帧形态支持{entity}",
+                    }] if entity else []),
+                    "relation_candidates": [entity] if entity else [],
+                    "literal_actions": [],
+                    "evidence": f"连续画面可见{entity or '清润饮'}",
+                },
+            }
+
+        asset_index = {"windows": [
+            window("product", "product.mp4", True, "finished_product"),
+            window("strong-evidence", "cultivation.mp4", False, "origin", "茉莉花植株", 0.82),
+            window("editable-material", "ingredient.mp4", True, "ingredient", "茉莉花", 0.70),
+        ]}
+
+        catalog = _annotated_material_catalog(asset_index, {"name": "清润饮"})
+        pool = _global_material_capability_pool(catalog, {"name": "清润饮"})
+
+        assert {item["window_id"] for item in catalog} == {"product", "editable-material"}
+        material = next(item for item in catalog if item["window_id"] == "editable-material")
+        assert material["product_relationship_verified"] is True
+        assert material["matched_product_entities"] == ["茉莉花"]
+        assert material["product_relationship_evidence"] == {
+            "product_anchor": "茉莉花",
+            "visual_entity": "茉莉花",
+            "scene_relation": "material",
+            "inferred_role": "ingredient",
+            "inference_basis": "curated_cross_source_visual_consensus",
+            "source_count": 2,
+            "max_confidence": 0.82,
+        }
+        assert any(anchor["text"] == "茉莉花" for anchor in pool["evidence_anchors"])
+
+        unproven_catalog = [
+            {
+                **item,
+                "product_relationship_evidence": {
+                    "inference_basis": "curated_cross_source_visual_consensus",
+                },
+            }
+            if item["window_id"] == "editable-material"
+            else item
+            for item in catalog
+        ]
+        unproven_pool = _global_material_capability_pool(
+            unproven_catalog,
+            {"name": "清润饮"},
+        )
+        assert not any(
+            anchor["text"] == "茉莉花"
+            for anchor in unproven_pool["evidence_anchors"]
+        )
+
+    @pytest.mark.parametrize("failure_mode", ["same_source", "low_confidence", "no_product", "conflict"])
+    def test_curated_visual_consensus_requires_independent_bounded_evidence(self, failure_mode):
+        """目录先验不能覆盖来源不独立、置信不足、缺少成品身份或实体冲突。"""
+        from local_asset_pipeline import _annotate_product_relationships
+
+        product_name = "清润饮"
+        catalog = [{
+            "window_id": "product",
+            "source_path": "/tmp/product.mp4",
+            "product_story_role": "finished_product",
+            "visible_text": ["其他产品" if failure_mode == "no_product" else product_name],
+            "visible_objects": ["瓶装饮品"],
+            "relation_candidates": [],
+            "evidence": "成品瓶身特写",
+        }]
+        for index, (entity, confidence) in enumerate([
+            ("茉莉花植株", 0.72 if failure_mode == "low_confidence" else 0.82),
+            ("玫瑰花" if failure_mode == "conflict" else "茉莉花", 0.70),
+        ]):
+            catalog.append({
+                "window_id": f"material-{index}",
+                "source_path": "/tmp/shared.mp4" if failure_mode == "same_source" else f"/tmp/{index}.mp4",
+                "product_story_role": "origin" if index == 0 else "ingredient",
+                "product_relevance_prior": "high",
+                "product_relevance_source": "curated_local_asset_folder",
+                "confidence": 0.9,
+                "visual_entity_candidates": [{
+                    "entity": entity,
+                    "confidence": confidence,
+                    "evidence": f"跨帧形态支持{entity}",
+                }],
+                "visible_objects": [entity],
+                "relation_candidates": [entity],
+                "visible_text": [],
+                "evidence": f"连续画面可见{entity}",
+            })
+
+        _annotate_product_relationships(catalog, {"name": product_name})
+
+        assert all(
+            not str(item.get("product_relationship_source") or "").startswith(
+                "curated_cross_source_visual_consensus"
+            )
+            for item in catalog
+        )
+
+    @pytest.mark.parametrize(
+        "product_info",
+        [
+            {"name": "普通饮品"},
+            {"name": "咖啡液", "ingredients": ["咖啡豆"]},
+            {"name": "花香饮", "selling_point": "茉莉花香"},
+        ],
+    )
+    def test_visual_entity_without_matching_product_anchor_is_not_promoted(self, product_info):
+        """通用花草画面、错配原料和感官卖点都不能凭单侧证据建立关系。"""
+        from local_asset_pipeline import _annotate_product_relationships
+
+        catalog = [{
+            "product_story_role": "context",
+            "setting": "山地花卉种植园",
+            "visible_objects": ["成片生长的茉莉花"],
+            "relation_candidates": ["茉莉花"],
+            "visible_text": [],
+            "evidence": "山坡上成片花卉",
+        }]
+
+        _annotate_product_relationships(catalog, product_info)
+
+        assert catalog[0]["product_story_role"] == "context"
+        assert catalog[0]["product_relationship_verified"] is False
+        assert catalog[0]["matched_product_facts"] == []
+
+    def test_terrain_word_inside_ingredient_name_does_not_infer_origin_scene(self):
+        """产品或原料名称里的地貌词不能替代真实的种植环境证据。"""
+        from local_asset_pipeline import _annotate_product_relationships
+
+        catalog = [{
+            "product_story_role": "context",
+            "setting": "室内桌面",
+            "visible_objects": ["山地苹果切片特写"],
+            "relation_candidates": ["山地苹果"],
+            "visible_text": [],
+            "evidence": "白色盘中摆放苹果切片",
+        }]
+
+        _annotate_product_relationships(
+            catalog,
+            {"name": "苹果脆片", "ingredients": ["山地苹果"]},
+        )
+
+        assert catalog[0]["product_story_role"] == "ingredient"
+        assert catalog[0]["product_relationship_verified"] is True
+
+    def test_only_high_confidence_visual_entity_candidate_can_anchor_relationship(self):
+        """具体实体猜测必须达到视觉置信门槛，低置信候选不能触发关系或角色。"""
+        from local_asset_pipeline import _annotate_product_relationships
+
+        def material(confidence):
+            return {
+                "product_story_role": "context",
+                "setting": "室内",
+                "visible_objects": ["白色小花"],
+                "visual_entity_candidates": [{
+                    "entity": "茉莉花",
+                    "confidence": confidence,
+                    "evidence": "白色小花与椭圆叶",
+                }],
+                "relation_candidates": [],
+                "visible_text": [],
+                "evidence": "画面连续可见白色小花",
+            }
+
+        catalog = [material(0.86), material(0.41)]
+        _annotate_product_relationships(
+            catalog,
+            {"name": "茶咖", "ingredients": ["茉莉花茶"]},
+        )
+
+        assert catalog[0]["product_story_role"] == "ingredient"
+        assert catalog[0]["product_relationship_verified"] is True
+        assert catalog[0]["matched_product_entities"] == ["茉莉花"]
+        assert catalog[1]["product_story_role"] == "context"
+        assert catalog[1]["product_relationship_verified"] is False
+
+    @pytest.mark.parametrize(
+        ("product_info", "visual_objects", "relation_candidates", "expected_fact"),
+        [
+            (
+                {"name": "茶饮", "ingredients": ["茉莉花茶"]},
+                ["混有白色花朵的深绿色散状物料", "竹制圆筛"],
+                ["白色花类物料", "深绿色散状原料"],
+                "茉莉花茶",
+            ),
+            (
+                {"name": "可可饮", "raw_materials": ["可可豆"]},
+                ["竹盘中的棕色豆状原料"],
+                ["棕色豆类原料"],
+                "可可豆",
+            ),
+        ],
+    )
+    def test_curated_material_prior_links_unique_trusted_ingredient_without_exact_ocr(
+        self,
+        product_info,
+        visual_objects,
+        relation_candidates,
+        expected_fact,
+    ):
+        """用户精选素材的明确原料镜头可关联唯一可信原料，但保持中等置信度。"""
+        from local_asset_pipeline import _annotate_product_relationships
+
+        catalog = [{
+            "product_story_role": "ingredient",
+            "product_relevance_prior": "high",
+            "product_relevance_source": "curated_local_asset_folder",
+            "confidence": 0.95,
+            "relation_confidence": 0.3,
+            "visible_objects": visual_objects,
+            "visual_entity_candidates": [],
+            "relation_candidates": relation_candidates,
+            "visible_text": [],
+            "evidence": "连续画面明确展示散装天然原料",
+        }]
+
+        _annotate_product_relationships(catalog, product_info)
+
+        assert catalog[0]["product_relationship_verified"] is True
+        assert catalog[0]["matched_product_facts"] == [expected_fact]
+        assert catalog[0]["matched_product_entities"] == []
+        assert catalog[0]["product_relationship_source"].startswith("curated_material_prior+")
+        assert 0.6 <= catalog[0]["product_relationship_confidence"] < 0.8
+
+    def test_curated_cultivation_scene_links_unique_ingredient_without_claiming_origin_fact(self):
+        """用户精选种植环境可关联产品来源叙事，但不能升级成具体产地事实。"""
+        from local_asset_pipeline import _annotate_product_relationships
+
+        catalog = [{
+            "product_story_role": "origin",
+            "product_relevance_prior": "high",
+            "product_relevance_source": "curated_local_asset_folder",
+            "confidence": 0.98,
+            "relation_confidence": 0.9,
+            "setting": "山地种植环境",
+            "visible_objects": ["带白色花朵的成片绿色种植植物"],
+            "visual_entity_candidates": [],
+            "relation_candidates": ["成片种植作物"],
+            "visible_text": [],
+            "evidence": "连续画面可见山地成片种植作物",
+        }]
+
+        _annotate_product_relationships(
+            catalog,
+            {"name": "花草饮", "ingredients": ["茉莉花茶"]},
+        )
+
+        assert catalog[0]["product_story_role"] == "origin"
+        assert catalog[0]["product_relationship_verified"] is True
+        assert catalog[0]["matched_product_facts"] == []
+        assert catalog[0]["matched_product_entities"] == []
+
+    @pytest.mark.parametrize(
+        ("overrides", "product_info"),
+        [
+            ({"product_relevance_source": "external_search"}, {"ingredients": ["茉莉花茶"]}),
+            ({"confidence": 0.5}, {"ingredients": ["茉莉花茶"]}),
+            ({}, {"ingredients": ["茉莉花茶", "咖啡豆"]}),
+            (
+                {"visual_entity_candidates": [{
+                    "entity": "咖啡豆",
+                    "confidence": 0.94,
+                    "evidence": "可见咖啡豆中央沟槽",
+                }]},
+                {"ingredients": ["茉莉花茶"]},
+            ),
+        ],
+    )
+    def test_curated_material_prior_does_not_override_missing_or_conflicting_evidence(
+        self,
+        overrides,
+        product_info,
+    ):
+        """精选素材先验不能覆盖来源不足、低置信、多原料歧义或明确实体冲突。"""
+        from local_asset_pipeline import _annotate_product_relationships
+
+        item = {
+            "product_story_role": "ingredient",
+            "product_relevance_prior": "high",
+            "product_relevance_source": "curated_local_asset_folder",
+            "confidence": 0.95,
+            "relation_confidence": 0.4,
+            "visible_objects": ["白色花朵与深绿色散状物料"],
+            "visual_entity_candidates": [],
+            "relation_candidates": ["花类散状原料"],
+            "visible_text": [],
+            "evidence": "连续画面可见散装原料",
+            **overrides,
+        }
+
+        _annotate_product_relationships([item], {"name": "测试产品", **product_info})
+
+        assert item["product_relationship_verified"] is False
+        assert item["matched_product_facts"] == []
+
+    def test_inferred_visual_role_is_written_back_to_planning_windows(self):
+        """关系推断必须进入实际素材规划窗口，而不是只停留在临时 catalog。"""
+        from local_asset_pipeline import _apply_product_relationships_to_windows
+
+        asset_index = {"windows": [{
+            "window_id": "jasmine-closeup",
+            "analysis": {
+                "usable_for_ad": True,
+                "product_story_role": "context",
+                "setting": "室内",
+                "visible_objects": ["盛开的茉莉花"],
+                "object_tracks": [{"object": "茉莉花", "visible_frame_count": 6}],
+                "visible_text": [],
+                "relation_candidates": [],
+                "evidence": "连续画面可见茉莉花特写",
+            },
+        }]}
+
+        _apply_product_relationships_to_windows(
+            asset_index,
+            {"name": "茶咖", "ingredients": ["茉莉花茶"]},
+        )
+
+        analysis = asset_index["windows"][0]["analysis"]
+        assert analysis["product_story_role"] == "ingredient"
+        assert analysis["product_relationship_verified"] is True
+        assert analysis["matched_product_facts"] == ["茉莉花茶"]
 
     def test_marketing_copy_does_not_relax_visual_requirement(self, tmp_path):
         """字幕可以营销化，但画面要求仍必须通过真实联系表校验。"""
@@ -4864,12 +5777,13 @@ class TestPostProcessingP0Fixes:
     def test_frame_evidence_upgrade_reuses_compatible_visual_analysis(self, tmp_path):
         """仅帧证据版本升级时，不得重新支付全部视频语义理解成本。"""
         import json
-        from local_asset_pipeline import _load_reusable_window_analyses
+        from local_asset_pipeline import VISION_ANALYSIS_VERSION, _load_reusable_window_analyses
 
         signatures = [{"path": "/tmp/a.mp4", "sha256": "same", "size": 123}]
         old_index = tmp_path / "index.json"
         old_index.write_text(json.dumps({
             "index_version": 4,
+            "vision_analysis_version": VISION_ANALYSIS_VERSION,
             "build_complete": True,
             "sources": signatures,
             "windows": [{
@@ -5880,6 +6794,57 @@ class TestMaterialDrivenPostProduction:
         ]
         assert len(dialogue_lines) == 2
         assert all(",,0,0,422,," in line for line in dialogue_lines)
+
+    def test_fancy_subtitle_renderer_highlights_only_selected_words(self, tmp_path):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from video_merger import add_fancy_subtitles
+
+        source = tmp_path / "source.mp4"
+        source.write_bytes(b"video")
+        output = tmp_path / "output.mp4"
+        captured = {}
+
+        def capture_ass(_cmd, timeout=300):
+            ass_path = next(tmp_path.glob("*_fancy_subs.ass"))
+            captured["content"] = ass_path.read_text(encoding="utf-8")
+
+        probe = SimpleNamespace(returncode=0, stdout="1080\n1920\n2.0\n", stderr="")
+        with (
+            patch("video_merger.subprocess.run", return_value=probe),
+            patch("video_merger._has_audio_stream", return_value=False),
+            patch("video_merger.run_ffmpeg", side_effect=capture_ass),
+        ):
+            add_fancy_subtitles(
+                source,
+                [
+                    {"text": "普通说明", "start": 0.0, "end": 1.0, "animation": "fade", "fancy": False},
+                    {
+                        "text": "原料都来自生态优质种植区",
+                        "start": 1.0,
+                        "end": 2.0,
+                        "animation": "fade",
+                        "fancy": True,
+                        "highlight": ["生态优质种植区"],
+                    },
+                ],
+                output,
+                accent_color="#4ECDC4",
+            )
+
+        dialogue_lines = [
+            line for line in captured["content"].splitlines() if line.startswith("Dialogue:")
+        ]
+        assert ",Default," in dialogue_lines[0]
+        assert ",Default," in dialogue_lines[1]
+        assert "Style: Special" not in captured["content"]
+        highlight_style = next(
+            line for line in captured["content"].splitlines() if line.startswith("Style: Highlight,")
+        )
+        assert "&H00C4CD4E" in highlight_style
+        assert "原料都来自" in dialogue_lines[1]
+        assert "&H00FFFFFF" in dialogue_lines[1]
+        assert r"{\rHighlight}" + "生态优质种植区" in dialogue_lines[1]
 
     def test_visual_locked_sfx_is_not_moved_to_music_beat(self, tmp_path):
         from video_merger import align_sfx_to_beats
@@ -8433,6 +9398,7 @@ class TestGlobalMaterialDrivenScriptArchitecture:
             )
 
         assert script["voiceover_full"] == "这款茶咖加入真实茉莉花茶调和风味。"
+        assert script["segments"][0]["emphasis_terms"] == ["茉莉花茶"]
 
     def test_visual_roles_are_not_claimable_copy_evidence(self):
         from local_asset_pipeline import _global_material_capability_pool
@@ -8456,6 +9422,125 @@ class TestGlobalMaterialDrivenScriptArchitecture:
         assert all(
             anchor["kind"] != "material_capability"
             and not str(anchor["id"]).startswith("material_role:")
+            for anchor in pool["evidence_anchors"]
+        )
+
+    def test_verified_visual_relationship_entity_becomes_bounded_copy_evidence(self):
+        """产品标签与高置信视觉实体共同确认后，具体原料实体才可供脚本引用。"""
+        from local_asset_pipeline import (
+            _annotate_product_relationships,
+            _global_material_capability_pool,
+            _materialize_semantic_script_segments,
+        )
+
+        catalog = [
+            {
+                "window_id": "product-window",
+                "start": 0.0,
+                "end": 3.0,
+                "product_story_role": "finished_product",
+                "visible_text": ["清润饮", "茉莉"],
+                "visible_objects": ["瓶装清润饮"],
+                "visual_entity_candidates": [],
+                "relation_candidates": [],
+                "literal_actions": [],
+                "evidence": "瓶身正面清晰可见清润饮与茉莉文字",
+            },
+            {
+                "window_id": "jasmine-window",
+                "start": 0.0,
+                "end": 3.0,
+                "product_story_role": "context",
+                "setting": "室内",
+                "visual_entity_candidates": [{
+                    "entity": "茉莉花",
+                    "confidence": 0.91,
+                    "evidence": "跨帧可见白色花瓣、花冠和对应叶形",
+                }],
+                "visible_objects": ["盛开的白色花朵"],
+                "relation_candidates": [],
+                "literal_actions": [],
+                "visible_text": [],
+                "evidence": "画面连续可见白色花朵特写",
+            },
+        ]
+        product_info = {"name": "清润饮", "type": "食品"}
+
+        _annotate_product_relationships(catalog, product_info)
+        pool = _global_material_capability_pool(
+            catalog,
+            product_info,
+        )
+
+        relationship_anchor = next(
+            anchor
+            for anchor in pool["evidence_anchors"]
+            if anchor.get("evidence_source") == "verified_visual_relationship"
+        )
+        assert relationship_anchor["text"] == "茉莉花"
+        assert relationship_anchor["kind"] == "verified_fact"
+        assert relationship_anchor["usage_scope"] == "ingredient_identity"
+        segments = _materialize_semantic_script_segments(
+            {
+                "segments": [{
+                    "segment": 0,
+                    "cue": "采用茉莉花作为原料",
+                    "evidence_refs": [relationship_anchor["id"]],
+                    "claims": [],
+                }],
+            },
+            {"0": {
+                "segment": 0,
+                "marketing_intent": "value",
+                "product_story_role": "ingredient",
+                "visual_capability": {},
+            }},
+            pool,
+            product_info,
+        )
+        assert segments[0]["emphasis_terms"] == ["茉莉花"]
+
+    @pytest.mark.parametrize(
+        "material",
+        [
+            {
+                "product_relationship_verified": False,
+                "matched_product_entities": ["茉莉花"],
+                "visual_entity_candidates": [{"entity": "茉莉花", "confidence": 0.94}],
+            },
+            {
+                "product_relationship_verified": True,
+                "matched_product_entities": ["茉莉花"],
+                "visual_entity_candidates": [{"entity": "茉莉花", "confidence": 0.41}],
+            },
+            {
+                "product_relationship_verified": True,
+                "matched_product_entities": [],
+                "visual_entity_candidates": [],
+                "visible_objects": ["无法确定品种的白色花朵"],
+            },
+        ],
+    )
+    def test_uncertain_or_unverified_visual_material_is_not_copy_evidence(self, material):
+        """单侧证据、低置信实体和泛化花朵都不能升级为原料文案事实。"""
+        from local_asset_pipeline import _global_material_capability_pool
+
+        pool = _global_material_capability_pool(
+            [{
+                "window_id": "uncertain-window",
+                "start": 0.0,
+                "end": 3.0,
+                "product_story_role": "ingredient",
+                "matched_product_facts": [],
+                "literal_actions": [],
+                "visible_text": [],
+                **material,
+            }],
+            {"name": "清润饮", "type": "食品"},
+        )
+
+        assert all(
+            anchor.get("evidence_source") != "verified_visual_relationship"
             for anchor in pool["evidence_anchors"]
         )
 
@@ -9217,6 +10302,7 @@ class TestLocalMultiClipPlanning:
             "asset_window_ids": [],
             "voiceover": "成品瓶装随身带想喝随时喝。",
             "subtitle": "成品瓶装随身带想喝随时喝。",
+            "emphasis_terms": ["随身装"],
             "claims": [],
         }]}
         original_script = copy.deepcopy(script)
@@ -9240,6 +10326,10 @@ class TestLocalMultiClipPlanning:
             item["source_video"] for item in second["selected_segments"]
         ]
         assert sum(item["target_duration"] for item in second["selected_segments"]) == 3.0
+        assert all(
+            item["emphasis_terms"] == ["随身装"]
+            for item in second["selected_segments"]
+        )
 
     def test_global_planner_reserves_product_closure_footage_for_cta(self, tmp_path):
         from local_asset_pipeline import plan_and_materialize_local_clips

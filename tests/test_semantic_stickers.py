@@ -320,7 +320,7 @@ def test_sticker_timing_is_readability_driven_and_cannot_cross_the_shot_boundary
         },
         {"ingredients": ["茉莉花茶"]},
         "ingredient",
-        "茉莉花茶原料",
+        "茉莉花原料",
     ),
     (
         {
@@ -367,6 +367,10 @@ def test_supported_sticker_types_are_grounded_in_script_or_verified_facts(
         selected_segments=[{
             "semantic_segment": 0,
             "product_story_role": segment["product_story_role"],
+            "analysis": {
+                "matched_product_entities": ["茉莉花"]
+                if segment["product_story_role"] == "ingredient" else [],
+            },
         }],
         product_info=product_info,
         requested_mode="on",
@@ -376,6 +380,32 @@ def test_supported_sticker_types_are_grounded_in_script_or_verified_facts(
         expected_kind,
         expected_text,
     )
+
+
+def test_local_ingredient_sticker_without_a_visual_entity_uses_generic_copy():
+    plan = build_semantic_sticker_plan(
+        ad_script={"segments": [{
+            "segment": 0,
+            "product_story_role": "ingredient",
+            "subtitle": "茉莉花茶原料清晰可见。",
+            "visual_query": ["白色花类物料"],
+        }]},
+        subtitles=[{
+            "segment": 0,
+            "text": "茉莉花茶原料清晰可见",
+            "start": 0.4,
+            "end": 2.4,
+        }],
+        selected_segments=[{
+            "semantic_segment": 0,
+            "product_story_role": "ingredient",
+            "analysis": {"matched_product_entities": []},
+        }],
+        product_info={"ingredients": ["茉莉花茶"]},
+        requested_mode="on",
+    )
+
+    assert plan["items"][0]["text"] == "原料实拍"
 
 
 def test_sticker_density_scales_with_video_duration_and_never_exceeds_five():

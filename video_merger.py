@@ -337,6 +337,100 @@ def choose_subtitle_animation(narrative: str, has_voiceover: bool = False) -> st
     return "fade"
 
 
+def _semantic_highlight_terms(subtitle: Dict[str, Any]) -> List[str]:
+    """Use concrete evidence values; semantic category words never become highlights."""
+    text = str(subtitle.get("text") or "").strip()
+    topic = str(subtitle.get("emphasis_topic") or "").strip().lower()
+    generic_by_topic = {
+        "origin": (
+            "生态", "优质", "天然", "高山", "山地", "核心", "源头",
+            "种植区", "种植园", "产区", "产地", "基地", "农场", "果园", "花园", "茶园", "花田",
+        ),
+        "ingredient": ("天然", "生态", "优质", "精选", "核心", "原料", "配料", "成分"),
+        "craft": ("先进", "传统", "核心", "工艺", "制作", "处理"),
+        "production": ("先进", "传统", "核心", "工艺", "制作", "处理"),
+    }
+    ingredient_form_suffixes = (
+        "提取物", "浓缩液", "植株", "花朵", "种子", "原浆",
+        "花", "茶", "豆", "果", "叶", "籽", "根", "茎", "粉", "汁", "油", "蜜", "奶",
+    )
+    feature_suffixes = ("香气", "香味", "风味", "气味", "口感", "色泽", "质感")
+    for candidate in dict.fromkeys(
+        str(value).strip()
+        for value in subtitle.get("emphasis_terms") or []
+        if str(value).strip()
+    ):
+        remainder = candidate
+        for generic in generic_by_topic.get(topic, ()):
+            remainder = remainder.replace(generic, "")
+        remainder = re.sub(r"(?:这款|产品|真实|实拍|来自|源自|产自)", "", remainder)
+        concrete = "".join(re.findall(r"[\u4e00-\u9fffA-Za-z0-9%]+", remainder))
+        if candidate in text and 2 <= len(candidate) <= 10 and len(concrete) >= 2:
+            return [candidate]
+        if topic != "ingredient" or len(concrete) < 3:
+            continue
+        for form_suffix in ingredient_form_suffixes:
+            if not concrete.endswith(form_suffix):
+                continue
+            spoken_entity = concrete[:-len(form_suffix)]
+            if len(spoken_entity) < 2:
+                continue
+            match = re.search(
+                rf"{re.escape(spoken_entity)}(?:{'|'.join(feature_suffixes)})?",
+                text,
+            )
+            if match and 2 <= len(match.group(0)) <= 10:
+                return [match.group(0)]
+    return []
+
+
+def select_fancy_subtitles(subtitles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Select at most one semantically eligible fancy cue per script segment."""
+    selected = [dict(subtitle) for subtitle in subtitles]
+    eligible_by_segment: Dict[int, List[Tuple[int, Dict[str, Any]]]] = {}
+    for index, subtitle in enumerate(selected):
+        subtitle["fancy"] = False
+        if not subtitle.get("emphasis"):
+            subtitle["animation"] = "fade"
+            continue
+        subtitle["highlight"] = _semantic_highlight_terms(subtitle)
+        if not subtitle["highlight"]:
+            subtitle["animation"] = "fade"
+            continue
+        segment = int(subtitle.get("segment", index))
+        eligible_by_segment.setdefault(segment, []).append((index, subtitle))
+
+    for candidates in eligible_by_segment.values():
+        def _priority(candidate: Tuple[int, Dict[str, Any]]) -> Tuple[float, int]:
+            index, subtitle = candidate
+            text = str(subtitle.get("text") or "")
+            kind = str(subtitle.get("emphasis_kind") or "")
+            topic = str(subtitle.get("emphasis_topic") or "")
+            topic_terms = {
+                "origin": ("产地", "原产", "来自", "种植", "高山", "地区", "源头"),
+                "ingredient": ("成分", "配料", "原料", "选用", "含有"),
+                "craft": ("工艺", "烘焙", "烘培", "发酵", "萃取", "制作", "处理"),
+                "production": ("工艺", "烘焙", "烘培", "发酵", "萃取", "制作", "处理"),
+            }
+            score = min(_subtitle_units(text), 11.0) / 11.0
+            score += 3.0 * len(subtitle.get("highlight") or [])
+            score += 2.0 if re.search(r"\d", text) else 0.0
+            score += 2.0 if kind == "hook" and text.endswith(("吗", "呢", "么", "?", "？")) else 0.0
+            score += 4.0 if any(term in text for term in topic_terms.get(topic, ())) else 0.0
+            score += 4.0 if kind == "cta" and any(
+                term in text for term in ("点", "了解", "购买", "下单", "领取", "入手", "看看", "试试")
+            ) else 0.0
+            tie_break = index if kind in {"hook", "cta"} else -index
+            return score, tie_break
+
+        winner_index, winner = max(candidates, key=_priority)
+        winner["fancy"] = True
+        for index, subtitle in candidates:
+            if index != winner_index:
+                subtitle["animation"] = "fade"
+    return selected
+
+
 # ============================================================
 # 转场库（15 种常用 xfade 转场）
 # ============================================================
@@ -2764,7 +2858,7 @@ def add_fancy_subtitles(
     # 字号按视频宽度自适应（基准：1080 宽 -> font_size）
     scale = video_w / 1080.0
     actual_font_size = int(font_size * scale)
-    highlight_size = int(actual_font_size * 1.3)  # 高亮字放大 30%
+    highlight_size = max(actual_font_size + 1, round(actual_font_size * 1.12))
 
     # 长文本自动缩小字号，避免单行超出安全宽度
     # 必须用实际渲染的 margin_lr 来算安全宽度，否则字号算大了会超出
@@ -2782,7 +2876,7 @@ def add_fancy_subtitles(
         new_size = max(new_size, int(actual_font_size * 0.5))  # 最多缩小 50%（长文本宁小勿超）
         print(f"  📏 长文本自适应字号：{actual_font_size} → {new_size}（最长 {max_line_len:.0f} 字）")
         actual_font_size = new_size
-        highlight_size = int(actual_font_size * 1.3)
+        highlight_size = max(actual_font_size + 1, round(actual_font_size * 1.12))
 
     # 构建 ASS 字幕文件（使用 output stem 命名，避免多版本并行时文件冲突）
     ass_path = output.parent / f"{output.stem}_fancy_subs.ass"
@@ -2816,14 +2910,24 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         centisecs = int((seconds % 1) * 100)
         return f"{hours}:{minutes:02d}:{secs:02d}.{centisecs:02d}"
 
+    def _inject_highlights(raw: str, words: List[str], restore_color: str) -> str:
+        result = raw
+        for word in sorted(dict.fromkeys(words), key=len, reverse=True):
+            if word and word in result:
+                tagged = f"{{\\rHighlight}}{word}{{\\rDefault}}{restore_color}"
+                result = result.replace(word, tagged, 1)
+        return result
+
     ass_lines = []
     for idx, sub in enumerate(subtitles, 1):
         start = sub.get("start", 0)
         end = sub.get("end", start + 2)
         text = sub.get("text", "")
-        highlight_words = sub.get("highlight", [])
         duration = max(end - start, 0.1)
         item_margin_v = margin_v
+        is_fancy = bool(sub.get("fancy"))
+        highlight_words = list(sub.get("highlight") or []) if is_fancy else []
+        base_style = "Default"
 
         if "\n" in text or "\\N" in text or _subtitle_units(text) * actual_font_size > safe_text_width:
             raise ValueError(
@@ -2833,7 +2937,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         start_str = _format_ass_time(start)
         end_str = _format_ass_time(end)
-        item_color = str(sub.get("color") or primary_color)
+        item_color = "#FFFFFF" if is_fancy else str(sub.get("color") or primary_color)
         if not re.fullmatch(r"#[0-9A-Fa-f]{6}", item_color):
             item_color = "#FFFFFF"
         color_tag = f"{{\\c{_hex_to_ass_color(item_color, '00')}}}"
@@ -2851,17 +2955,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             hold_duration = duration - type_duration
             char_delay = type_duration / max(len(chars), 1)
 
-            # P0 修复：保持阶段的全文本需先注入高亮标签，再逐字打出
-            def _inject_highlight(raw: str, hw_list: list) -> str:
-                """对原始文本注入 ASS 高亮样式标签"""
-                result = raw
-                for hw in hw_list:
-                    if hw and hw in result:
-                        tagged = f"{{\\rHighlight}}{hw}{{\\r}}"
-                        result = result.replace(hw, tagged, 1)
-                return result
-
-            full_with_hl = _inject_highlight("".join(chars), highlight_words)
+            full_with_hl = _inject_highlights("".join(chars), highlight_words, color_tag)
             # 打字阶段：逐字出现（不含高亮标签，避免标签字符被逐字切开）
             for i in range(1, len(chars) + 1):
                 char_start = start + (i - 1) * char_delay
@@ -2872,7 +2966,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 cs = _format_ass_time(char_start)
                 ce = _format_ass_time(char_end)
                 ass_lines.append(
-                    f"Dialogue: 0,{cs},{ce},Default,,0,0,{item_margin_v},,{color_tag}{partial_text}"
+                    f"Dialogue: 0,{cs},{ce},{base_style},,0,0,{item_margin_v},,{color_tag}{partial_text}"
                 )
 
             # 保持阶段：全部显示（含高亮）直到结束
@@ -2880,7 +2974,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 hold_start = start + type_duration
                 hs = _format_ass_time(hold_start)
                 ass_lines.append(
-                    f"Dialogue: 0,{hs},{end_str},Default,,0,0,{item_margin_v},,{color_tag}{full_with_hl}"
+                    f"Dialogue: 0,{hs},{end_str},{base_style},,0,0,{item_margin_v},,{color_tag}{full_with_hl}"
                 )
 
         elif item_animation == "pop":
@@ -2890,13 +2984,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 f"{{\\an2\\fscx1\\fscy1\\t(0,150,\\fscx120\\fscy120)\\t(150,250,\\fscx100\\fscy100)}}"
             )
             _t = text.replace(chr(10), "\\N")
-            # 注入高亮标签
-            for hw in highlight_words:
-                if hw and hw in _t:
-                    _t = _t.replace(hw, f"{{\\rHighlight\\fscx130\\fscy130}}{hw}{{\\r}}", 1)
+            _t = _inject_highlights(_t, highlight_words, color_tag)
             display_text = f"{anim_tag}{color_tag}{_t}"
             ass_lines.append(
-                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,{item_margin_v},,{display_text}"
+                f"Dialogue: 0,{start_str},{end_str},{base_style},,0,0,{item_margin_v},,{display_text}"
             )
 
         elif item_animation == "slide":
@@ -2908,9 +2999,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 f"\\alpha&HFF&\\t(0,300,\\alpha&H00&)}}"
             )
             _t = text.replace(chr(10), "\\N")
+            _t = _inject_highlights(_t, highlight_words, color_tag)
             display_text = f"{anim_tag}{color_tag}{_t}"
             ass_lines.append(
-                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,{item_margin_v},,{display_text}"
+                f"Dialogue: 0,{start_str},{end_str},{base_style},,0,0,{item_margin_v},,{display_text}"
             )
 
         elif item_animation == "fade":
@@ -2921,27 +3013,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 f"\\t({int((duration-fade_out)*1000)},{int(duration*1000)},\\alpha&HFF&)}}"
             )
             _t = text.replace(chr(10), "\\N")
+            _t = _inject_highlights(_t, highlight_words, color_tag)
             display_text = f"{anim_tag}{color_tag}{_t}"
             ass_lines.append(
-                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,{item_margin_v},,{display_text}"
+                f"Dialogue: 0,{start_str},{end_str},{base_style},,0,0,{item_margin_v},,{display_text}"
             )
 
         elif item_animation == "highlight":
-            display_text = text
-            for hw in highlight_words:
-                if hw in display_text:
-                    tagged = f"{{\\rHighlight\\fscx130\\fscy130}}{hw}{{\\r}}"
-                    display_text = display_text.replace(hw, tagged)
+            display_text = _inject_highlights(text, highlight_words, color_tag)
             _t = display_text.replace(chr(10), "\\N")
             display_text = f"{{\\alpha&HFF&\\t(0,200,\\alpha&H00&)}}{color_tag}{_t}"
             ass_lines.append(
-                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,{item_margin_v},,{display_text}"
+                f"Dialogue: 0,{start_str},{end_str},{base_style},,0,0,{item_margin_v},,{display_text}"
             )
 
         else:
-            display_text = color_tag + text.replace(chr(10), "\\N")
+            display_text = color_tag + _inject_highlights(
+                text.replace(chr(10), "\\N"), highlight_words, color_tag,
+            )
             ass_lines.append(
-                f"Dialogue: 0,{start_str},{end_str},Default,,0,0,{item_margin_v},,{display_text}"
+                f"Dialogue: 0,{start_str},{end_str},{base_style},,0,0,{item_margin_v},,{display_text}"
             )
 
     ass_content = ass_header + "\n".join(ass_lines) + "\n"

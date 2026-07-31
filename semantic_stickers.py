@@ -86,10 +86,19 @@ def _sticker_text(
     product_info: Dict[str, Any],
     *,
     material_verified: bool,
+    material_entities: Optional[List[str]] = None,
 ) -> str:
     if kind == "origin":
         return "产地实拍" if material_verified else str(product_info.get("origin") or "")[:MAX_STICKER_TEXT_LENGTH]
     if kind == "ingredient":
+        if material_verified:
+            entity = next(
+                (str(value).strip() for value in material_entities or [] if str(value).strip()),
+                "",
+            )
+            if not entity:
+                return "原料实拍"
+            return (entity if "原料" in entity else f"{entity}原料")[:MAX_STICKER_TEXT_LENGTH]
         ingredients = product_info.get("ingredients") or []
         source_text = " ".join([
             str(segment.get("subtitle") or ""),
@@ -212,6 +221,17 @@ def build_semantic_sticker_plan(
         (int(item.get("semantic_segment", item.get("segment", -1))), str(item.get("product_story_role") or ""))
         for item in selected_segments or []
     }
+    selected_entities: Dict[tuple[int, str], List[str]] = {}
+    for item in selected_segments or []:
+        key = (
+            int(item.get("semantic_segment", item.get("segment", -1))),
+            str(item.get("product_story_role") or ""),
+        )
+        analysis = item.get("analysis") or {}
+        for value in item.get("matched_product_entities") or analysis.get("matched_product_entities") or []:
+            entity = str(value).strip()
+            if entity and entity not in selected_entities.setdefault(key, []):
+                selected_entities[key].append(entity)
     timeline_by_segment = {
         int(item.get("index", item.get("segment", -1))): item
         for item in segment_timeline or []
@@ -299,6 +319,7 @@ def build_semantic_sticker_plan(
                 segment,
                 product,
                 material_verified=selected_segments is not None,
+                material_entities=selected_entities.get((segment_index, role), []),
             ),
         )[:MAX_STICKER_TEXT_LENGTH]
         if not text:

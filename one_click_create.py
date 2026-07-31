@@ -128,6 +128,7 @@ from video_merger import (
     prepare_single_line_subtitles,
     assign_intelligent_subtitle_colors,
     choose_subtitle_animation,
+    select_fancy_subtitles,
     add_bgm_ffmpeg,
     add_sfx_to_video,
     generate_sfx_timings,
@@ -7778,11 +7779,19 @@ def run_generation_pipeline(
             subtitle_contract.get("animation")
             or choose_subtitle_animation(narrative, has_voiceover=voiceover_enabled)
         )
+        subtitle["emphasis"] = bool(subtitle_contract.get("emphasis"))
+        subtitle["emphasis_kind"] = str(subtitle_contract.get("emphasis_kind") or "normal")
+        subtitle["emphasis_topic"] = str(subtitle_contract.get("emphasis_topic") or "")
+        subtitle["emphasis_terms"] = list(subtitle_contract.get("emphasis_terms") or [])
+    subtitles = select_fancy_subtitles(subtitles)
     if postproduction_contract:
         postproduction_contract["subtitles"] = [
             {
                 key: subtitle.get(key)
-                for key in ("segment", "text", "start", "end", "color", "animation")
+                for key in (
+                    "segment", "text", "start", "end", "color", "animation",
+                    "emphasis", "emphasis_kind", "emphasis_topic", "fancy",
+                )
             }
             for subtitle in subtitles
         ]

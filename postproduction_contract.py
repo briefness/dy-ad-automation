@@ -7,7 +7,22 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
-POSTPRODUCTION_CONTRACT_VERSION = 4
+POSTPRODUCTION_CONTRACT_VERSION = 5
+
+
+def _subtitle_emphasis(narrative: str, product_story_role: str) -> str:
+    normalized = str(narrative or "").lower()
+    role = str(product_story_role or "").lower()
+    if role in {"origin", "ingredient", "craft", "production"}:
+        return "product_fact"
+    if role in {"selling_point", "benefit", "feature", "proof", "result"}:
+        return "selling_point"
+    if any(
+        token in normalized
+        for token in ("selling_point", "benefit", "feature", "proof", "result", "comparison", "value")
+    ):
+        return "selling_point"
+    return "normal"
 
 
 def _subtitle_animation(narrative: str, motion_class: str) -> str:
@@ -25,6 +40,20 @@ def _subtitle_animation(narrative: str, motion_class: str) -> str:
     return "fade"
 
 
+def _evidence_emphasis_terms(selected: Dict[str, Any]) -> List[str]:
+    analysis = selected.get("analysis") or {}
+    values = [
+        *(analysis.get("matched_product_entities") or []),
+        *(selected.get("emphasis_terms") or []),
+        *(analysis.get("matched_product_facts") or []),
+    ]
+    return list(dict.fromkeys(
+        str(value).strip()
+        for value in values
+        if 2 <= len(str(value).strip()) <= 10
+    ))
+
+
 def _semantic_subtitle_contracts(
     segment_contracts: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -35,10 +64,42 @@ def _semantic_subtitle_contracts(
     contracts = []
     for semantic_segment, edits in grouped.items():
         animations = [str((edit.get("subtitle") or {}).get("animation") or "fade") for edit in edits]
+        emphasized = [
+            edit.get("subtitle") or {}
+            for edit in edits
+            if (edit.get("subtitle") or {}).get("emphasis")
+        ]
+        emphasis_kinds = {
+            str(subtitle.get("emphasis_kind") or "normal")
+            for subtitle in emphasized
+        }
+        emphasis_topics = {
+            str(subtitle.get("emphasis_topic") or "")
+            for subtitle in emphasized
+        }
+        emphasis_terms = list(dict.fromkeys(
+            str(term).strip()
+            for subtitle in emphasized
+            for term in subtitle.get("emphasis_terms") or []
+            if str(term).strip()
+        ))
+        emphasis_kinds.discard("normal")
+        emphasis_topics.discard("")
+        emphasis_kind = (
+            "normal"
+            if not emphasis_kinds
+            else next(iter(emphasis_kinds))
+            if len(emphasis_kinds) == 1
+            else "semantic_priority"
+        )
         contracts.append({
             "semantic_segment": semantic_segment,
             "edit_indices": [int(edit["edit_index"]) for edit in edits],
             "animation": animations[0] if len(set(animations)) == 1 else "fade",
+            "emphasis": bool(emphasis_kinds),
+            "emphasis_kind": emphasis_kind,
+            "emphasis_topic": next(iter(emphasis_topics)) if len(emphasis_topics) == 1 else "",
+            "emphasis_terms": emphasis_terms,
             "placement_policy": "platform_fixed_bottom_safe_area",
         })
     return contracts
@@ -57,6 +118,9 @@ def build_local_postproduction_contract(
         motion_class = str(motion.get("motion_class") or "static")
         narrative = str(selected.get("narrative") or "showcase")
         frame_quality = selected.get("frame_quality") or {}
+        emphasis_kind = _subtitle_emphasis(narrative, selected.get("product_story_role") or "unknown")
+        emphasis_terms = _evidence_emphasis_terms(selected)
+        emphasis_enabled = emphasis_kind != "normal" and bool(emphasis_terms)
         semantic_segment = int(
             selected.get("semantic_segment", selected.get("script_segment", len(segment_contracts)))
         )
@@ -78,6 +142,14 @@ def build_local_postproduction_contract(
             },
             "subtitle": {
                 "animation": _subtitle_animation(narrative, motion_class),
+                "emphasis": emphasis_enabled,
+                "emphasis_kind": emphasis_kind if emphasis_enabled else "normal",
+                "emphasis_topic": (
+                    str(selected.get("product_story_role") or "").lower()
+                    if emphasis_enabled and emphasis_kind == "product_fact"
+                    else ""
+                ),
+                "emphasis_terms": emphasis_terms if emphasis_enabled else [],
             },
             "color": {
                 "policy": "preserve_source",

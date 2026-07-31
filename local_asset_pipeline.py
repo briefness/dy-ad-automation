@@ -59,7 +59,7 @@ from config import (
 
 
 INDEX_VERSION = 6
-VISION_ANALYSIS_VERSION = 1
+VISION_ANALYSIS_VERSION = 2
 REFERENCE_PROFILE_VERSION = 5
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 MIN_MATCH_SCORE = 0.70
@@ -69,7 +69,7 @@ SCENE_CHANGE_THRESHOLD = 0.28
 MIN_SCENE_SECONDS = 1.0
 MOTION_SAMPLE_FRAMES = 12
 MAX_INITIAL_SCRIPT_JSON_ATTEMPTS = 3
-SCRIPT_CONTRACT_VERSION = 50
+SCRIPT_CONTRACT_VERSION = 52
 MIN_VOICEOVER_UNITS_PER_SECOND = 4.2
 MIN_OUTRO_VOICEOVER_UNITS_PER_SECOND = 4.4
 MAX_OUTRO_VOICEOVER_UNITS_PER_SECOND = 5.4
@@ -90,6 +90,12 @@ PRODUCT_STORY_ROLES = {
     "finished_product", "ingredient", "origin", "production",
     "usage", "result", "context", "unknown",
 }
+CULTIVATION_SCENE = re.compile(
+    r"种植(?:园|基地|区|场)?|栽培|培育|农场|庄园|果园|花园|茶园|花田|"
+    r"农田|田野|田间|苗圃|山地|山坡|山野|plantation|orchard|farm|garden|field|grove",
+    re.IGNORECASE,
+)
+MIN_VISUAL_ENTITY_CONFIDENCE = 0.75
 MARKETING_INTENTS = {"hook", "value", "proof", "cta"}
 GENERIC_SALES_COPY = re.compile(r"^(?:这款|这杯|这瓶)?[^，。！？]{0,8}(?:值得细看|一起来看|来看看|看过来)[！!。]?$" )
 CLAIM_FACT_PATHS = {
@@ -639,6 +645,23 @@ def _json_from_text(text: str) -> Dict[str, Any]:
     return json.loads(cleaned)
 
 
+def _repair_cached_utf8(value: Any) -> Any:
+    """Repair legacy Latin-1-decoded UTF-8 strings without mutating cached data."""
+    if isinstance(value, dict):
+        return {key: _repair_cached_utf8(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_repair_cached_utf8(item) for item in value]
+    if not isinstance(value, str):
+        return value
+    try:
+        repaired = value.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
+    original_cjk = len(re.findall(r"[\u4e00-\u9fff]", value))
+    repaired_cjk = len(re.findall(r"[\u4e00-\u9fff]", repaired))
+    return repaired if repaired_cjk > original_cjk else value
+
+
 def _streamed_chat_json(response: requests.Response) -> Dict[str, Any]:
     """Collect one Chat Completions SSE response and decode its JSON content."""
     content_parts: List[str] = []
@@ -676,7 +699,7 @@ def _streamed_chat_json(response: requests.Response) -> Dict[str, Any]:
         return False
 
     done = False
-    for raw_line in response.iter_lines(decode_unicode=True):
+    for raw_line in response.iter_lines(decode_unicode=False):
         line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else str(raw_line or "")
         if not line.strip() or line.startswith(":"):
             continue
@@ -790,6 +813,7 @@ def _claim_supported(
             (analysis or {}).get("product_relationship_verified")
             and _text_matches_facts(claim_text, [
                 *(str(value) for value in (analysis or {}).get("matched_product_facts") or []),
+                *(str(value) for value in (analysis or {}).get("matched_product_entities") or []),
                 str((analysis or {}).get("relation_evidence") or ""),
             ])
         )
@@ -800,6 +824,16 @@ def _claim_supported(
         prefix = "product_info."
         if not evidence_source.startswith(prefix) or evidence_source[len(prefix):] not in allowed_paths:
             return False
+    if (
+        not evidence_source
+        and claim_type == "ingredient"
+        and (analysis or {}).get("product_relationship_verified")
+        and _text_matches_facts(
+            claim_text,
+            [str(value) for value in (analysis or {}).get("matched_product_entities") or []],
+        )
+    ):
+        return True
     facts = _fact_values(product_info, allowed_paths)
     if claim_type == "effect":
         terms = _infer_effect_terms(claim_text)
@@ -928,17 +962,22 @@ def _apply_product_relationships_to_windows(
     product_info: Dict[str, Any],
 ) -> None:
     """Attach the current product's verified relationships to indexed window evidence."""
-    catalog = _material_catalog(asset_index)
+    catalog = _material_catalog(asset_index, include_unusable=True)
     _annotate_product_relationships(catalog, product_info)
     relationships = {str(item.get("window_id")): item for item in catalog}
     fields = (
+        "product_story_role",
+        "relation_candidates",
         "product_relevance_prior",
         "product_relevance_source",
         "product_identity_supported",
         "product_identity_evidence",
         "product_relationship_verified",
         "product_relationship_source",
+        "product_relationship_confidence",
+        "product_relationship_evidence",
         "matched_product_facts",
+        "matched_product_entities",
     )
     for window in asset_index.get("windows") or []:
         relationship = relationships.get(str(window.get("window_id")))
@@ -1419,6 +1458,7 @@ Return this exact JSON shape:
   "literal_actions": ["画面中直接可见的动作，使用中文"],
   "temporal_events": [{{"start": 0.0, "end": 0.0, "action": "按时间顺序描述直接可见动作"}}],
   "visible_objects": ["画面中直接可见的对象，使用中文"],
+  "visual_entity_candidates": [{{"entity": "可由形态识别的具体植物、花、果实、谷物或原料实体", "confidence": 0.0, "evidence": "支持该实体候选的跨帧形态特征"}}],
   "object_tracks": [{{"object": "对象", "visible_frame_count": 0, "first_seen": 0.0, "last_seen": 0.0}}],
   "visible_text": [{{"text": "可辨认的画面文字", "visible_frame_count": 0, "first_seen": 0.0, "last_seen": 0.0}}],
   "product_story_role": "finished_product|ingredient|origin|production|usage|result|context|unknown",
@@ -1443,7 +1483,9 @@ Rules:
 - confidence and relation_confidence are 0-1.
 - product_story_role describes what the footage itself depicts, not an asserted relationship to the advertised product.
 - 不要只按关键词字面匹配；应根据连续画面中可辨认的对象、环境和动作做有证据约束的语义归类。
-- 可辨认的茶园、茶山、咖啡种植园、果园或其他种植场景应归类为 origin；这只表示素材的商品叙事角色，不得据此断言它就是当前产品的产地，也不得猜测具体地名。
+- 遇到植物、花、果实、种子、叶片、豆类或其他天然原料时，应根据花型、叶形、果实、枝条、生长形态及跨帧一致性给出尽可能具体的 visual_entity_candidates；无法从形态区分时保留多个候选并降低 confidence，不得强猜。
+- visual_entity_candidates 只能来自画面形态，不得依据文件名、产品资料、标签文案或口播迎合某个原料答案；每个候选必须写出直接可见的形态 evidence。
+- 可辨认的成片种植、栽培园区、农场、果园、花田或山地培育环境应归类为 origin；这只表示素材的商品叙事角色，不得据此断言它就是当前产品的产地，也不得猜测具体地名。
 - Loose leaves, flowers, fruit, beans or other materials may be ingredient footage, but never infer that the product uses them.
 - A filename is metadata only and cannot prove an ingredient, origin or production relationship.
 - Use unknown/none when not visually supported.
@@ -1862,6 +1904,22 @@ def _normalize_analysis(raw: Dict[str, Any]) -> Dict[str, Any]:
             "first_seen": round(first_seen, 3),
             "last_seen": round(max(first_seen, last_seen), 3),
         })
+    visual_entity_candidates = []
+    for candidate in raw.get("visual_entity_candidates") or []:
+        if not isinstance(candidate, dict) or not str(candidate.get("entity") or "").strip():
+            continue
+        try:
+            candidate_confidence = max(
+                0.0,
+                min(1.0, float(candidate.get("confidence", 0.0))),
+            )
+        except (TypeError, ValueError):
+            candidate_confidence = 0.0
+        visual_entity_candidates.append({
+            "entity": str(candidate["entity"]).strip(),
+            "confidence": candidate_confidence,
+            "evidence": str(candidate.get("evidence") or "").strip(),
+        })
     temporal_events = raw.get("temporal_events") or []
     normalized_events = []
     for event in temporal_events if isinstance(temporal_events, list) else []:
@@ -1911,6 +1969,7 @@ def _normalize_analysis(raw: Dict[str, Any]) -> Dict[str, Any]:
         "literal_actions": [str(value) for value in literal_actions],
         "temporal_events": normalized_events,
         "visible_objects": [str(value) for value in visible_objects],
+        "visual_entity_candidates": visual_entity_candidates,
         "object_tracks": object_tracks,
         "visible_text": normalized_text,
         "product_story_role": story_role,
@@ -2428,10 +2487,14 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
     evidence_report_path = ctx.cache_dir / "frame_evidence_report.html"
     if ctx.index_path.exists():
         try:
-            cached = json.loads(ctx.index_path.read_text(encoding="utf-8"))
+            cached = _repair_cached_utf8(
+                json.loads(ctx.index_path.read_text(encoding="utf-8"))
+            )
             if (
                 cached.get("index_version") == INDEX_VERSION
                 and cached.get("build_complete") is True
+                and int(cached.get("vision_analysis_version") or 1)
+                == VISION_ANALYSIS_VERSION
                 and cached.get("frame_evidence_version") == FRAME_EVIDENCE_VERSION
                 and cached.get("audio_understanding_signature") == audio_backend_signature
                 and _signatures_match(cached.get("sources", []), signatures)
@@ -2681,14 +2744,19 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
     return index
 
 
-def _material_catalog(asset_index: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _material_catalog(
+    asset_index: Optional[Dict[str, Any]],
+    include_unusable: bool = False,
+) -> List[Dict[str, Any]]:
     catalog = []
     for window in (asset_index or {}).get("windows") or []:
         analysis = window.get("analysis") or {}
-        if not analysis.get("usable_for_ad"):
+        usable_for_ad = bool(analysis.get("usable_for_ad"))
+        if not usable_for_ad and not include_unusable:
             continue
         catalog.append({
             "window_id": window.get("window_id"),
+            "usable_for_ad": usable_for_ad,
             "product_relevance_prior": "high",
             "product_relevance_source": "curated_local_asset_folder",
             "source_video": window.get("source_video"),
@@ -2703,6 +2771,7 @@ def _material_catalog(asset_index: Optional[Dict[str, Any]]) -> List[Dict[str, A
             "literal_actions": analysis.get("literal_actions") or [],
             "temporal_events": analysis.get("temporal_events") or [],
             "visible_objects": analysis.get("visible_objects") or [],
+            "visual_entity_candidates": analysis.get("visual_entity_candidates") or [],
             "object_tracks": analysis.get("object_tracks") or [],
             "visible_text": analysis.get("visible_text") or [],
             "product_story_role": analysis.get("product_story_role") or "unknown",
@@ -2746,8 +2815,184 @@ def _material_catalog(asset_index: Optional[Dict[str, Any]]) -> List[Dict[str, A
     return catalog
 
 
+def _confident_visual_entity_names(item: Dict[str, Any]) -> List[str]:
+    names = []
+    for candidate in item.get("visual_entity_candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            confidence = float(candidate.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        name = str(candidate.get("entity") or "").strip()
+        if name and confidence >= MIN_VISUAL_ENTITY_CONFIDENCE:
+            names.append(name)
+    return list(dict.fromkeys(names))
+
+
+def _visual_relation_entities(item: Dict[str, Any]) -> List[str]:
+    entities = [
+        *_confident_visual_entity_names(item),
+        *(str(value) for value in item.get("relation_candidates") or []),
+        *(str(value) for value in item.get("visible_objects") or []),
+        *(
+            str(track.get("object") or "")
+            for track in item.get("object_tracks") or []
+            if isinstance(track, dict)
+        ),
+    ]
+    return list(dict.fromkeys(entity.strip() for entity in entities if entity.strip()))
+
+
+def _matching_visual_entity(entities: List[str], anchors: List[str]) -> str:
+    def entity_matches(entity: str, anchor: str) -> bool:
+        if _text_matches_facts(entity, [anchor]):
+            return True
+        normalized_entity = "".join(re.findall(r"[\u4e00-\u9fff]", entity))
+        normalized_anchor = "".join(re.findall(r"[\u4e00-\u9fff]", anchor))
+        return any(
+            normalized_anchor[index:index + 3] in normalized_entity
+            for index in range(max(0, len(normalized_anchor) - 2))
+        )
+
+    return next(
+        (
+            entity
+            for entity in entities
+            if any(entity_matches(entity, anchor) for anchor in anchors)
+        ),
+        "",
+    )
+
+
+def _product_label_anchors(
+    catalog: List[Dict[str, Any]],
+    product_name: str,
+) -> List[str]:
+    anchors: List[str] = []
+    for item in catalog:
+        if (
+            str(item.get("product_story_role") or "unknown") != "finished_product"
+            or not item.get("product_identity_supported")
+        ):
+            continue
+        for value in item.get("visible_text") or []:
+            anchor = str(value).replace(product_name, "").strip(" \t|｜·,，。:：;；-_")
+            if len(re.sub(r"\s+", "", anchor)) >= 2:
+                anchors.append(anchor)
+    return list(dict.fromkeys(anchors))
+
+
+def _curated_cross_source_entity_consensus(
+    catalog: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Find concrete entities repeated across independent curated sources."""
+    if not any(
+        str(item.get("product_story_role") or "") == "finished_product"
+        and item.get("product_identity_supported")
+        for item in catalog
+    ):
+        return []
+
+    groups: List[Dict[str, Any]] = []
+    for item in catalog:
+        role = str(item.get("product_story_role") or "unknown")
+        if (
+            role not in {"context", "ingredient", "origin", "production"}
+            or item.get("product_relevance_source") != "curated_local_asset_folder"
+            or str(item.get("product_relevance_prior") or "").lower() != "high"
+        ):
+            continue
+        source = str(item.get("source_path") or item.get("source_video") or "").strip()
+        if not source:
+            continue
+        for candidate in item.get("visual_entity_candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            entity = str(candidate.get("entity") or "").strip()
+            try:
+                confidence = float(candidate.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if len(entity) < 2 or confidence < 0.65:
+                continue
+            group = next(
+                (
+                    existing
+                    for existing in groups
+                    if _text_matches_facts(entity, existing["entities"])
+                    or _matching_visual_entity([entity], existing["entities"])
+                ),
+                None,
+            )
+            if group is None:
+                group = {"entities": [], "observations": [], "sources": set()}
+                groups.append(group)
+            if entity not in group["entities"]:
+                group["entities"].append(entity)
+            group["observations"].append({
+                "entity": entity,
+                "confidence": confidence,
+                "role": role,
+                "source": source,
+            })
+            group["sources"].add(source)
+
+    consensus = []
+    for group in groups:
+        observations = group["observations"]
+        max_confidence = max(
+            (float(item["confidence"]) for item in observations),
+            default=0.0,
+        )
+        if len(group["sources"]) < 2 or max_confidence < MIN_VISUAL_ENTITY_CONFIDENCE:
+            continue
+        ingredient_entities = [
+            item for item in observations if item["role"] == "ingredient"
+        ]
+        canonical = min(
+            ingredient_entities or observations,
+            key=lambda item: (
+                len(str(item["entity"])),
+                -float(item["confidence"]),
+                str(item["entity"]),
+            ),
+        )
+        consensus.append({
+            "entity": str(canonical["entity"]),
+            "source_count": len(group["sources"]),
+            "max_confidence": max_confidence,
+        })
+    return consensus
+
+
+def _matching_curated_consensus_entity(
+    item: Dict[str, Any],
+    consensus: List[Dict[str, Any]],
+) -> str:
+    candidates = []
+    for candidate in item.get("visual_entity_candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            confidence = float(candidate.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        entity = str(candidate.get("entity") or "").strip()
+        if entity and confidence >= 0.65:
+            candidates.append(entity)
+    return next(
+        (
+            str(anchor["entity"])
+            for anchor in consensus
+            if _matching_visual_entity(candidates, [str(anchor["entity"])])
+        ),
+        "",
+    )
+
+
 def _annotate_product_relationships(catalog: List[Dict[str, Any]], product_info: Dict[str, Any]) -> None:
-    """Join visual role candidates to trusted product facts without inventing relationships."""
+    """Join product anchors, visible entities and scene relations without inventing facts."""
     normalized_name = str(product_info.get("name") or "").strip()
     role_fact_paths = {
         "ingredient": CLAIM_FACT_PATHS["ingredient"],
@@ -2768,18 +3013,196 @@ def _annotate_product_relationships(catalog: List[Dict[str, Any]], product_info:
         item["product_identity_evidence"] = (
             normalized_name if item["product_identity_supported"] else ""
         )
+
+    ingredient_facts = _fact_values(product_info, CLAIM_FACT_PATHS["ingredient"])
+    label_anchors = _product_label_anchors(catalog, normalized_name)
+    curated_consensus = _curated_cross_source_entity_consensus(catalog)
+    for item in catalog:
         role = str(item.get("product_story_role") or "unknown")
-        candidates = [str(value) for value in item.get("relation_candidates") or []]
-        facts = _fact_values(product_info, role_fact_paths.get(role, ()))
-        matched_facts = [fact for fact in facts if any(_text_matches_facts(candidate, [fact]) for candidate in candidates)]
-        direct_product = item["product_identity_supported"] and role == "finished_product"
-        item["product_relationship_verified"] = bool(direct_product or matched_facts)
-        item["product_relationship_source"] = (
-            "visual.product_identity" if direct_product
-            else f"product_info.{role_fact_paths[role][0]}" if matched_facts and role in role_fact_paths
-            else ""
+        entities = _visual_relation_entities(item)
+        matched_ingredient_facts = [
+            fact
+            for fact in ingredient_facts
+            if _matching_visual_entity(entities, [fact])
+        ]
+        matched_label_anchors = [
+            anchor
+            for anchor in label_anchors
+            if _matching_visual_entity(entities, [anchor])
+        ]
+        matched_consensus_entity = _matching_curated_consensus_entity(
+            item,
+            curated_consensus,
         )
+        matched_consensus = next(
+            (
+                anchor
+                for anchor in curated_consensus
+                if matched_consensus_entity
+                and _matching_visual_entity(
+                    [matched_consensus_entity],
+                    [str(anchor.get("entity") or "")],
+                )
+            ),
+            None,
+        )
+        product_anchors = [
+            *matched_ingredient_facts,
+            *matched_label_anchors,
+            *([matched_consensus_entity] if matched_consensus_entity else []),
+        ]
+        matched_entity = (
+            _matching_visual_entity(entities, product_anchors)
+            or matched_consensus_entity
+        )
+        scene_text = " ".join([
+            str(item.get("setting") or ""),
+            str(item.get("relation_evidence") or ""),
+            str(item.get("evidence") or ""),
+        ])
+        scene_is_cultivation = bool(CULTIVATION_SCENE.search(scene_text))
+        cultivation_scene = bool(matched_entity and scene_is_cultivation)
+        inferred_role = "origin" if cultivation_scene else "ingredient"
+        relationship_source = ""
+        relationship_evidence: Dict[str, Any] = {}
+        matched_entities: List[str] = []
+        curated_role_inference = False
+        curated_confidence = 0.0
+        if matched_entity and role in {"unknown", "context", "ingredient", "origin"}:
+            if cultivation_scene or role in {"unknown", "context"}:
+                role = inferred_role
+                item["product_story_role"] = role
+            matched_entities = [matched_consensus_entity or matched_entity]
+            if matched_ingredient_facts:
+                source_path = next(
+                    path
+                    for path in CLAIM_FACT_PATHS["ingredient"]
+                    if any(
+                        fact in _fact_values(product_info, (path,))
+                        for fact in matched_ingredient_facts
+                    )
+                )
+                relationship_source = f"product_info.{source_path}+visual.entity"
+            elif matched_label_anchors:
+                relationship_source = "visual.product_label+visual.entity"
+            else:
+                relationship_source = (
+                    "curated_cross_source_visual_consensus+visual.product_identity"
+                )
+            if cultivation_scene:
+                relationship_source = relationship_source.replace(
+                    "+visual.entity", "+visual.cultivation_scene"
+                )
+            relationship_evidence = {
+                "product_anchor": product_anchors[0],
+                "visual_entity": matched_entity,
+                "scene_relation": "cultivation" if cultivation_scene else "material",
+                "inferred_role": role,
+                **({
+                    "inference_basis": "curated_cross_source_visual_consensus",
+                    "source_count": int(matched_consensus["source_count"]),
+                    "max_confidence": float(matched_consensus["max_confidence"]),
+                } if matched_consensus else {}),
+            }
+            candidates = [str(value) for value in item.get("relation_candidates") or []]
+            if matched_entity not in candidates:
+                item["relation_candidates"] = [*candidates, matched_entity]
+
+        confident_visual_entities = _confident_visual_entity_names(item)
+        visual_conflict = bool(
+            confident_visual_entities
+            and not _matching_visual_entity(confident_visual_entities, ingredient_facts)
+        )
+        curated_role_inference = bool(
+            not matched_entity
+            and len(ingredient_facts) == 1
+            and role in {"ingredient", "origin"}
+            and str(item.get("product_relevance_prior") or "").lower() == "high"
+            and item.get("product_relevance_source") == "curated_local_asset_folder"
+            and float(item.get("confidence") or 0.0) >= 0.75
+            and bool(item.get("relation_candidates") or item.get("visible_objects"))
+            and not visual_conflict
+        )
+        if curated_role_inference:
+            anchor = ingredient_facts[0]
+            source_path = next(
+                path
+                for path in CLAIM_FACT_PATHS["ingredient"]
+                if anchor in _fact_values(product_info, (path,))
+            )
+            visual_evidence = next(iter(item.get("relation_candidates") or []), "") or next(
+                iter(item.get("visible_objects") or []), ""
+            )
+            relationship_source = (
+                f"curated_material_prior+visual.{role}_role+product_info.{source_path}"
+            )
+            relationship_evidence = {
+                "product_anchor": anchor,
+                "visual_entity": str(visual_evidence),
+                "scene_relation": "cultivation" if role == "origin" else "material",
+                "inferred_role": role,
+                "inference_basis": "curated_material+visual_role",
+            }
+            visual_confidence = max(0.0, min(1.0, float(item.get("confidence") or 0.0)))
+            relation_confidence = max(
+                0.0,
+                min(1.0, float(item.get("relation_confidence") or 0.0)),
+            )
+            curated_confidence = round(
+                min(0.79, 0.55 + 0.15 * visual_confidence + 0.09 * relation_confidence),
+                2,
+            )
+
+        facts = _fact_values(product_info, role_fact_paths.get(role, ()))
+        matched_facts = [
+            fact
+            for fact in facts
+            if _matching_visual_entity(_visual_relation_entities(item), [fact])
+        ]
+        if role == "ingredient" and matched_ingredient_facts:
+            matched_facts = matched_ingredient_facts
+        elif curated_role_inference and role == "ingredient":
+            matched_facts = ingredient_facts
+        elif cultivation_scene:
+            matched_facts = []
+        elif curated_role_inference:
+            matched_facts = []
+        direct_product = item["product_identity_supported"] and role == "finished_product"
+        inferred_relationship = bool(
+            (matched_entity and product_anchors) or curated_role_inference
+        )
+        item["product_relationship_verified"] = bool(
+            direct_product or matched_facts or inferred_relationship
+        )
+        if not relationship_source:
+            relationship_source = (
+                "visual.product_identity" if direct_product
+                else f"product_info.{role_fact_paths[role][0]}" if matched_facts and role in role_fact_paths
+                else ""
+            )
+        item["product_relationship_source"] = relationship_source
+        item["product_relationship_confidence"] = (
+            1.0 if direct_product
+            else curated_confidence if curated_role_inference
+            else 1.0 if matched_facts
+            else 0.82 if matched_ingredient_facts
+            else 0.72 if matched_label_anchors
+            else 0.76 if matched_consensus_entity
+            else 0.0
+        )
+        item["product_relationship_evidence"] = relationship_evidence
         item["matched_product_facts"] = matched_facts
+        item["matched_product_entities"] = matched_entities
+
+
+def _annotated_material_catalog(
+    asset_index: Optional[Dict[str, Any]],
+    product_info: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Use every understood window as evidence, but return only editable footage."""
+    evidence_catalog = _material_catalog(asset_index, include_unusable=True)
+    _annotate_product_relationships(evidence_catalog, product_info)
+    return [item for item in evidence_catalog if item.get("usable_for_ad")]
 
 
 def _material_attention_score(item: Dict[str, Any]) -> float:
@@ -3008,6 +3431,7 @@ def _build_coverage_driven_narrative_plan(
             "product_relevance_prior": str(material.get("product_relevance_prior") or "high"),
             "product_relationship_verified": bool(material.get("product_relationship_verified")),
             "matched_product_facts": material.get("matched_product_facts") or [],
+            "matched_product_entities": material.get("matched_product_entities") or [],
             "planning_basis": {
                 "attention_score": round(_material_attention_score(material), 3),
                 "confidence": float(material.get("confidence") or 0.0),
@@ -3025,8 +3449,7 @@ def build_local_asset_story_contract(
     preview: bool = False,
 ) -> Dict[str, Any]:
     """Derive segment count, bindings and duration exclusively from usable local footage."""
-    material_catalog = _material_catalog(asset_index)
-    _annotate_product_relationships(material_catalog, product_info)
+    material_catalog = _annotated_material_catalog(asset_index, product_info)
     if not material_catalog:
         raise LocalAssetError("本地素材没有可用于构建自然时长故事的窗口")
 
@@ -3136,6 +3559,7 @@ def _global_material_capability_pool(
         "product_relationship_verified": False,
         "product_identity_supported": False,
         "matched_product_facts": [],
+        "matched_product_entities": [],
         "literal_actions": [],
         "temporal_events": [],
         "visible_objects": [],
@@ -3160,6 +3584,7 @@ def _global_material_capability_pool(
             "window_count": 0,
             "capacity_seconds": 0.0,
             "visual_concepts": [],
+            "visual_entities": [],
             "literal_actions": [],
             "visible_text": [],
             "verified_facts": [],
@@ -3168,6 +3593,7 @@ def _global_material_capability_pool(
         })
         group["window_count"] += 1
         append_unique(group["visual_concepts"], material.get("visible_objects"), 8)
+        append_unique(group["visual_entities"], material.get("matched_product_entities"), 6)
         append_unique(group["literal_actions"], material.get("literal_actions"), 6)
         append_unique(group["visible_text"], material.get("visible_text"), 6)
         append_unique(group["verified_facts"], material.get("matched_product_facts"), 6)
@@ -3184,6 +3610,7 @@ def _global_material_capability_pool(
         )
         for field, limit in (
             ("matched_product_facts", 20),
+            ("matched_product_entities", 20),
             ("literal_actions", 20),
             ("temporal_events", 20),
             ("visible_objects", 20),
@@ -3226,6 +3653,44 @@ def _global_material_capability_pool(
                 "kind": "verified_fact",
                 "usage_scope": "product_fact",
             })
+    anchored_text = {str(anchor.get("text") or "") for anchor in evidence_anchors}
+    for material in material_catalog:
+        if not material.get("product_relationship_verified"):
+            continue
+        confident_entities = _confident_visual_entity_names(material)
+        role = str(material.get("product_story_role") or "unknown").lower()
+        for entity in material.get("matched_product_entities") or []:
+            entity = str(entity).strip()
+            relationship_evidence = material.get("product_relationship_evidence") or {}
+            consensus_proven = bool(
+                isinstance(relationship_evidence, dict)
+                and relationship_evidence.get("inference_basis")
+                == "curated_cross_source_visual_consensus"
+                and isinstance(relationship_evidence.get("source_count"), int)
+                and relationship_evidence["source_count"] >= 2
+                and isinstance(relationship_evidence.get("max_confidence"), (int, float))
+                and float(relationship_evidence["max_confidence"])
+                >= MIN_VISUAL_ENTITY_CONFIDENCE
+            )
+            if (
+                not entity
+                or entity in anchored_text
+                or (
+                    not _matching_visual_entity(confident_entities, [entity])
+                    and not consensus_proven
+                )
+            ):
+                continue
+            evidence_anchors.append({
+                "id": f"visual_relationship:{len(evidence_anchors)}",
+                "text": entity,
+                "kind": "verified_fact",
+                "usage_scope": "ingredient_identity" if role == "ingredient" else "source_entity",
+                "evidence_source": "verified_visual_relationship",
+                "relationship_source": str(material.get("product_relationship_source") or ""),
+                "confidence": float(material.get("product_relationship_confidence") or 0.0),
+            })
+            anchored_text.add(entity)
     return {
         "source": "global_local_video_understanding",
         "total_usable_duration": round(_deduplicated_material_duration(material_catalog), 3),
@@ -3278,6 +3743,7 @@ def _semantic_copy_constraints(
         visual_capability = {
             "role": role,
             "visual_concepts": list(capability.get("visual_concepts") or [])[:8],
+            "visual_entities": list(capability.get("visual_entities") or [])[:6],
             "literal_actions": list(capability.get("literal_actions") or [])[:6],
             "visible_text": list(capability.get("visible_text") or [])[:6],
         } if role else {}
@@ -3707,6 +4173,13 @@ def _materialize_semantic_script_segments(
             for anchor in referenced_anchors
             if str(anchor.get("text") or "").strip()
         ]))[:6]
+        emphasis_terms = list(dict.fromkeys(
+            str(anchor.get("text") or "").strip()
+            for anchor in referenced_anchors
+            if str(anchor.get("id") or "") != "product:name"
+            and str(anchor.get("kind") or "") == "verified_fact"
+            and str(anchor.get("text") or "").strip()
+        ))[:4]
         visual_query = copy.get("visual_query") or []
         if isinstance(visual_query, str):
             visual_query = [visual_query]
@@ -3742,6 +4215,7 @@ def _materialize_semantic_script_segments(
             "scene_prompt": "",
             "visual_query": visual_query,
             "asset_query": evidence_query,
+            "emphasis_terms": emphasis_terms,
             "fallback_visual": "",
         }
         segment["claims"] = _normalize_claim_objects(segment, product_info, global_analysis)
@@ -3774,8 +4248,7 @@ def build_material_constrained_script(
         product_category=str(product_info.get("type") or ""),
         script_style=script_style,
     )
-    material_catalog = _material_catalog(asset_index)
-    _annotate_product_relationships(material_catalog, product_info)
+    material_catalog = _annotated_material_catalog(asset_index, product_info)
     if not material_catalog:
         raise LocalAssetError("本地素材没有可用于生成销售语义的有效视频窗口")
     for window in (asset_index or {}).get("windows") or []:
@@ -3791,7 +4264,7 @@ def build_material_constrained_script(
         analysis = window.setdefault("analysis", {})
         for key in (
             "product_relationship_verified", "product_relationship_source",
-            "matched_product_facts", "product_relevance_prior",
+            "matched_product_facts", "matched_product_entities", "product_relevance_prior",
         ):
             analysis[key] = material.get(key)
 
@@ -4613,6 +5086,7 @@ def plan_and_materialize_local_clips(
                 ),
                 "subtitle": segment.get("subtitle"),
                 "voiceover": segment.get("voiceover"),
+                "emphasis_terms": list(segment.get("emphasis_terms") or []),
                 "source_video": selected_window.get("source_video"),
                 "source_path": selected_window.get("source_path"),
                 "source_start": selected_window.get("start"),
