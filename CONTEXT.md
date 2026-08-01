@@ -8,6 +8,10 @@ An aggregate of the whole local-footage set: available semantic roles, usable du
 
 A stable identifier and text description for information available to sales copy. An anchor comes from visible video evidence or trusted product facts; candidates cite anchor identifiers instead of relying on product-category keyword lists.
 
+## Material Copy Contract
+
+The code-owned contract compiled from the authored cue, subtitle or voiceover plus its Evidence Anchor references. It derives observable subjects, actions, effective visual binding and the minimum primary-visual relevance required by the copy. Script validation, compatible-capacity calculation, clip scoring and final selected-window validation must use this same contract; `supportive` permits persuasive copy but never unrelated primary footage, and `product:name` proves identity only rather than composition, variant, origin, process or performance facts.
+
 ## Marketing Device
 
 The persuasive function performed by a line, such as contrast, curiosity, proof, reason, convenience, reveal, or action. The Material Copy Contract determines which devices fit each narrative intent.

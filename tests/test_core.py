@@ -5145,6 +5145,78 @@ class TestPostProcessingP0Fixes:
         second = json.loads(generate.call_args_list[1].args[0])
         assert second["segment_contracts"] == first["segment_contracts"]
         assert "token 上限" in second["structured_output_retry"]["reason"]
+        assert generate.call_args_list[1].kwargs["max_tokens"] > generate.call_args_list[0].kwargs["max_tokens"]
+        assert result["json_generation_attempt"] == 2
+
+    def test_visual_contract_rejection_retries_with_the_actual_violation(self, tmp_path):
+        import json
+        from unittest.mock import patch
+
+        from local_asset_pipeline import build_material_constrained_script
+
+        invalid = {
+            "segments": [{
+                "segment": 0,
+                "cue": "你看这瓶装产品，拿取很方便。",
+                "evidence_refs": ["product:name"],
+                "claims": [],
+                "visual_binding": "required",
+                "visual_claim": "展示瓶装产品",
+                "visual_query": ["手拿起瓶装产品"],
+            }],
+        }
+        valid = {
+            "segments": [{
+                "segment": 0,
+                "cue": "你看这瓶装产品，拿取很方便。",
+                "evidence_refs": ["product:name"],
+                "claims": [],
+                "visual_binding": "required",
+                "visual_claim": "瓶装产品",
+                "visual_query": ["手拿起瓶装产品"],
+            }],
+        }
+        window = {
+            "window_id": "product-action",
+            "source_video": "product.mp4",
+            "source_path": "/tmp/product.mp4",
+            "start": 0.0,
+            "end": 4.0,
+            "analysis": {
+                "usable_for_ad": True,
+                "confidence": 1.0,
+                "product_story_role": "finished_product",
+                "product_visibility": 5,
+                "primary_visuals": ["手拿起瓶装产品"],
+                "visible_objects": ["瓶装产品"],
+                "literal_actions": ["手拿起瓶装产品"],
+            },
+        }
+
+        with patch("config.LLM_ENABLED", True), \
+             patch("llm_client.generate_json", side_effect=[
+                 creative_candidates(invalid, invalid, invalid),
+                 creative_candidates(valid, valid, valid),
+             ]) as generate, \
+             patch("local_asset_pipeline.LOCAL_ASSET_INDEX_PATH", tmp_path):
+            result = build_material_constrained_script(
+                product_info={"name": "产品", "type": "食品"},
+                coverage={},
+                num_segments=1,
+                script_style="demonstration",
+                asset_index={
+                    "asset_folder": "/tmp/visual-contract-retry",
+                    "windows": [window],
+                },
+                segment_durations={0: 4.0},
+                narrative_plan_override=[{
+                    "segment": 0,
+                    "product_story_role": "finished_product",
+                }],
+            )
+
+        retry_prompt = json.loads(generate.call_args_list[1].args[0])
+        assert "visual_claim 不是 cue 原文片段" in retry_prompt["structured_output_retry"]["reason"]
         assert result["json_generation_attempt"] == 2
 
     def test_obsolete_script_repair_runtime_is_physically_absent(self):
@@ -5296,6 +5368,50 @@ class TestPostProcessingP0Fixes:
         assert "forbidden_without_verified_facts" not in prompt["segment_contracts"][0]
         assert prompt["forbidden_without_verified_facts"] == ["提神", "清爽", "好喝"]
         assert 1200 < _script_response_token_budget(5) <= 3000
+
+    def test_compact_prompt_does_not_duplicate_role_level_visual_evidence(self):
+        import json
+
+        from local_asset_pipeline import _build_compact_script_prompt
+
+        repeated_detail = "不应重复进入提示的窗口级详情" * 100
+        prompt = _build_compact_script_prompt(
+            product_info={"name": "产品"},
+            script_reference_profile={},
+            external_cta=False,
+            script_style="demonstration",
+            copy_constraints={
+                "0": {
+                    "segment": 0,
+                    "marketing_intent": "hook",
+                    "copy_goal": "建立兴趣",
+                    "product_story_role": "usage",
+                    "visual_capability": {
+                        "role": "usage",
+                        "primary_visuals": ["主体完成使用动作"],
+                    },
+                },
+            },
+            material_capability_pool={
+                "source": "global_local_video_understanding",
+                "total_usable_duration": 4.0,
+                "role_capabilities": [{
+                    "role": "usage",
+                    "capacity_seconds": 4.0,
+                    "primary_visuals": ["主体完成使用动作"],
+                    "spoken_summaries": ["分享实际使用体验"],
+                    "literal_actions": [repeated_detail],
+                }],
+            },
+        )
+        encoded = json.dumps(prompt, ensure_ascii=False)
+
+        assert repeated_detail not in encoded
+        assert prompt["visual_capabilities"] == [{
+            "role": "usage",
+            "capacity_seconds": 4.0,
+            "spoken_summaries": ["分享实际使用体验"],
+        }]
 
     def test_compact_segment_cues_materialize_the_single_voiceover_source(self):
         from local_asset_pipeline import _normalize_compact_script_response
@@ -5714,6 +5830,31 @@ class TestPostProcessingP0Fixes:
         })
 
         assert normalized["visible_text"] == ["茶咖"]
+
+    def test_primary_visuals_exclude_incidental_or_single_frame_subjects(self):
+        from local_asset_pipeline import _normalize_analysis
+
+        normalized = _normalize_analysis({
+            "primary_visuals": [
+                {
+                    "description": "宠物清晰守在餐盘旁等待进食",
+                    "prominence": "primary",
+                    "visible_frame_count": 6,
+                },
+                {
+                    "description": "画面角落露出部分宠物头部",
+                    "prominence": "incidental",
+                    "visible_frame_count": 8,
+                },
+                {
+                    "description": "手拿起袋装产品",
+                    "prominence": "primary",
+                    "visible_frame_count": 1,
+                },
+            ],
+        })
+
+        assert normalized["primary_visuals"] == ["宠物清晰守在餐盘旁等待进食"]
 
     def test_motion_channel_disagreement_blocks_window(self):
         """VLM 和连续帧高置信结论冲突时必须拒绝，不允许任选一个结论。"""
@@ -7213,6 +7354,187 @@ class TestReferenceAdAnalysis:
         assert performance["mode"] == "single_take"
         assert performance["tts_requests"] == 1
         assert performance["tts_reused"] is True
+
+    def test_smart_duration_keeps_tts_as_local_timeline_authority(self):
+        import one_click_create
+
+        rhythm = {
+            "segments": [
+                {"index": 0, "duration": 3.0},
+                {"index": 1, "duration": 4.0},
+            ],
+            "total_duration": 7.0,
+            "actual_total_duration": 7.0,
+            "duration_source": "material_story_contract",
+        }
+        one_take = {
+            "clip_durations": {0: 2.5, 1: 3.5},
+            "main_duration": 6.0,
+        }
+
+        source = one_click_create._apply_local_timeline_authority(
+            rhythm,
+            one_take,
+            target_duration_explicit=False,
+        )
+
+        assert source == "single_take_tts_timeline"
+        assert [item["duration"] for item in rhythm["segments"]] == [2.5, 3.5]
+        assert rhythm["actual_total_duration"] == 6.0
+
+    def test_explicit_duration_keeps_visual_timeline_authority(self):
+        import one_click_create
+
+        rhythm = {
+            "segments": [
+                {"index": 0, "duration": 3.0},
+                {"index": 1, "duration": 4.0},
+            ],
+            "total_duration": 7.0,
+            "actual_total_duration": 7.0,
+            "duration_source": "material_story_contract",
+        }
+        original = copy.deepcopy(rhythm)
+
+        source = one_click_create._apply_local_timeline_authority(
+            rhythm,
+            {"clip_durations": {0: 2.5, 1: 3.5}, "main_duration": 6.0},
+            target_duration_explicit=True,
+        )
+
+        assert source == "requested_visual_timeline"
+        assert rhythm == original
+
+    def test_explicit_duration_maps_one_take_cues_to_visual_semantic_windows(self):
+        import one_click_create
+
+        mapped = one_click_create._map_voiceover_lines_to_semantic_timeline(
+            [
+                {"segment": 0, "text": "第一句", "start": 0.0, "end": 2.75},
+                {"segment": 1, "text": "第二句", "start": 2.75, "end": 5.44},
+                {"segment": 2, "text": "第三句", "start": 5.44, "end": 8.88},
+                {"segment": 3, "text": "第四句", "start": 8.88, "end": 11.25},
+            ],
+            [
+                {"index": 0, "start": 0.0, "end": 2.753},
+                {"index": 1, "start": 2.753, "end": 6.398},
+                {"index": 2, "start": 6.398, "end": 10.398},
+                {"index": 3, "start": 10.398, "end": 14.398},
+            ],
+        )
+
+        assert [(item["start"], item["end"]) for item in mapped] == [
+            (0.0, 2.753),
+            (2.753, 6.398),
+            (6.398, 10.398),
+            (10.398, 14.398),
+        ]
+        assert [(item["source_start"], item["source_end"]) for item in mapped] == [
+            (0.0, 2.75),
+            (2.75, 5.44),
+            (5.44, 8.88),
+            (8.88, 11.25),
+        ]
+
+    def test_explicit_duration_accepts_rendered_timeline_already_collapsed_from_ten_edits(self):
+        import one_click_create
+
+        edit_timeline = [
+            {
+                "index": index,
+                "start": float(index * 3),
+                "end": float((index + 1) * 3),
+                "duration": 3.0,
+                "type": "showcase",
+                "purpose": "value",
+            }
+            for index in range(10)
+        ]
+        semantic_indices = [0, 1, 1, 2, 3, 3, 4, 5, 5, 6]
+        rendered_semantic_timeline = one_click_create._collapse_edit_timeline_by_semantic(
+            edit_timeline,
+            semantic_indices,
+        )
+        voiceover_lines = [
+            {
+                "segment": index,
+                "text": f"第{index + 1}句",
+                "start": float(index * 2),
+                "end": float((index + 1) * 2),
+            }
+            for index in range(7)
+        ]
+
+        mapped = one_click_create._map_voiceover_lines_to_semantic_timeline(
+            voiceover_lines,
+            rendered_semantic_timeline,
+        )
+
+        assert len(rendered_semantic_timeline) == len(mapped) == 7
+        assert [(item["start"], item["end"]) for item in mapped] == [
+            (item["start"], item["end"])
+            for item in rendered_semantic_timeline
+        ]
+
+        source = Path("one_click_create.py").read_text(encoding="utf-8")
+        explicit_branch = source[
+            source.index("if local_one_take_timeline and target_duration_explicit:"):
+            source.index("elif local_one_take_timeline:", source.index("if local_one_take_timeline and target_duration_explicit:"))
+        ]
+        assert "_collapse_edit_timeline_by_semantic" not in explicit_branch
+        assert "_rendered_segment_timeline" in explicit_branch
+
+    def test_explicit_duration_reuses_one_take_master_inside_visual_windows(self, tmp_path):
+        import tts_client
+
+        master = tmp_path / "master.m4a"
+        master.write_bytes(b"audio")
+        output = tmp_path / "voice.m4a"
+        lines = [
+            {
+                "segment": 0,
+                "text": "第一句。",
+                "source_start": 0.0,
+                "source_end": 2.0,
+                "start": 0.0,
+                "end": 3.0,
+            },
+            {
+                "segment": 1,
+                "text": "第二句。",
+                "source_start": 2.0,
+                "source_end": 4.0,
+                "start": 3.0,
+                "end": 6.0,
+            },
+        ]
+
+        def fake_ffmpeg(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"segment")
+            return MagicMock(returncode=0, stderr=b"")
+
+        def fake_subtitles(local_lines, _audio, _audio_end):
+            line = local_lines[0]
+            return [{**line, "start": 0.1, "end": 1.9}]
+
+        with patch.object(tts_client, "generate_tts_audio") as generate, \
+             patch.object(tts_client.subprocess, "run", side_effect=fake_ffmpeg), \
+             patch.object(tts_client, "_get_audio_duration", return_value=2.0), \
+             patch.object(tts_client, "split_and_align_voiceover_subtitles", side_effect=fake_subtitles), \
+             patch.object(tts_client, "_mix_audio_segments") as mix:
+            _, subtitles = tts_client.fit_pre_generated_voiceover_to_windows(
+                lines,
+                master,
+                output,
+                total_duration=6.0,
+            )
+
+        generate.assert_not_called()
+        assert [item["start"] for item in mix.call_args.args[0]] == [0.0, 3.0]
+        assert [(item["start"], item["end"]) for item in subtitles] == [
+            (0.1, 1.9),
+            (3.1, 4.9),
+        ]
 
     def test_local_one_take_master_cache_is_keyed_by_full_synthesis_contract(self, tmp_path):
         import one_click_create
@@ -9052,13 +9374,13 @@ class TestReferenceAdAnalysis:
             for text in commercial_copy
         )
 
-    def test_current_local_script_builder_has_no_automatic_copy_reviewer(self):
+    def test_current_local_script_builder_has_no_subjective_copy_reviewer(self):
         import inspect
         from local_asset_pipeline import build_material_constrained_script
 
         source = inspect.getsource(build_material_constrained_script)
 
-        assert "candidate_validator=" not in source
+        assert "_visual_grounding_violations" in source
         assert "candidate_factual_violations" not in source
         assert "global_factual_evidence_failed" not in source
 
@@ -9287,6 +9609,493 @@ class TestReferenceAdAnalysis:
 
 
 class TestGlobalMaterialDrivenScriptArchitecture:
+    def test_supportive_copy_with_observable_action_still_requires_matching_primary_visual(self):
+        from local_asset_pipeline import _visual_grounding_violations
+
+        contracts = [{
+            "segment": 0,
+            "visual_capability": {
+                "primary_visuals": ["手提起密封袋装商品"],
+                "visual_concepts": ["密封袋装商品"],
+                "literal_actions": ["手提起密封袋装商品"],
+                "visible_text": [],
+            },
+        }]
+        candidate = {
+            "segments": [{
+                "segment": 0,
+                "cue": "日常开袋就能喂。",
+                "visual_binding": "supportive",
+                "visual_claim": "",
+                "visual_query": ["手提起密封袋装商品"],
+                "evidence_refs": ["product:name"],
+                "claims": [],
+            }],
+        }
+
+        violations = _visual_grounding_violations(candidate, contracts)
+
+        assert any("动作与 visual_query 不一致" in violation for violation in violations)
+
+    def test_specific_product_claim_requires_relevant_non_name_evidence_anchor(self):
+        from local_asset_pipeline import _copy_preflight_check, _visual_grounding_violations
+
+        contracts = [{"segment": 0, "visual_capability": {}}]
+        anchors = [
+            {
+                "id": "product:name",
+                "text": "宠物食品",
+                "kind": "product_info",
+                "usage_scope": "product_identity",
+            },
+            {
+                "id": "product:verified_claims:0",
+                "text": "提供冻干款，适口性经过验证",
+                "kind": "verified_fact",
+                "usage_scope": "product_fact",
+            },
+        ]
+        segment = {
+            "segment": 0,
+            "cue": "冻干款可选，适口性更好。",
+            "visual_binding": "supportive",
+            "visual_claim": "",
+            "visual_query": [],
+            "evidence_refs": ["product:name"],
+            "claims": [],
+        }
+
+        missing_evidence = _visual_grounding_violations(
+            {"segments": [segment]},
+            contracts,
+            anchors,
+        )
+        missing_composition_evidence = _visual_grounding_violations(
+            {"segments": [{
+                **segment,
+                "cue": "它是全价配方，满足成犬日常营养需求。",
+            }]},
+            contracts,
+            anchors,
+        )
+        supported = _visual_grounding_violations(
+            {"segments": [{
+                **segment,
+                "evidence_refs": ["product:verified_claims:0"],
+            }]},
+            contracts,
+            anchors,
+        )
+
+        assert any("非名称 Evidence Anchor" in violation for violation in missing_evidence)
+        assert any(
+            "非名称 Evidence Anchor" in violation
+            for violation in missing_composition_evidence
+        )
+        assert supported == []
+        attributed_question = {
+            **segment,
+            "cue": "你想了解这款号称能提神的产品吗？",
+            "subtitle": "你想了解这款号称能提神的产品吗？",
+            "voiceover": "你想了解这款号称能提神的产品吗？",
+        }
+        assert _copy_preflight_check(
+            attributed_question,
+            None,
+            {"name": "宠物食品"},
+            {
+                "product_identity_supported": True,
+                "product_relevance_prior": "high",
+            },
+            anchors,
+        ) is None
+
+    def test_visual_grounding_accepts_observable_action_synonyms(self):
+        from local_asset_pipeline import _visual_grounding_violations
+
+        contracts = [{
+            "segment": 0,
+            "visual_capability": {
+                "primary_visuals": ["灰白色哈士奇低头进食碗内的颗粒状食物"],
+                "visual_concepts": ["灰白色哈士奇", "颗粒状食物"],
+                "literal_actions": ["哈士奇低头进食颗粒状食物"],
+                "visible_text": [],
+            },
+        }]
+        candidate = {
+            "segments": [{
+                "segment": 0,
+                "cue": "你看，我家狗狗吃得多香。",
+                "visual_binding": "required",
+                "visual_claim": "我家狗狗吃得多香",
+                "visual_query": ["灰白色哈士奇低头进食碗内的颗粒状食物"],
+            }],
+        }
+
+        assert _visual_grounding_violations(candidate, contracts) == []
+
+    def test_visual_grounding_rejects_different_observable_action(self):
+        from local_asset_pipeline import _visual_grounding_violations
+
+        contracts = [{
+            "segment": 0,
+            "visual_capability": {
+                "primary_visuals": ["袋装商品被手提起并移出画面"],
+                "visual_concepts": ["袋装商品"],
+                "literal_actions": ["手提起袋装商品并移出画面"],
+                "visible_text": [],
+            },
+        }]
+        candidate = {
+            "segments": [{
+                "segment": 0,
+                "cue": "狗狗已经守在餐盘旁等着开吃了。",
+                "visual_binding": "required",
+                "visual_claim": "狗狗已经守在餐盘旁等着开吃了",
+                "visual_query": ["袋装商品被手提起并移出画面"],
+            }],
+        }
+
+        assert _visual_grounding_violations(candidate, contracts) == [
+            "segment 0 的 visual_claim 动作与 visual_query 不一致：wait"
+        ]
+
+    def test_visual_grounding_rejects_different_subject_with_same_action(self):
+        from local_asset_pipeline import _visual_grounding_violations
+
+        contracts = [{
+            "segment": 0,
+            "visual_capability": {
+                "primary_visuals": ["人物低头食用餐盘内的食物"],
+                "visual_concepts": ["人物", "餐盘"],
+                "literal_actions": ["人物低头食用食物"],
+                "visible_text": [],
+            },
+        }]
+        candidate = {
+            "segments": [{
+                "segment": 0,
+                "cue": "你看，宠物正在低头吃饭。",
+                "visual_binding": "supportive",
+                "visual_claim": "宠物正在低头吃饭",
+                "visual_query": ["人物低头食用餐盘内的食物"],
+            }],
+        }
+
+        assert _visual_grounding_violations(candidate, contracts) == [
+            "segment 0 的 visual_claim 主体与 visual_query 不一致：animal"
+        ]
+
+    def test_abstract_sales_copy_is_not_treated_as_a_required_visual_claim(self):
+        from local_asset_pipeline import (
+            _materialize_semantic_script_segments,
+            _visual_grounding_violations,
+        )
+
+        contracts = [{
+            "segment": 0,
+            "product_story_role": "usage",
+            "visual_capability": {
+                "primary_visuals": ["哈士奇低头进食碗内的颗粒状食物"],
+                "visual_concepts": ["哈士奇", "颗粒状食物"],
+                "literal_actions": ["哈士奇低头进食颗粒状食物"],
+                "visible_text": [],
+            },
+        }]
+        candidate = {
+            "segments": [{
+                "segment": 0,
+                "cue": "给狗狗选对口粮，日常喂养能省超多心。",
+                "visual_binding": "required",
+                "visual_claim": "给狗狗选对口粮，日常喂养能省超多心",
+                "visual_query": ["哈士奇低头进食碗内的颗粒状食物"],
+                "evidence_refs": [],
+                "claims": [],
+            }],
+        }
+
+        assert _visual_grounding_violations(candidate, contracts) == []
+
+        result = {"segments": candidate["segments"]}
+        segments = _materialize_semantic_script_segments(
+            result,
+            {"0": contracts[0]},
+            {"aggregate_analysis": {}, "evidence_anchors": []},
+            {"name": "宠物食品"},
+        )
+
+        assert segments[0]["visual_binding"] == "supportive"
+        assert segments[0]["visual_claim"] == ""
+
+    def test_required_visual_binding_cannot_omit_its_visible_claim(self):
+        from local_asset_pipeline import _visual_grounding_violations
+
+        contracts = [{
+            "segment": 0,
+            "visual_capability": {
+                "primary_visuals": ["宠物守在餐盘旁等待进食"],
+                "visual_concepts": ["宠物", "餐盘"],
+                "literal_actions": ["宠物守在餐盘旁等待进食"],
+                "visible_text": [],
+            },
+        }]
+        candidate = {
+            "segments": [{
+                "segment": 0,
+                "cue": "宠物早就守在餐盘旁，等着开吃了。",
+                "visual_binding": "required",
+                "visual_claim": "",
+                "visual_query": ["宠物守在餐盘旁等待进食"],
+            }],
+        }
+
+        assert _visual_grounding_violations(candidate, contracts) == [
+            "segment 0 的 required 现场画面主张缺少 visual_claim"
+        ]
+
+    def test_required_visual_binding_cannot_use_incidental_visible_objects(self):
+        from local_asset_pipeline import _visual_grounding_violations
+
+        contracts = [{
+            "segment": 0,
+            "visual_capability": {
+                "primary_visuals": ["手将袋装产品移出画面"],
+                "visual_concepts": ["桌下宠物头部", "圆形木桌"],
+                "literal_actions": ["桌下宠物头部保持静止"],
+                "visible_text": [],
+            },
+        }]
+        candidate = {
+            "segments": [{
+                "segment": 0,
+                "cue": "宠物守在桌旁，已经等着开吃了。",
+                "visual_binding": "required",
+                "visual_claim": "宠物守在桌旁，已经等着开吃了",
+                "visual_query": ["桌下宠物头部"],
+            }],
+        }
+
+        assert _visual_grounding_violations(candidate, contracts) == [
+            "segment 0 的 required visual_query 不是主视觉能力：桌下宠物头部"
+        ]
+
+    def test_visual_grounding_does_not_turn_ordinary_sales_copy_into_a_caption(self):
+        from local_asset_pipeline import _visual_grounding_violations
+
+        contracts = [{
+            "segment": 0,
+            "visual_capability": {
+                "visual_concepts": ["袋装产品"],
+                "literal_actions": ["手拿起袋装产品"],
+                "visible_text": [],
+            },
+        }]
+        candidate = {
+            "segments": [{
+                "segment": 0,
+                "cue": "这款产品已经有大袋小袋多种规格了。",
+                "visual_claim": "",
+                "visual_query": ["袋装产品"],
+            }],
+        }
+
+        assert _visual_grounding_violations(candidate, contracts) == []
+
+    def test_direct_visual_claim_selects_its_supporting_footage(self, tmp_path):
+        from unittest.mock import patch
+
+        from local_asset_pipeline import (
+            build_material_constrained_script,
+            plan_and_materialize_local_clips,
+        )
+
+        def window(window_id, source, confidence, objects, actions, primary_visuals):
+            return {
+                "window_id": window_id,
+                "source_video": source,
+                "source_path": str(tmp_path / source),
+                "start": 0.0,
+                "end": 3.0,
+                "duration": 3.0,
+                "analysis": {
+                    "usable_for_ad": True,
+                    "confidence": confidence,
+                    "product_story_role": "context",
+                    "product_visibility": 0,
+                    "product_relevance_prior": "high",
+                    "visible_subjects": ["environment"],
+                    "primary_visuals": primary_visuals,
+                    "visible_objects": objects,
+                    "literal_actions": actions,
+                    "visible_text": [],
+                    "narrative_roles": ["hook"],
+                    "evidence": "；".join([*objects, *actions]),
+                },
+                "motion": {
+                    "motion_class": "semi_dynamic",
+                    "subject_motion": "medium",
+                    "subject_motion_ratio": 0.08,
+                    "confidence": 1.0,
+                    "active_ranges": [[0.0, 3.0]],
+                },
+                "frame_quality": {"passed": True},
+            }
+
+        asset_index = {
+            "asset_folder": str(tmp_path / "assets"),
+            "windows": [
+                window(
+                    "table",
+                    "table.mp4",
+                    1.0,
+                    ["圆形木质桌面", "袋装产品"],
+                    ["袋装产品被移出画面"],
+                    ["袋装产品被移出画面"],
+                ),
+                window(
+                    "subject-action",
+                    "subject-action.mp4",
+                    0.85,
+                    ["哈士奇犬", "圆形食盘"],
+                    ["哈士奇犬将头部凑近圆形食盘"],
+                    ["哈士奇犬将头部凑近圆形食盘"],
+                ),
+            ],
+            "coverage": {},
+        }
+        unsupported = {
+            "route": "unsupported-observation",
+            "segments": [{
+                "segment": 0,
+                "marketing_intent": "hook",
+                "cue": "你看，我家狗狗早就蹲在旁边等着吃了。",
+                "visual_binding": "required",
+                "visual_claim": "狗狗早就蹲在旁边等着吃了",
+                "visual_query": ["圆形木质桌面"],
+                "evidence_refs": ["product:name"],
+                "claims": [],
+            }],
+        }
+        supported = {
+            "route": "supported-observation",
+            "segments": [{
+                "segment": 0,
+                "marketing_intent": "hook",
+                "cue": "你看，这只哈士奇正把头凑近食盘。",
+                "visual_binding": "required",
+                "visual_claim": "这只哈士奇正把头凑近食盘",
+                "visual_query": ["哈士奇犬将头部凑近圆形食盘"],
+                "evidence_refs": ["product:name"],
+                "claims": [],
+            }],
+        }
+
+        with patch("config.LLM_ENABLED", True), \
+             patch(
+                 "llm_client.generate_json",
+                 return_value=creative_candidates(unsupported, supported, supported),
+             ), \
+             patch("local_asset_pipeline.LOCAL_ASSET_INDEX_PATH", tmp_path):
+            script = build_material_constrained_script(
+                product_info={"name": "宠物食品", "type": "食品"},
+                coverage={},
+                num_segments=1,
+                script_style="demonstration",
+                asset_index=asset_index,
+                segment_durations={0: 3.0},
+                narrative_plan_override=[{
+                    "segment": 0,
+                    "narrative": "hook",
+                    "marketing_intent": "hook",
+                    "product_story_role": "context",
+                }],
+            )
+
+        result = plan_and_materialize_local_clips(
+            asset_index=asset_index,
+            ad_script=script,
+            rhythm_template={"segments": [{"index": 0, "duration": 3.0}]},
+            clips_dir=tmp_path / "clips",
+            final_dir=tmp_path / "final",
+            output_name="visual-claim-grounding",
+            product_info={"name": "宠物食品", "type": "食品"},
+            plan_only=True,
+            record_failure=False,
+        )
+
+        assert script["segments"][0]["visual_claim"] == "这只哈士奇正把头凑近食盘"
+        assert script["segments"][0]["visual_binding"] == "required"
+        assert result["selected_segments"][0]["source_video"] == "subject-action.mp4"
+
+    def test_required_visual_binding_rejects_incidental_only_footage(self, tmp_path):
+        import pytest
+
+        from local_asset_pipeline import LocalAssetError, plan_and_materialize_local_clips
+
+        asset_index = {
+            "windows": [{
+                "window_id": "incidental-subject",
+                "source_video": "incidental.mp4",
+                "source_path": str(tmp_path / "incidental.mp4"),
+                "start": 0.0,
+                "end": 3.0,
+                "duration": 3.0,
+                "analysis": {
+                    "usable_for_ad": True,
+                    "confidence": 1.0,
+                    "product_story_role": "context",
+                    "product_relevance_prior": "high",
+                    "product_visibility": 0,
+                    "narrative_roles": ["hook"],
+                    "visible_subjects": ["environment"],
+                    "primary_visuals": ["手将袋装产品移出画面"],
+                    "visible_objects": ["圆形木桌", "画面角落的部分宠物头部"],
+                    "literal_actions": [
+                        "手将袋装产品移出画面",
+                        "画面角落的部分宠物头部保持静止",
+                    ],
+                    "visible_text": [],
+                    "evidence": "主体是桌面和袋装产品，画面角落仅露出部分宠物头部",
+                },
+                "motion": {
+                    "motion_class": "semi_dynamic",
+                    "subject_motion": "medium",
+                    "subject_motion_ratio": 0.08,
+                    "confidence": 1.0,
+                    "active_ranges": [[0.0, 3.0]],
+                },
+                "frame_quality": {"passed": True},
+            }],
+            "coverage": {},
+        }
+        script = {
+            "segments": [{
+                "segment": 0,
+                "narrative": "hook",
+                "product_story_role": "context",
+                "visual_binding": "required",
+                "visual_claim": "宠物守在餐盘旁等着开吃",
+                "visual_query": ["宠物清晰守在餐盘旁等待进食"],
+                "subtitle": "宠物守在餐盘旁等着开吃。",
+                "voiceover": "宠物守在餐盘旁等着开吃。",
+            }],
+        }
+
+        with pytest.raises(LocalAssetError) as exc_info:
+            plan_and_materialize_local_clips(
+                asset_index=asset_index,
+                ad_script=script,
+                rhythm_template={"segments": [{"index": 0, "duration": 3.0}]},
+                clips_dir=tmp_path / "clips",
+                final_dir=tmp_path / "final",
+                output_name="incidental-subject",
+                product_info={"name": "商品", "type": "食品"},
+                plan_only=True,
+                record_failure=False,
+            )
+
+        assert "素材无法完整覆盖脚本段" in str(exc_info.value)
+
     def test_global_material_capacity_merges_overlapping_source_windows(self):
         from local_asset_pipeline import _global_material_capability_pool
 
@@ -9312,6 +10121,79 @@ class TestGlobalMaterialDrivenScriptArchitecture:
 
         assert pool["total_usable_duration"] == 6.0
         assert pool["role_capabilities"][0]["capacity_seconds"] == 6.0
+
+    def test_primary_visuals_flow_into_segment_copy_contracts(self):
+        from local_asset_pipeline import (
+            _global_material_capability_pool,
+            _semantic_copy_constraints,
+        )
+
+        pool = _global_material_capability_pool(
+            [{
+                "window_id": "focal-action",
+                "source_path": "/tmp/source.mp4",
+                "start": 0.0,
+                "end": 3.0,
+                "product_story_role": "usage",
+                "primary_visuals": ["宠物清晰守在餐盘旁等待进食"],
+                "visible_objects": ["餐盘", "袋装产品"],
+                "literal_actions": ["宠物守在餐盘旁等待进食"],
+            }],
+            {"name": "商品", "type": "食品"},
+        )
+        constraints = _semantic_copy_constraints(
+            pool,
+            num_segments=1,
+            segment_durations={0: 3.0},
+            external_cta=False,
+            narrative_plan=[{
+                "segment": 0,
+                "product_story_role": "usage",
+            }],
+        )
+
+        assert constraints["0"]["visual_capability"]["primary_visuals"] == [
+            "宠物清晰守在餐盘旁等待进食"
+        ]
+
+    def test_copy_contract_only_exposes_primary_visuals_with_full_duration_capacity(self):
+        from local_asset_pipeline import (
+            _global_material_capability_pool,
+            _semantic_copy_constraints,
+        )
+
+        pool = _global_material_capability_pool(
+            [
+                {
+                    "window_id": "brief",
+                    "source_path": "/tmp/brief.mp4",
+                    "start": 0.0,
+                    "end": 2.0,
+                    "product_story_role": "usage",
+                    "primary_visuals": ["主体短暂进入画面"],
+                },
+                {
+                    "window_id": "complete",
+                    "source_path": "/tmp/complete.mp4",
+                    "start": 0.0,
+                    "end": 4.0,
+                    "product_story_role": "usage",
+                    "primary_visuals": ["主体持续完成使用动作"],
+                },
+            ],
+            {"name": "商品"},
+        )
+        constraints = _semantic_copy_constraints(
+            pool,
+            num_segments=1,
+            segment_durations={0: 3.5},
+            external_cta=False,
+            narrative_plan=[{"segment": 0, "product_story_role": "usage"}],
+        )
+
+        assert constraints["0"]["visual_capability"]["primary_visuals"] == [
+            "主体持续完成使用动作"
+        ]
 
     def test_script_generation_enforces_selected_voice_physical_capacity(self, tmp_path):
         import json
@@ -9953,6 +10835,355 @@ class TestGlobalMaterialDrivenScriptArchitecture:
 
 
 class TestLocalMultiClipPlanning:
+    @pytest.mark.parametrize(
+        ("copy", "expected_binding", "expected_actions"),
+        [
+            ("狗狗目前没有进食。", "supportive", []),
+            ("狗狗正在进食。", "required", ["consume"]),
+            ("你看，狗狗正在进食吗？", "required", ["consume"]),
+        ],
+    )
+    def test_copy_polarity_controls_observable_action_binding(
+        self,
+        copy,
+        expected_binding,
+        expected_actions,
+    ):
+        from local_asset_pipeline import _compile_material_copy_contract
+
+        contract = _compile_material_copy_contract({
+            "subtitle": copy,
+            "voiceover": copy,
+            "visual_binding": "supportive",
+            "visual_claim": "",
+            "visual_query": ["清晰展示产品"],
+        })
+
+        assert contract["effective_visual_binding"] == expected_binding
+        assert contract["observable_actions"] == expected_actions
+
+    def test_questioned_negative_action_copy_keeps_supportive_visual_preference(
+        self,
+        tmp_path,
+    ):
+        from local_asset_pipeline import (
+            _compile_material_copy_contract,
+            plan_and_materialize_local_clips,
+        )
+
+        copy = "你家狗狗是不是总挑嘴不爱吃饭？"
+        segment = {
+            "segment": 0,
+            "narrative": "hook",
+            "product_story_role": "finished_product",
+            "desired_product_story_role": "finished_product",
+            "subtitle": copy,
+            "voiceover": copy,
+            "visual_binding": "supportive",
+            "visual_claim": "",
+            "visual_query": ["蓝白包装袋多层堆叠，镜头拉远展示同系列包装"],
+            "evidence_refs": ["product:name"],
+            "claims": [],
+        }
+        contract = _compile_material_copy_contract(segment)
+
+        assert contract["effective_visual_binding"] == "supportive"
+        assert contract["observable_actions"] == []
+        assert contract["observable_visual_claim"] == ""
+
+        result = plan_and_materialize_local_clips(
+            asset_index={
+                "windows": [{
+                    "window_id": "clear-product",
+                    "source_video": "product.mp4",
+                    "source_path": str(tmp_path / "product.mp4"),
+                    "start": 0.0,
+                    "end": 3.0,
+                    "duration": 3.0,
+                    "analysis": {
+                        "usable_for_ad": True,
+                        "confidence": 1.0,
+                        "product_story_role": "finished_product",
+                        "product_relevance_prior": "high",
+                        "product_identity_supported": True,
+                        "product_visibility": 5,
+                        "narrative_roles": ["hook", "product_showcase"],
+                        "visible_subjects": ["product"],
+                        "primary_visuals": ["清晰展示袋装宠物食品正面包装"],
+                        "visible_objects": ["袋装宠物食品"],
+                        "literal_actions": [],
+                        "visible_text": ["宠物食品"],
+                        "evidence": "清晰展示袋装宠物食品正面包装",
+                    },
+                    "motion": {"motion_class": "semi_dynamic"},
+                    "frame_quality": {"passed": True},
+                }],
+                "coverage": {},
+            },
+            ad_script={"segments": [segment]},
+            rhythm_template={"segments": [{"index": 0, "duration": 2.78}]},
+            clips_dir=tmp_path / "clips",
+            final_dir=tmp_path / "final",
+            output_name="negative-question-supportive-visual",
+            product_info={"name": "宠物食品"},
+            plan_only=True,
+            record_failure=False,
+        )
+
+        assert result["selected_segments"][0]["source_video"] == "product.mp4"
+
+    def test_planner_rejects_action_copy_when_primary_visual_only_handles_package(self, tmp_path):
+        import pytest
+
+        from local_asset_pipeline import LocalAssetError, plan_and_materialize_local_clips
+
+        window = {
+            "window_id": "package-only",
+            "source_video": "package.mp4",
+            "source_path": str(tmp_path / "package.mp4"),
+            "start": 0.0,
+            "end": 3.0,
+            "duration": 3.0,
+            "analysis": {
+                "usable_for_ad": True,
+                "confidence": 1.0,
+                "product_story_role": "usage",
+                "product_relevance_prior": "high",
+                "product_visibility": 5,
+                "narrative_roles": ["usage_demo"],
+                "visible_subjects": ["hands", "product"],
+                "primary_visuals": ["手提起密封袋装商品"],
+                "visible_objects": ["密封袋装商品"],
+                "literal_actions": ["手提起密封袋装商品"],
+                "visible_text": [],
+                "evidence": "手提起密封袋装商品，没有开袋或喂食",
+            },
+            "motion": {
+                "motion_class": "semi_dynamic",
+                "subject_motion": "medium",
+                "subject_motion_ratio": 0.08,
+                "confidence": 1.0,
+                "active_ranges": [[0.0, 3.0]],
+            },
+            "frame_quality": {"passed": True},
+        }
+        script = {"segments": [{
+            "segment": 0,
+            "narrative": "usage_demo",
+            "product_story_role": "usage",
+            "desired_product_story_role": "usage",
+            "subtitle": "日常开袋就能喂。",
+            "voiceover": "日常开袋就能喂。",
+            "visual_binding": "supportive",
+            "visual_claim": "",
+            "visual_query": ["手提起密封袋装商品"],
+            "evidence_refs": ["product:name"],
+            "claims": [],
+        }]}
+
+        with pytest.raises(LocalAssetError, match="素材无法完整覆盖脚本段"):
+            plan_and_materialize_local_clips(
+                asset_index={"windows": [window], "coverage": {}},
+                ad_script=script,
+                rhythm_template={"segments": [{"index": 0, "duration": 3.0}]},
+                clips_dir=tmp_path / "clips",
+                final_dir=tmp_path / "final",
+                output_name="action-copy-contract",
+                product_info={"name": "宠物食品"},
+                plan_only=True,
+                record_failure=False,
+            )
+
+    def test_name_only_supportive_copy_rejects_unrelated_primary_context(self, tmp_path):
+        import pytest
+
+        from local_asset_pipeline import LocalAssetError, plan_and_materialize_local_clips
+
+        window = {
+            "window_id": "paper-boxes",
+            "source_video": "boxes.mp4",
+            "source_path": str(tmp_path / "boxes.mp4"),
+            "start": 0.0,
+            "end": 3.0,
+            "duration": 3.0,
+            "analysis": {
+                "usable_for_ad": True,
+                "confidence": 1.0,
+                "product_story_role": "context",
+                "product_relevance_prior": "high",
+                "product_visibility": 0,
+                "narrative_roles": ["hook"],
+                "visible_subjects": ["environment"],
+                "primary_visuals": ["桌面摆放纸盒和抽纸盒"],
+                "visible_objects": ["纸盒", "抽纸盒", "画面边缘的宠物局部"],
+                "literal_actions": ["纸盒保持静止"],
+                "visible_text": [],
+                "evidence": "主体是桌面的纸盒与抽纸盒",
+            },
+            "motion": {"motion_class": "semi_dynamic"},
+            "frame_quality": {"passed": True},
+        }
+        segment = {
+            "segment": 0,
+            "narrative": "hook",
+            "product_story_role": "context",
+            "desired_product_story_role": "context",
+            "subtitle": "选对狗粮真的能帮养宠家庭省不少心。",
+            "voiceover": "选对狗粮真的能帮养宠家庭省不少心。",
+            "visual_binding": "supportive",
+            "visual_claim": "",
+            "visual_query": ["桌面摆放纸盒和抽纸盒"],
+            "evidence_refs": ["product:name"],
+            "claims": [],
+        }
+
+        with pytest.raises(LocalAssetError, match="素材无法完整覆盖脚本段"):
+            plan_and_materialize_local_clips(
+                asset_index={"windows": [window], "coverage": {}},
+                ad_script={"segments": [segment]},
+                rhythm_template={"segments": [{"index": 0, "duration": 3.0}]},
+                clips_dir=tmp_path / "clips",
+                final_dir=tmp_path / "final",
+                output_name="name-only-context",
+                product_info={"name": "狗粮"},
+                plan_only=True,
+                record_failure=False,
+            )
+
+    def test_supportive_context_preference_falls_back_to_relevant_product_footage(self, tmp_path):
+        from local_asset_pipeline import plan_and_materialize_local_clips
+
+        def window(window_id, source, role, visibility, primary_visuals, objects):
+            return {
+                "window_id": window_id,
+                "source_video": source,
+                "source_path": str(tmp_path / source),
+                "start": 0.0,
+                "end": 3.0,
+                "duration": 3.0,
+                "analysis": {
+                    "usable_for_ad": True,
+                    "confidence": 1.0,
+                    "product_story_role": role,
+                    "product_relevance_prior": "high",
+                    "product_identity_supported": role == "finished_product",
+                    "product_visibility": visibility,
+                    "narrative_roles": ["product_showcase"],
+                    "visible_subjects": ["product"] if visibility else ["environment"],
+                    "primary_visuals": primary_visuals,
+                    "visible_objects": objects,
+                    "literal_actions": [],
+                    "visible_text": ["产品名称"] if visibility else [],
+                    "evidence": primary_visuals[0],
+                },
+                "motion": {"motion_class": "static"},
+                "frame_quality": {"passed": True},
+            }
+
+        segment = {
+            "segment": 0,
+            "narrative": "source_context",
+            "product_story_role": "context",
+            "desired_product_story_role": "context",
+            "visual_story_role": "context",
+            "subtitle": "适合日常使用常备。",
+            "voiceover": "适合日常使用常备。",
+            "visual_binding": "supportive",
+            "visual_claim": "",
+            "visual_query": ["桌面摆放纸盒和抽纸盒"],
+            "evidence_refs": ["product:name"],
+            "claims": [],
+        }
+        result = plan_and_materialize_local_clips(
+            asset_index={
+                "windows": [
+                    window(
+                        "unrelated-context",
+                        "context.mp4",
+                        "context",
+                        0,
+                        ["桌面摆放纸盒和抽纸盒"],
+                        ["纸盒", "抽纸盒"],
+                    ),
+                    window(
+                        "clear-product",
+                        "product.mp4",
+                        "finished_product",
+                        5,
+                        ["清晰展示产品正面包装"],
+                        ["产品包装"],
+                    ),
+                ],
+                "coverage": {},
+            },
+            ad_script={"segments": [segment]},
+            rhythm_template={"segments": [{"index": 0, "duration": 1.95}]},
+            clips_dir=tmp_path / "clips",
+            final_dir=tmp_path / "final",
+            output_name="context-product-fallback",
+            product_info={"name": "产品"},
+            plan_only=True,
+            record_failure=False,
+        )
+
+        assert result["selected_segments"][0]["source_video"] == "product.mp4"
+
+    def test_name_only_supportive_copy_accepts_clear_product_footage(self, tmp_path):
+        from local_asset_pipeline import plan_and_materialize_local_clips
+
+        window = {
+            "window_id": "clear-product",
+            "source_video": "product.mp4",
+            "source_path": str(tmp_path / "product.mp4"),
+            "start": 0.0,
+            "end": 3.0,
+            "duration": 3.0,
+            "analysis": {
+                "usable_for_ad": True,
+                "confidence": 1.0,
+                "product_story_role": "finished_product",
+                "product_relevance_prior": "high",
+                "product_identity_supported": True,
+                "product_visibility": 5,
+                "narrative_roles": ["product_showcase"],
+                "visible_subjects": ["product"],
+                "primary_visuals": ["清晰展示袋装狗粮正面包装"],
+                "visible_objects": ["袋装狗粮"],
+                "literal_actions": [],
+                "visible_text": ["狗粮"],
+                "evidence": "清晰展示袋装狗粮正面包装",
+            },
+            "motion": {"motion_class": "semi_dynamic"},
+            "frame_quality": {"passed": True},
+        }
+        segment = {
+            "segment": 0,
+            "narrative": "product_showcase",
+            "product_story_role": "finished_product",
+            "desired_product_story_role": "finished_product",
+            "subtitle": "选对狗粮真的能帮养宠家庭省不少心。",
+            "voiceover": "选对狗粮真的能帮养宠家庭省不少心。",
+            "visual_binding": "supportive",
+            "visual_claim": "",
+            "visual_query": ["清晰展示袋装狗粮正面包装"],
+            "evidence_refs": ["product:name"],
+            "claims": [],
+        }
+
+        result = plan_and_materialize_local_clips(
+            asset_index={"windows": [window], "coverage": {}},
+            ad_script={"segments": [segment]},
+            rhythm_template={"segments": [{"index": 0, "duration": 3.0}]},
+            clips_dir=tmp_path / "clips",
+            final_dir=tmp_path / "final",
+            output_name="name-only-product",
+            product_info={"name": "狗粮"},
+            plan_only=True,
+            record_failure=False,
+        )
+
+        assert result["selected_segments"][0]["source_video"] == "product.mp4"
+
     """One semantic cue may retrieve multiple evidence-backed edit clips."""
 
     def test_planner_restores_source_tail_reserved_only_for_frame_analysis(self, tmp_path):
@@ -10511,6 +11742,159 @@ class TestLocalMultiClipPlanning:
         assert [item["semantic_segment"] for item in result["selected_segments"]] == [0, 0]
         assert materialized == pytest.approx([(0.0, 3.0), (3.0, 5.0)])
         assert sum(item["target_duration"] for item in result["selected_segments"]) == pytest.approx(5.0)
+
+    def test_planner_prefers_unused_sources_when_visual_support_is_equivalent(self, tmp_path):
+        from local_asset_pipeline import plan_and_materialize_local_clips
+
+        def window(source, duration, confidence):
+            return {
+                "window_id": source,
+                "source_path": str(tmp_path / source),
+                "source_video": source,
+                "start": 0.0,
+                "end": duration,
+                "duration": duration,
+                "analysis": {
+                    "usable_for_ad": True,
+                    "confidence": confidence,
+                    "product_story_role": "finished_product",
+                    "product_visibility": 5,
+                    "product_relevance_prior": "high",
+                    "visible_subjects": ["product"],
+                    "visible_objects": ["瓶装产品"],
+                    "literal_actions": [],
+                    "visible_text": [],
+                    "narrative_roles": ["product_showcase"],
+                    "evidence": "清晰展示瓶装产品",
+                },
+                "motion": {"motion_class": "semi_dynamic"},
+                "frame_quality": {"passed": True},
+            }
+
+        segments = [{
+            "segment": index,
+            "narrative": "product_showcase",
+            "marketing_intent": "value",
+            "product_story_role": "finished_product",
+            "desired_product_story_role": "finished_product",
+            "subtitle": f"产品信息 {index}",
+            "voiceover": f"产品信息 {index}",
+            "visual_query": ["瓶装产品"],
+            "claims": [],
+        } for index in range(3)]
+        result = plan_and_materialize_local_clips(
+            asset_index={
+                "asset_folder": str(tmp_path),
+                "windows": [
+                    window("source-a.mp4", 6.0, 1.0),
+                    window("source-b.mp4", 2.0, 0.99),
+                    window("source-c.mp4", 2.0, 0.98),
+                ],
+                "coverage": {},
+            },
+            ad_script={"segments": segments},
+            rhythm_template={
+                "segments": [
+                    {"index": index, "duration": 2.0, "type": "product_showcase"}
+                    for index in range(3)
+                ],
+            },
+            clips_dir=tmp_path / "clips",
+            final_dir=tmp_path / "final",
+            output_name="source-diversity",
+            product_info={"name": "产品"},
+            plan_only=True,
+            record_failure=False,
+        )
+
+        assert [item["source_video"] for item in result["selected_segments"]] == [
+            "source-a.mp4",
+            "source-b.mp4",
+            "source-c.mp4",
+        ]
+
+    def test_planner_reuses_source_when_only_it_has_required_visual_evidence(self, tmp_path):
+        from local_asset_pipeline import plan_and_materialize_local_clips
+
+        required_visual = "宠物低头进食餐盘内的颗粒状食物"
+
+        def window(source, primary_visual):
+            return {
+                "window_id": source,
+                "source_path": str(tmp_path / source),
+                "source_video": source,
+                "start": 0.0,
+                "end": 4.0,
+                "duration": 4.0,
+                "analysis": {
+                    "usable_for_ad": True,
+                    "confidence": 1.0,
+                    "product_story_role": "usage",
+                    "product_visibility": 5,
+                    "product_relevance_prior": "high",
+                    "visible_subjects": ["product"],
+                    "primary_visuals": [primary_visual],
+                    "visible_objects": ["宠物", "餐盘"],
+                    "literal_actions": [primary_visual],
+                    "visible_text": [],
+                    "narrative_roles": ["usage_demo"],
+                    "evidence": primary_visual,
+                },
+                "motion": {
+                    "motion_class": "semi_dynamic",
+                    "subject_motion": "medium",
+                    "subject_motion_ratio": 0.08,
+                    "confidence": 1.0,
+                    "active_ranges": [[0.0, 4.0]],
+                },
+                "frame_quality": {"passed": True},
+            }
+
+        segments = [{
+            "segment": index,
+            "narrative": "usage_demo",
+            "marketing_intent": "value",
+            "product_story_role": "usage",
+            "desired_product_story_role": "usage",
+            "subtitle": "宠物正在吃",
+            "voiceover": "宠物正在吃",
+            "visual_binding": "required",
+            "visual_claim": "宠物正在吃",
+            "visual_query": [required_visual],
+            "claims": [],
+        } for index in range(2)]
+        result = plan_and_materialize_local_clips(
+            asset_index={
+                "asset_folder": str(tmp_path),
+                "windows": [
+                    window("required.mp4", required_visual),
+                    window("supportive.mp4", "多件包装产品摆放在桌面"),
+                ],
+                "coverage": {},
+            },
+            ad_script={"segments": segments},
+            rhythm_template={
+                "segments": [
+                    {"index": index, "duration": 2.0, "type": "usage_demo"}
+                    for index in range(2)
+                ],
+            },
+            clips_dir=tmp_path / "clips",
+            final_dir=tmp_path / "final",
+            output_name="required-source-reuse",
+            product_info={"name": "宠物食品"},
+            plan_only=True,
+            record_failure=False,
+        )
+
+        assert [item["source_video"] for item in result["selected_segments"]] == [
+            "required.mp4",
+            "required.mp4",
+        ]
+        assert [
+            (item["source_start"], item["source_end"])
+            for item in result["selected_segments"]
+        ] == pytest.approx([(0.0, 2.0), (2.0, 4.0)])
 
     def test_global_planner_reserves_unique_action_evidence_for_action_cue(self, tmp_path):
         from local_asset_pipeline import plan_and_materialize_local_clips

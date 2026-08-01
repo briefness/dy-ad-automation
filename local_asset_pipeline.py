@@ -59,17 +59,19 @@ from config import (
 
 
 INDEX_VERSION = 6
-VISION_ANALYSIS_VERSION = 2
+VISION_ANALYSIS_VERSION = 3
 REFERENCE_PROFILE_VERSION = 5
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 MIN_MATCH_SCORE = 0.70
 MIN_PLAN_SCORE = 0.72
 MIN_KEY_SEGMENT_CONFIDENCE = 0.75
+SOURCE_REUSE_SELECTION_PENALTY = 0.15
 SCENE_CHANGE_THRESHOLD = 0.28
 MIN_SCENE_SECONDS = 1.0
 MOTION_SAMPLE_FRAMES = 12
 MAX_INITIAL_SCRIPT_JSON_ATTEMPTS = 3
-SCRIPT_CONTRACT_VERSION = 52
+MAX_SCRIPT_RESPONSE_TOKENS = 6000
+SCRIPT_CONTRACT_VERSION = 57
 MIN_VOICEOVER_UNITS_PER_SECOND = 4.2
 MIN_OUTRO_VOICEOVER_UNITS_PER_SECOND = 4.4
 MAX_OUTRO_VOICEOVER_UNITS_PER_SECOND = 5.4
@@ -138,6 +140,13 @@ QUALITY_ENDORSEMENT_CLAIM = re.compile(
     r"用料(?:很)?实在|用料扎实|原料扎实|好原料|好基底|品质(?:更)?好|高品质|"
     r"不掺假|没有掺假|假货|正品|保真|货真价实|真材实料|靠谱|放心(?:买|选|喝|用)"
 )
+CONCRETE_PRODUCT_ASSERTION = re.compile(
+    r"(?:可选|可供选择|提供.{0,8}(?:款|版本|规格|型号)|"
+    r"(?:是|为|属于).{0,12}(?:配方|成分|材质|工艺|规格|型号|版本|产地|等级)|"
+    r"(?:满足|支持|达到|符合).{0,16}(?:需求|标准|要求)|"
+    r"[\w\u4e00-\u9fff]{1,8}性更[\w\u4e00-\u9fff]{1,6}|"
+    r"(?:提升|降低|增强|改善).{0,12}(?:效果|表现|效率|比例|程度|体验))"
+)
 ACTION_CONCEPT_PATTERNS = {
     "pick": re.compile(r"拿起|取出|举起|抬起"),
     "place": re.compile(r"放回|放下|摆放|排列|放置|调整"),
@@ -151,6 +160,21 @@ ACTION_CONCEPT_PATTERNS = {
 AMBIGUOUS_STATE_ACTIONS = re.compile(r"摆放|排列|放置")
 ACTION_CONTEXT = re.compile(r"手|双手|将|正在|开始|持续|逐步|依次|调整|向.+(?:移动|倒|放)")
 CAPABILITY_ACTION_CONTEXT = re.compile(r"随时|可以|可直接|能(?:够)?|方便|无需|不用|想.+就")
+DIRECT_VISUAL_ASSERTION = re.compile(
+    r"(?:你看[，,:：]|你(?:来|再)?看看|(?:画面|镜头)(?:里|中)|"
+    r"(?:正在|还在|一直).{0,18}(?:着|中))"
+)
+VISUAL_OBSERVATION_ACTIONS = {
+    **ACTION_CONCEPT_PATTERNS,
+    "open": re.compile(r"打开|关闭|撕开|拆开"),
+    "consume": re.compile(r"进食|食用|舔食|啃食|爱吃|吃得|低头吃|正在吃"),
+    "feed": re.compile(r"投喂|喂食|喂给|喂它|喂他|喂她|(?:直接|正在|开始|开袋.{0,4})喂"),
+    "wait": re.compile(r"等待|等着|守在.{0,8}(?:旁|边)|蹲在.{0,8}(?:旁|边)"),
+}
+VISUAL_SUBJECT_KINDS = {
+    "person": re.compile(r"人物|人手|双手|单手|手部|消费者|顾客|模特|男子|女子|男士|女士|小孩|儿童"),
+    "animal": re.compile(r"宠物|动物|犬|狗|猫|兔|鸟|鱼|马|牛|羊|猪"),
+}
 
 
 class LocalAssetError(RuntimeError):
@@ -770,7 +794,16 @@ def _text_matches_facts(text: str, facts: List[str]) -> bool:
     )
 
 
+def _is_attributed_or_questioned_claim(text: str) -> bool:
+    return bool(
+        re.search(r"号称|据说|听说|宣称|所谓", str(text or ""))
+        and re.search(r"[？?]|吗(?:[，。！？,.!?]|$)", str(text or ""))
+    )
+
+
 def _infer_copy_claims(text: str) -> List[Dict[str, str]]:
+    if _is_attributed_or_questioned_claim(text):
+        return []
     claims: List[Dict[str, str]] = []
     if EXPLICIT_INGREDIENT_CLAIM.search(text):
         claims.append({"text": text, "type": "ingredient"})
@@ -886,26 +919,7 @@ def _marketing_claim_violations(
 
 
 def _temporal_action_claims(segment: Dict[str, Any]) -> List[str]:
-    claims = []
-    for field in ("subtitle", "voiceover", "visual_requirement"):
-        text = str(segment.get(field) or "")
-        for concept, pattern in ACTION_CONCEPT_PATTERNS.items():
-            for action_match in pattern.finditer(text):
-                if field != "visual_requirement" and any(
-                    capability.end() <= action_match.start()
-                    and action_match.start() - capability.end() <= 4
-                    for capability in CAPABILITY_ACTION_CONTEXT.finditer(text)
-                ):
-                    continue
-                if (
-                    concept == "place"
-                    and AMBIGUOUS_STATE_ACTIONS.search(text)
-                    and not ACTION_CONTEXT.search(text)
-                ):
-                    continue
-                claims.append(concept)
-                break
-    return list(dict.fromkeys(claims))
+    return list(_compile_material_copy_contract(segment)["observable_actions"])
 
 
 def _unsupported_action_claims(segment: Dict[str, Any], analysis: Dict[str, Any]) -> List[str]:
@@ -919,7 +933,7 @@ def _unsupported_action_claims(segment: Dict[str, Any], analysis: Dict[str, Any]
     return [
         concept
         for concept in claims
-        if not ACTION_CONCEPT_PATTERNS[concept].search(event_text)
+        if not VISUAL_OBSERVATION_ACTIONS[concept].search(event_text)
     ]
 
 
@@ -948,6 +962,17 @@ def _story_role_supported(segment: Dict[str, Any], analysis: Dict[str, Any]) -> 
     product_roles = {"finished_product", "usage", "result"}
     if required in product_roles and actual in product_roles:
         return str(analysis.get("product_relevance_prior") or "").lower() == "high"
+    if required in {"context", "unknown"} and actual in product_roles:
+        material_copy_contract = _compile_material_copy_contract(segment)
+        product_grounded = bool(analysis.get("product_identity_supported")) or (
+            str(analysis.get("product_relevance_prior") or "").lower() == "high"
+            and int(analysis.get("product_visibility") or 0) >= 3
+        )
+        return bool(
+            product_grounded
+            and material_copy_contract["effective_visual_binding"] != "required"
+            and not material_copy_contract["concrete_product_claim"]
+        )
     if required in {"ingredient", "origin", "production"}:
         return (
             actual == "finished_product"
@@ -1189,9 +1214,13 @@ def _copy_preflight_check(
     duration: Optional[float],
     product_info: Dict[str, Any],
     analysis: Dict[str, Any],
+    evidence_anchors: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Reject only copy claims that exceed trusted product or visual evidence."""
     violations = _marketing_claim_violations(segment, product_info, analysis)
+    material_copy_contract = _compile_material_copy_contract(segment, evidence_anchors)
+    if material_copy_contract["evidence_violations"]:
+        violations["evidence_refs"] = list(material_copy_contract["evidence_violations"])
     identity_violations = _product_identity_violations(
         segment,
         str(product_info.get("name") or ""),
@@ -1227,6 +1256,7 @@ def _validate_derived_material_segment(
     segment: Dict[str, Any],
     window: Dict[str, Any],
     product_info: Dict[str, Any],
+    evidence_anchors: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Validate copy against independent indexed evidence without re-querying that same evidence."""
     analysis = window.get("analysis") or {}
@@ -1249,7 +1279,29 @@ def _validate_derived_material_segment(
             "reason": "脚本要求的素材语义类别与视频内容识别结果不一致",
             "validation_source": "indexed_local_evidence",
         }
-    deterministic = _copy_preflight_check(segment, None, product_info, analysis)
+    visual_support_reason = _required_visual_support_reason(segment, analysis)
+    if visual_support_reason:
+        return {
+            "supported": False,
+            "subtitle_supported": True,
+            "voiceover_supported": True,
+            "visual_supported": False,
+            "static_supported": True,
+            "dynamic_required": bool(_temporal_action_claims(segment)),
+            "dynamic_supported": True,
+            "confidence": max(0.75, float(analysis.get("confidence") or 0.0)),
+            "unsupported_fields": ["visual_requirement"],
+            "unsupported_claims": [visual_support_reason],
+            "reason": visual_support_reason,
+            "validation_source": "material_copy_contract",
+        }
+    deterministic = _copy_preflight_check(
+        segment,
+        None,
+        product_info,
+        analysis,
+        evidence_anchors,
+    )
     if deterministic is not None:
         return {**deterministic, "validation_source": "indexed_local_evidence"}
     action_claims = _temporal_action_claims(segment)
@@ -1454,6 +1506,7 @@ Return this exact JSON shape:
   "action_phase": "setup|action|outcome|none",
   "motion_level": "low|medium|high",
   "visible_subjects": ["person|product|hands|environment|text|unknown"],
+  "primary_visuals": [{{"description": "足以独立承载一句文案的清晰主体及其动作或状态", "prominence": "primary|incidental", "visible_frame_count": 0}}],
   "setting": "桌面|柜台|货架|室内房间|传统茶室|其他|unknown",
   "literal_actions": ["画面中直接可见的动作，使用中文"],
   "temporal_events": [{{"start": 0.0, "end": 0.0, "action": "按时间顺序描述直接可见动作"}}],
@@ -1483,6 +1536,8 @@ Rules:
 - confidence and relation_confidence are 0-1.
 - product_story_role describes what the footage itself depicts, not an asserted relationship to the advertised product.
 - 不要只按关键词字面匹配；应根据连续画面中可辨认的对象、环境和动作做有证据约束的语义归类。
+- primary_visuals 最多3项，只保留连续至少2帧清晰可辨、处于画面主要位置或承担主要动作、足以独立承载一句字幕主张的主体及动作/状态。
+- 画面边角、只露出局部、背景陪衬、包装图案或虽持续出现但不承担主要叙事的对象，prominence 必须为 incidental，不能作为主视觉。
 - 遇到植物、花、果实、种子、叶片、豆类或其他天然原料时，应根据花型、叶形、果实、枝条、生长形态及跨帧一致性给出尽可能具体的 visual_entity_candidates；无法从形态区分时保留多个候选并降低 confidence，不得强猜。
 - visual_entity_candidates 只能来自画面形态，不得依据文件名、产品资料、标签文案或口播迎合某个原料答案；每个候选必须写出直接可见的形态 evidence。
 - 可辨认的成片种植、栽培园区、农场、果园、花田或山地培育环境应归类为 origin；这只表示素材的商品叙事角色，不得据此断言它就是当前产品的产地，也不得猜测具体地名。
@@ -1866,6 +1921,21 @@ def _normalize_analysis(raw: Dict[str, Any]) -> Dict[str, Any]:
     subjects = raw.get("visible_subjects") or []
     if isinstance(subjects, str):
         subjects = [subjects]
+    primary_visuals = []
+    for item in raw.get("primary_visuals") or []:
+        if not isinstance(item, dict):
+            continue
+        description = str(item.get("description") or "").strip()
+        try:
+            visible_count = int(item.get("visible_frame_count", 0))
+        except (TypeError, ValueError):
+            visible_count = 0
+        if (
+            description
+            and str(item.get("prominence") or "").strip().lower() == "primary"
+            and visible_count >= 2
+        ):
+            primary_visuals.append(description)
     literal_actions = raw.get("literal_actions") or []
     if isinstance(literal_actions, str):
         literal_actions = [literal_actions]
@@ -1965,6 +2035,7 @@ def _normalize_analysis(raw: Dict[str, Any]) -> Dict[str, Any]:
         "action_phase": str(raw.get("action_phase") or "none"),
         "motion_level": str(raw.get("motion_level") or "low"),
         "visible_subjects": [str(s) for s in subjects],
+        "primary_visuals": list(dict.fromkeys(primary_visuals))[:3],
         "setting": str(raw.get("setting") or "unknown"),
         "literal_actions": [str(value) for value in literal_actions],
         "temporal_events": normalized_events,
@@ -2558,6 +2629,8 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
             draft = json.loads(draft_path.read_text(encoding="utf-8"))
             if (
                 draft.get("index_version") == INDEX_VERSION
+                and int(draft.get("vision_analysis_version") or 1)
+                == VISION_ANALYSIS_VERSION
                 and draft.get("frame_evidence_version") == FRAME_EVIDENCE_VERSION
                 and draft.get("audio_understanding_signature") == audio_backend_signature
                 and _signatures_match(draft.get("sources", []), signatures)
@@ -2767,6 +2840,7 @@ def _material_catalog(
             "narrative_roles": analysis.get("narrative_roles") or [],
             "action_phase": analysis.get("action_phase"),
             "visible_subjects": analysis.get("visible_subjects") or [],
+            "primary_visuals": analysis.get("primary_visuals") or [],
             "setting": analysis.get("setting"),
             "literal_actions": analysis.get("literal_actions") or [],
             "temporal_events": analysis.get("temporal_events") or [],
@@ -3583,6 +3657,7 @@ def _global_material_capability_pool(
             "role": role,
             "window_count": 0,
             "capacity_seconds": 0.0,
+            "primary_visuals": [],
             "visual_concepts": [],
             "visual_entities": [],
             "literal_actions": [],
@@ -3592,6 +3667,7 @@ def _global_material_capability_pool(
             "spoken_intents": [],
         })
         group["window_count"] += 1
+        append_unique(group["primary_visuals"], material.get("primary_visuals"), 8)
         append_unique(group["visual_concepts"], material.get("visible_objects"), 8)
         append_unique(group["visual_entities"], material.get("matched_product_entities"), 6)
         append_unique(group["literal_actions"], material.get("literal_actions"), 6)
@@ -3624,12 +3700,22 @@ def _global_material_capability_pool(
         role_groups.items(),
         key=lambda item: (-float(item[1]["capacity_seconds"]), item[0]),
     ):
+        role_items = role_materials.get(role) or []
+        primary_visual_capacities = {
+            visual: round(_deduplicated_material_duration([
+                item
+                for item in role_items
+                if visual in (item.get("primary_visuals") or [])
+            ]), 3)
+            for visual in group.get("primary_visuals") or []
+        }
         role_capabilities.append({
             **group,
             "capacity_seconds": round(
-                _deduplicated_material_duration(role_materials.get(role) or []),
+                _deduplicated_material_duration(role_items),
                 3,
             ),
+            "primary_visual_capacities": primary_visual_capacities,
         })
 
     evidence_anchors: List[Dict[str, Any]] = []
@@ -3740,8 +3826,18 @@ def _semantic_copy_constraints(
         goal = str(plan_item.get("copy_goal") or default_goal).strip()
         role = str(plan_item.get("product_story_role") or "").strip().lower()
         capability = capabilities_by_role.get(role) or {}
+        primary_visuals = list(capability.get("primary_visuals") or [])
+        primary_capacities = capability.get("primary_visual_capacities") or {}
+        segment_duration = float(segment_durations.get(index) or 0.0)
+        if primary_capacities and segment_duration > 0:
+            primary_visuals = [
+                visual
+                for visual in primary_visuals
+                if float(primary_capacities.get(visual) or 0.0) + 0.08 >= segment_duration
+            ]
         visual_capability = {
             "role": role,
+            "primary_visuals": primary_visuals[:6],
             "visual_concepts": list(capability.get("visual_concepts") or [])[:8],
             "visual_entities": list(capability.get("visual_entities") or [])[:6],
             "literal_actions": list(capability.get("literal_actions") or [])[:6],
@@ -3907,10 +4003,14 @@ def _build_compact_script_prompt(
         "rules": [
             "每段返回一个语义节拍和 cue，按 segment 顺序拼接为一条连续口播",
             "各 cue 只作语义锚点，不按镜头限字；narration_guidance 仅为非阻断性精炼建议",
-            "只引用全局 evidence_anchors id，不得虚构事实或感官",
+            "只引用全局 evidence_anchors:product:name 只证身份，具体事实须引用相关非名称锚点",
             "spoken_summaries 和 spoken_intents 只用于理解原素材表达与叙事，不是事实来源，不得复制其中未经核验的主张",
             "product_story_role 由素材理解确定，不得改写",
             "cue 只推进购买理由；visual_query 只能取本段 visual_capability，不得含素材 ID 或文件名",
+            (
+                "required只绑定当前可见动作/状态；claim取最短原句，query取对应primary_visuals；"
+                "其余supportive/none"
+            ),
             "cue 可跨段成句，标点供单次 TTS 断句",
             "返回三个不同候选；差异方向由素材、script_style、参考片观察和使用者规则决定",
             (
@@ -3926,7 +4026,20 @@ def _build_compact_script_prompt(
             "total_usable_duration": (material_capability_pool or {}).get("total_usable_duration"),
             "semantic_beat_count": len(segment_contracts),
         },
-        "visual_capabilities": (material_capability_pool or {}).get("role_capabilities") or [],
+        "visual_capabilities": [
+            {
+                "role": str(item.get("role") or ""),
+                "capacity_seconds": float(item.get("capacity_seconds") or 0.0),
+                **({
+                    "spoken_summaries": list(item.get("spoken_summaries") or [])[:3],
+                } if item.get("spoken_summaries") else {}),
+                **({
+                    "spoken_intents": list(item.get("spoken_intents") or [])[:3],
+                } if item.get("spoken_intents") else {}),
+            }
+            for item in (material_capability_pool or {}).get("role_capabilities") or []
+            if str(item.get("role") or "").strip()
+        ],
         "viral_creative_blueprint": creative_blueprint,
         "user_script_quality_policy": {
             "source": "explicit_user_feedback_only",
@@ -3960,11 +4073,341 @@ def _build_compact_script_prompt(
                 "cue": "connected spoken copy grounded in referenced evidence",
                 "evidence_refs": ["allowed evidence id"],
                 "claims": [],
-                "visual_query": ["items from this segment visual_capability"],
+                "visual_binding": "required|supportive|none",
+                "visual_claim": "visible cue clause or empty string",
+                "visual_query": ["one item from this segment visual_capability"],
             }],
             **({"outro_cue": "connected CTA ending containing required_text"} if external_cta else {}),
         }]},
     }
+
+
+def _visual_observation_actions(text: Any) -> List[str]:
+    value = str(text or "")
+    actions: List[str] = []
+    for concept, pattern in VISUAL_OBSERVATION_ACTIONS.items():
+        for match in pattern.finditer(value):
+            if any(
+                capability.end() <= match.start()
+                and match.start() - capability.end() <= 4
+                for capability in CAPABILITY_ACTION_CONTEXT.finditer(value)
+            ):
+                continue
+            if (
+                concept == "place"
+                and AMBIGUOUS_STATE_ACTIONS.search(value)
+                and not ACTION_CONTEXT.search(value)
+            ):
+                continue
+            if (
+                concept == "mix"
+                and match.group(0) == "加入"
+                and not re.search(r"手|把|将|正在|开始|随后|接着|向.{0,12}加入", value)
+            ):
+                continue
+            actions.append(concept)
+            break
+    if "wait" in actions and re.search(r"(?:等待|等着).{0,4}(?:吃|开吃|进食)", value):
+        actions = [action for action in actions if action != "consume"]
+    return list(dict.fromkeys(actions))
+
+
+def _asserted_visual_observation_actions(text: Any) -> List[str]:
+    """Return actions stated as present facts, excluding questions and negation."""
+    value = str(text or "")
+    actions = _visual_observation_actions(value)
+    if not actions:
+        return []
+    if (
+        re.search(r"[？?]|是不是|是否|有没有|能不能|会不会|怎么|为什么", value)
+        and not DIRECT_VISUAL_ASSERTION.search(value)
+    ):
+        return []
+
+    asserted: List[str] = []
+    for action in actions:
+        pattern = VISUAL_OBSERVATION_ACTIONS[action]
+        for match in pattern.finditer(value):
+            clause_prefix = re.split(
+                r"[，。！？,.!?；;]|但是|但|却|而且|而|仍然|仍|还会|也会",
+                value[:match.start()],
+            )[-1]
+            if re.search(
+                r"(?:不(?!但|仅|只)|没(?:有)?|未|并非|不是|无法|不能|不会|别|勿)"
+                r"[^，。！？,.!?；;]{0,8}$",
+                clause_prefix,
+            ):
+                continue
+            asserted.append(action)
+            break
+    return asserted
+
+
+def _visual_subject_kinds(text: Any) -> List[str]:
+    value = str(text or "")
+    return [
+        kind
+        for kind, pattern in VISUAL_SUBJECT_KINDS.items()
+        if pattern.search(value)
+    ]
+
+
+def _material_copy_text(segment: Dict[str, Any]) -> str:
+    """Return the authored copy source before any selected-window metadata."""
+    for field in ("cue", "voiceover", "subtitle"):
+        value = re.sub(r"\s+", " ", str(segment.get(field) or "")).strip()
+        if value:
+            return value
+    return ""
+
+
+def _compile_material_copy_contract(
+    segment: Dict[str, Any],
+    evidence_anchors: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Compile one code-owned copy/evidence contract for every pipeline stage."""
+    from material_copy_optimizer import semantic_overlap
+
+    copy_text = _material_copy_text(segment)
+    explicit_visual_claim = str(segment.get("visual_claim") or "").strip()
+    visual_requirement = str(segment.get("visual_requirement") or "").strip()
+    claim_actions = _visual_observation_actions(explicit_visual_claim)
+    observable_actions = list(dict.fromkeys([
+        *_asserted_visual_observation_actions(copy_text),
+        *claim_actions,
+        *_visual_observation_actions(visual_requirement),
+    ]))
+    subject_kinds = _visual_subject_kinds(" ".join(
+        value for value in (copy_text, explicit_visual_claim) if value
+    ))
+    queries = segment.get("visual_query") or []
+    if isinstance(queries, str):
+        queries = [queries]
+    queries = [str(value).strip() for value in queries if str(value).strip()]
+    if not queries and visual_requirement:
+        queries = [visual_requirement]
+
+    requested_binding = str(segment.get("visual_binding") or "").strip().lower()
+    if requested_binding not in {"required", "supportive", "none"}:
+        requested_binding = "required" if explicit_visual_claim else "supportive"
+    direct_visual_assertion = bool(DIRECT_VISUAL_ASSERTION.search(copy_text))
+    if explicit_visual_claim:
+        effective_binding = (
+            "required"
+            if claim_actions
+            or direct_visual_assertion
+            or max(
+                (semantic_overlap(explicit_visual_claim, query) for query in queries),
+                default=0.0,
+            ) >= 0.08
+            else "supportive"
+        )
+    elif observable_actions or direct_visual_assertion:
+        effective_binding = "required"
+    else:
+        effective_binding = requested_binding
+    observable_visual_claim = explicit_visual_claim or (
+        copy_text if effective_binding == "required" else ""
+    )
+
+    anchors = {
+        str(anchor.get("id")): anchor
+        for anchor in evidence_anchors or []
+        if isinstance(anchor, dict) and anchor.get("id")
+    }
+    raw_evidence_refs = segment.get("evidence_refs") or []
+    if isinstance(raw_evidence_refs, str):
+        raw_evidence_refs = [raw_evidence_refs]
+    evidence_refs = list(dict.fromkeys(
+        str(value).strip()
+        for value in raw_evidence_refs
+        if str(value).strip()
+    ))
+    invalid_refs = [reference for reference in evidence_refs if anchors and reference not in anchors]
+    non_name_refs = [
+        reference
+        for reference in evidence_refs
+        if reference in anchors
+        and reference != "product:name"
+        and str(anchors[reference].get("usage_scope") or "") != "product_identity"
+    ]
+    raw_claims = segment.get("claims") or []
+    if not isinstance(raw_claims, list):
+        raw_claims = []
+    structured_claim_texts = [
+        str(claim.get("text") or "").strip()
+        for claim in raw_claims
+        if isinstance(claim, dict) and str(claim.get("text") or "").strip()
+    ]
+    attributed_or_questioned_claim = _is_attributed_or_questioned_claim(copy_text)
+    concrete_product_claim = bool(
+        structured_claim_texts
+        or (
+            not attributed_or_questioned_claim
+            and (
+                _infer_copy_claims(copy_text)
+                or CONCRETE_PRODUCT_ASSERTION.search(copy_text)
+            )
+        )
+    )
+    relevant_non_name_refs = [
+        reference
+        for reference in non_name_refs
+        if max(
+            (
+                semantic_overlap(text, str(anchors[reference].get("text") or ""))
+                for text in [copy_text, *structured_claim_texts]
+                if text
+            ),
+            default=0.0,
+        ) >= 0.16
+    ]
+    evidence_violations = [
+        "引用了不存在的 Evidence Anchor：" + ",".join(invalid_refs)
+    ] if invalid_refs else []
+    if anchors and concrete_product_claim and not relevant_non_name_refs:
+        evidence_violations.append(
+            "具体产品主张缺少相关的非名称 Evidence Anchor"
+            if not non_name_refs else
+            "具体产品主张引用的 Evidence Anchor 与文案无关"
+        )
+
+    return {
+        "copy_text": copy_text,
+        "requested_visual_binding": requested_binding,
+        "effective_visual_binding": effective_binding,
+        "observable_visual_claim": observable_visual_claim,
+        "observable_actions": observable_actions,
+        "subject_kinds": subject_kinds,
+        "visual_queries": queries,
+        "evidence_refs": evidence_refs,
+        "identity_only_evidence": bool(evidence_refs) and not non_name_refs,
+        "requires_primary_relevance": bool(evidence_refs) and effective_binding != "none",
+        "concrete_product_claim": concrete_product_claim,
+        "evidence_violations": evidence_violations,
+    }
+
+
+def _effective_visual_binding(segment: Dict[str, Any]) -> str:
+    """Make the model's binding label enforceable from observable cue evidence."""
+    return str(_compile_material_copy_contract(segment)["effective_visual_binding"])
+
+
+def _visual_grounding_violations(
+    candidate: Dict[str, Any],
+    segment_contracts: List[Dict[str, Any]],
+    evidence_anchors: Optional[List[Dict[str, Any]]] = None,
+) -> List[str]:
+    """Require observable claims to cite structurally compatible primary visuals."""
+    from material_copy_optimizer import semantic_overlap
+
+    contracts = {
+        int(item.get("segment")): item
+        for item in segment_contracts
+        if isinstance(item, dict) and str(item.get("segment", "")).isdigit()
+    }
+    violations: List[str] = []
+    for segment in candidate.get("segments") or []:
+        if not isinstance(segment, dict) or not str(segment.get("segment", "")).isdigit():
+            continue
+        index = int(segment["segment"])
+        material_copy_contract = _compile_material_copy_contract(segment, evidence_anchors)
+        cue = material_copy_contract["copy_text"]
+        explicit_claim = str(segment.get("visual_claim") or "").strip()
+        claim = str(material_copy_contract["observable_visual_claim"])
+        queries = list(material_copy_contract["visual_queries"])
+        contract = contracts.get(index) or {}
+        capability = contract.get("visual_capability") or {}
+        visual_binding = str(material_copy_contract["effective_visual_binding"])
+        violations.extend(
+            f"segment {index} 的{violation}"
+            for violation in material_copy_contract["evidence_violations"]
+        )
+        allowed = {
+            str(value).strip()
+            for field in (
+                "primary_visuals", "visual_concepts", "literal_actions", "visible_text",
+            )
+            for value in capability.get(field) or []
+            if str(value).strip()
+        }
+        if visual_binding == "required":
+            allowed = {
+                str(value).strip()
+                for value in capability.get("primary_visuals") or []
+                if str(value).strip()
+            }
+
+        if (
+            material_copy_contract["requested_visual_binding"] == "required"
+            and not explicit_claim
+        ):
+            violations.append(f"segment {index} 的 required 现场画面主张缺少 visual_claim")
+            continue
+        if DIRECT_VISUAL_ASSERTION.search(cue) and not claim:
+            violations.append(f"segment {index} 的现场画面主张缺少 visual_claim")
+            continue
+        if visual_binding != "required":
+            continue
+        if not claim:
+            continue
+        normalized_cue = re.sub(r"[^\w\u4e00-\u9fff]", "", cue).lower()
+        normalized_claim = re.sub(r"[^\w\u4e00-\u9fff]", "", claim).lower()
+        if not normalized_claim or normalized_claim not in normalized_cue:
+            violations.append(f"segment {index} 的 visual_claim 不是 cue 原文片段")
+            continue
+        if not queries:
+            violations.append(f"segment {index} 的 visual_claim 缺少 visual_query 证据")
+            continue
+        if not allowed:
+            violations.append(f"segment {index} 没有可引用的视觉能力")
+            continue
+        invalid_queries = [query for query in queries if allowed and query not in allowed]
+        if invalid_queries:
+            if visual_binding == "required":
+                violations.append(
+                    f"segment {index} 的 required visual_query 不是主视觉能力："
+                    f"{', '.join(invalid_queries)}"
+                )
+                continue
+            violations.append(
+                f"segment {index} 的 visual_query 超出本段视觉能力：{', '.join(invalid_queries)}"
+            )
+            continue
+        query_text = " ".join(queries)
+        claim_actions = _visual_observation_actions(claim)
+        query_actions = _visual_observation_actions(query_text)
+        missing_actions = [action for action in claim_actions if action not in query_actions]
+        if missing_actions:
+            violations.append(
+                f"segment {index} 的 visual_claim 动作与 visual_query 不一致："
+                f"{','.join(missing_actions)}"
+            )
+            continue
+        claim_subjects = _visual_subject_kinds(claim)
+        query_subjects = _visual_subject_kinds(query_text)
+        claim_animate_subjects = [
+            subject for subject in claim_subjects if subject in {"person", "animal"}
+        ]
+        query_animate_subjects = {
+            subject for subject in query_subjects if subject in {"person", "animal"}
+        }
+        missing_subjects = (
+            [subject for subject in claim_animate_subjects if subject not in query_animate_subjects]
+            if query_animate_subjects else []
+        )
+        if missing_subjects:
+            violations.append(
+                f"segment {index} 的 visual_claim 主体与 visual_query 不一致："
+                f"{','.join(missing_subjects)}"
+            )
+            continue
+        if (
+            not claim_actions
+            and max((semantic_overlap(claim, query) for query in queries), default=0.0) < 0.08
+        ):
+            violations.append(f"segment {index} 的 visual_claim 与 visual_query 不一致")
+    return violations
 
 
 def _punctuate_voiceover_cue(cue: Any) -> str:
@@ -4016,6 +4459,20 @@ def _normalize_compact_script_response(
             if not item[2]
         ]
         if require_valid_candidate and not contract_valid:
+            result["candidate_contract_violations"] = list(dict.fromkeys(
+                violation
+                for _, _, violations in evaluated
+                for violation in violations
+            ))
+            result["creative_candidates_evaluated"] = [
+                {
+                    "route": str(candidate.get("route") or ""),
+                    "user_preference_score": score,
+                    "passed": not violations,
+                    "factual_violations": violations,
+                }
+                for score, candidate, violations in evaluated
+            ]
             return False
         if contract_valid:
             _, selected, selected_contract_violations = max(
@@ -4191,7 +4648,9 @@ def _materialize_semantic_script_segments(
         visual_capability = contract.get("visual_capability") or {}
         allowed_visual_queries = list(dict.fromkeys(
             str(value).strip()
-            for field in ("visual_concepts", "literal_actions", "visible_text")
+            for field in (
+                "primary_visuals", "visual_concepts", "literal_actions", "visible_text",
+            )
             for value in visual_capability.get(field) or []
             if str(value).strip()
         ))[:6]
@@ -4199,6 +4658,11 @@ def _materialize_semantic_script_segments(
             visual_query = [value for value in visual_query if value in allowed_visual_queries]
             if not visual_query:
                 visual_query = allowed_visual_queries
+        material_copy_contract = _compile_material_copy_contract(
+            copy,
+            capability_pool.get("evidence_anchors") or [],
+        )
+        visual_binding = str(material_copy_contract["effective_visual_binding"])
         segment = {
             "segment": index,
             "narrative": narrative,
@@ -4211,6 +4675,11 @@ def _materialize_semantic_script_segments(
             "evidence_refs": copy.get("evidence_refs") or [],
             "continuity_from": index - 1 if index > 0 else None,
             "claims": copy.get("claims") or [],
+            "visual_binding": visual_binding,
+            "visual_claim": (
+                str(material_copy_contract["observable_visual_claim"])
+                if visual_binding == "required" else ""
+            ),
             "visual_requirement": "",
             "scene_prompt": "",
             "visual_query": visual_query,
@@ -4358,6 +4827,7 @@ def build_material_constrained_script(
         attempt_failures: List[Dict[str, Any]] = []
         last_script_response: Any = None
         last_structure_reason = "尚未生成完整结构化脚本"
+        response_token_budget = _script_response_token_budget(num_segments)
         for json_attempt in range(1, MAX_INITIAL_SCRIPT_JSON_ATTEMPTS + 1):
             attempt_failure_reason = "上一响应缺少完整的语义 segments JSON"
             attempt_prompt = dict(prompt)
@@ -4378,7 +4848,7 @@ def build_material_constrained_script(
                     json.dumps(attempt_prompt, ensure_ascii=False),
                     system_prompt=system_prompt,
                     temperature=0.3 if json_attempt == 1 else 0.0,
-                    max_tokens=_script_response_token_budget(num_segments),
+                    max_tokens=response_token_budget,
                     raise_on_parse_error=True,
                 )
             except LLMJSONError as exc:
@@ -4399,6 +4869,11 @@ def build_material_constrained_script(
                     "finish_reason": exc.finish_reason,
                     "truncated": isinstance(exc, LLMJSONTruncatedError),
                 })
+                if isinstance(exc, LLMJSONTruncatedError):
+                    response_token_budget = min(
+                        MAX_SCRIPT_RESPONSE_TOKENS,
+                        max(response_token_budget + 1, math.ceil(response_token_budget * 1.5)),
+                    )
                 continue
             last_script_response = result
             if result is None:
@@ -4412,9 +4887,12 @@ def build_material_constrained_script(
                 creative_blueprint=creative_blueprint,
                 segment_contracts=prompt_segment_contracts,
                 require_creative_candidates=True,
-                require_valid_candidate=(
-                    int(narration_contract.get("maximum_voiceover_units") or 0) > 0
+                candidate_validator=lambda candidate: _visual_grounding_violations(
+                    candidate,
+                    prompt_segment_contracts,
+                    capability_pool.get("evidence_anchors") or [],
                 ),
+                require_valid_candidate=True,
                 maximum_voiceover_units=int(
                     narration_contract.get("maximum_voiceover_units") or 0
                 ),
@@ -4435,6 +4913,12 @@ def build_material_constrained_script(
                         f"{maximum_voiceover_units} 单位"
                     )
             if not structured_valid:
+                contract_violations = result.get("candidate_contract_violations") or []
+                if contract_violations:
+                    violation_summary = "；".join(
+                        str(value) for value in contract_violations[:6]
+                    )[:600]
+                    attempt_failure_reason = f"上一响应合同校验失败：{violation_summary}"
                 last_structure_reason = attempt_failure_reason
                 attempt_failures.append({
                     "attempt": json_attempt,
@@ -4461,7 +4945,10 @@ def build_material_constrained_script(
                 failure_result,
                 status="failed",
             )
-            raise LocalAssetError("所有响应均未形成有效的完整 segments JSON")
+            raise LocalAssetError(
+                "所有响应均未形成有效的完整 segments JSON；"
+                f"最后原因：{last_structure_reason}"
+            )
 
     segments = _materialize_semantic_script_segments(
         result,
@@ -4494,6 +4981,7 @@ def build_material_constrained_script(
 
 
 def _segment_queries(segment: Dict[str, Any]) -> List[str]:
+    material_copy_contract = _compile_material_copy_contract(segment)
     queries = segment.get("asset_query") or []
     if isinstance(queries, str):
         queries = [queries]
@@ -4502,6 +4990,8 @@ def _segment_queries(segment: Dict[str, Any]) -> List[str]:
         visual_queries = [visual_queries]
     values = [
         segment.get("narrative", ""),
+        material_copy_contract["copy_text"],
+        material_copy_contract["observable_visual_claim"],
         *visual_queries,
         segment.get("visual_requirement", ""),
         segment.get("scene_prompt", ""),
@@ -4576,6 +5066,7 @@ def _visual_intent_alignment(segment: Dict[str, Any], analysis: Dict[str, Any]) 
     if isinstance(queries, str):
         queries = [queries]
     evidence = [
+        *(str(value) for value in analysis.get("primary_visuals") or []),
         *(str(value) for value in analysis.get("literal_actions") or []),
         *(str(value) for value in analysis.get("visible_objects") or []),
         *(str(value) for value in analysis.get("visible_text") or []),
@@ -4587,6 +5078,88 @@ def _visual_intent_alignment(segment: Dict[str, Any], analysis: Dict[str, Any]) 
         for query in queries
         for value in evidence
     )
+
+
+def _required_visual_support_reason(
+    segment: Dict[str, Any],
+    analysis: Dict[str, Any],
+) -> str:
+    from material_copy_optimizer import semantic_overlap
+
+    material_copy_contract = _compile_material_copy_contract(segment)
+    visual_binding = str(material_copy_contract["effective_visual_binding"])
+    queries = list(material_copy_contract["visual_queries"])
+    primary_source = (
+        analysis.get("primary_visuals")
+        if "primary_visuals" in analysis else
+        analysis.get("literal_actions")
+    )
+    primary_visuals = {
+        str(value).strip()
+        for value in primary_source or []
+        if str(value).strip()
+    }
+    if visual_binding == "required":
+        if not queries:
+            return "required 现场画面主张缺少 visual_query"
+        primary_text = " ".join(primary_visuals)
+        primary_actions = set(_visual_observation_actions(primary_text))
+        primary_subjects = {
+            subject
+            for subject in _visual_subject_kinds(primary_text)
+            if subject in {"person", "animal"}
+        }
+        missing = []
+        for query in queries:
+            query_actions = set(_visual_observation_actions(query))
+            query_subjects = {
+                subject
+                for subject in _visual_subject_kinds(query)
+                if subject in {"person", "animal"}
+            }
+            action_supported = bool(query_actions) and query_actions <= primary_actions
+            subject_supported = not query_subjects or bool(query_subjects & primary_subjects)
+            if (
+                query not in primary_visuals
+                and semantic_overlap(query, primary_text) < 0.16
+                and not (action_supported and subject_supported)
+            ):
+                missing.append(query)
+        if missing:
+            return f"候选镜头主视觉不支持 required 主张：{','.join(missing)}"
+        return ""
+    if not material_copy_contract["requires_primary_relevance"]:
+        return ""
+
+    story_role = str(analysis.get("product_story_role") or "unknown").strip().lower()
+    relevance = str(analysis.get("product_relevance_prior") or "").strip().lower()
+    product_visibility = int(analysis.get("product_visibility") or 0)
+    if analysis.get("product_identity_supported"):
+        return ""
+    if (
+        story_role in {"finished_product", "usage", "result"}
+        and relevance == "high"
+        and product_visibility >= 3
+    ):
+        return ""
+    if (
+        story_role in {"ingredient", "origin", "production"}
+        and analysis.get("product_relationship_verified")
+    ):
+        return ""
+
+    primary_text = " ".join(primary_visuals)
+    copy_subjects = {
+        subject
+        for subject in material_copy_contract["subject_kinds"]
+        if subject in {"person", "animal"}
+    }
+    primary_subjects = set(_visual_subject_kinds(primary_text))
+    if copy_subjects and copy_subjects & primary_subjects:
+        return ""
+    if primary_text and semantic_overlap(material_copy_contract["copy_text"], primary_text) >= 0.12:
+        return ""
+    return "候选镜头主视觉与当前文案及其 Evidence Anchor 无关"
 
 
 def _motion_score(segment: Dict[str, Any], window: Dict[str, Any]) -> Tuple[float, Optional[str]]:
@@ -4727,6 +5300,9 @@ def _hard_segment_ok(segment: Dict[str, Any], window: Dict[str, Any], score: flo
     story_role = str(analysis.get("product_story_role") or "unknown")
     if score < MIN_MATCH_SCORE:
         return False, f"匹配分 {score:.2f} 低于阈值 {MIN_MATCH_SCORE:.2f}"
+    visual_reject = _required_visual_support_reason(segment, analysis)
+    if visual_reject:
+        return False, visual_reject
     if narrative in {"usage_demo", "result"} and confidence < MIN_KEY_SEGMENT_CONFIDENCE:
         return False, f"{narrative} 置信度 {confidence:.2f} 低于阈值 {MIN_KEY_SEGMENT_CONFIDENCE:.2f}"
     if (
@@ -4749,7 +5325,9 @@ def _narrative_role_affinity(segment: Dict[str, Any], analysis: Dict[str, Any]) 
     required_role = _desired_product_story_role(segment)
     actual_role = str(analysis.get("product_story_role") or "unknown").strip().lower()
     if required_role:
-        return 1.0 if required_role == actual_role else 0.0
+        if required_role == actual_role:
+            return 1.0
+        return 0.7 if _story_role_supported(segment, analysis) else 0.0
 
     narrative = str(segment.get("narrative") or "").strip().lower()
     intent = str(segment.get("marketing_intent") or "").strip().lower()
@@ -4899,6 +5477,9 @@ def plan_and_materialize_local_clips(
     selected: List[Dict[str, Any]] = []
     selected_segments: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
+    evidence_anchors = list(
+        (ad_script.get("material_capability_pool") or {}).get("evidence_anchors") or []
+    )
 
     if not segments:
         raise LocalAssetError("素材约束脚本没有可用段落")
@@ -4907,30 +5488,19 @@ def plan_and_materialize_local_clips(
         capacity = 0.0
         for window in windows:
             analysis = window.get("analysis") or {}
-            candidate_visual = _visual_requirement_from_material({
-                "setting": analysis.get("setting"),
-                "visible_objects": analysis.get("visible_objects") or [],
-                "literal_actions": analysis.get("literal_actions") or [],
-                "visible_text": analysis.get("visible_text") or [],
-            })
-            candidate_segment = {
-                **segment,
-                "subtitle": "",
-                "voiceover": "",
-                "claims": [],
-            }
             score, _ = _score_window(
-                candidate_segment,
+                segment,
                 window,
                 [],
                 allow_replan=True,
             )
             semantic_check = _validate_derived_material_segment(
-                candidate_segment,
+                segment,
                 window,
                 product_info or {},
+                evidence_anchors,
             )
-            hard_ok, _ = _hard_segment_ok(candidate_segment, window, score)
+            hard_ok, _ = _hard_segment_ok(segment, window, score)
             if semantic_check.get("supported") and hard_ok:
                 capacity += _narrative_role_affinity(segment, analysis) * max(
                     0.0,
@@ -4978,22 +5548,17 @@ def plan_and_materialize_local_clips(
                         "literal_actions": analysis.get("literal_actions") or [],
                         "visible_text": analysis.get("visible_text") or [],
                     })
-                    candidate_segment = {
-                        **segment,
-                        "subtitle": "",
-                        "voiceover": "",
-                        "claims": [],
-                    }
                     score, details = _score_window(
-                        candidate_segment,
+                        segment,
                         window,
                         selected,
                         allow_replan=True,
                     )
                     semantic_check = _validate_derived_material_segment(
-                        candidate_segment,
+                        segment,
                         window,
                         product_info or {},
+                        evidence_anchors,
                     )
                     if not semantic_check.get("supported"):
                         rejected.append({
@@ -5006,9 +5571,22 @@ def plan_and_materialize_local_clips(
                             ),
                         })
                         continue
-                    ok, reason = _hard_segment_ok(candidate_segment, window, score)
+                    ok, reason = _hard_segment_ok(segment, window, score)
                     if ok:
                         affinity = _narrative_role_affinity(segment, analysis)
+                        source_reuse_count = sum(
+                            1
+                            for previous in selected
+                            if previous.get("source_path") == window.get("source_path")
+                        )
+                        details = {
+                            **details,
+                            "source_reuse_count": source_reuse_count,
+                            "source_diversity_penalty": (
+                                SOURCE_REUSE_SELECTION_PENALTY
+                                * min(source_reuse_count, 3)
+                            ),
+                        }
                         ranked.append((score, affinity, window, details, candidate_visual))
                     elif score > 0:
                         rejected.append({
@@ -5025,7 +5603,7 @@ def plan_and_materialize_local_clips(
                     item[0]
                     + 0.25 * item[1]
                     + 0.35 * item[3].get("visual_intent_alignment", 0.0)
-                    ,
+                    - item[3].get("source_diversity_penalty", 0.0),
                     min(
                         remaining_duration,
                         float(item[2]["end"]) - float(item[2]["start"]),
@@ -5063,6 +5641,34 @@ def plan_and_materialize_local_clips(
                 "end": float(window["start"]) + allocated_duration,
                 "duration": round(allocated_duration, 3),
             }
+            final_semantic_check = _validate_derived_material_segment(
+                segment,
+                selected_window,
+                product_info or {},
+                evidence_anchors,
+            )
+            final_hard_ok, final_hard_reason = _hard_segment_ok(
+                segment,
+                selected_window,
+                score,
+            )
+            if not final_semantic_check.get("supported") or not final_hard_ok:
+                reason = str(
+                    final_semantic_check.get("reason")
+                    or final_hard_reason
+                    or "最终素材证据合同校验失败"
+                )
+                raise LocalAssetError(
+                    f"脚本段 {seg_idx} 的最终选中素材不再满足文案证据合同：{reason}",
+                    details={
+                        "reason": "final_material_copy_contract_violation",
+                        "semantic_segment": seg_idx,
+                        "source_video": selected_window.get("source_video"),
+                        "source_start": selected_window.get("start"),
+                        "source_end": selected_window.get("end"),
+                        "contract_reason": reason,
+                    },
+                )
             edit_index = len(selected)
             selected.append(selected_window)
             segment_window_ids.append(str(window.get("window_id")))

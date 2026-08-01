@@ -952,6 +952,111 @@ def generate_full_voiceover(
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def fit_pre_generated_voiceover_to_windows(
+    script_lines: List[Dict[str, Any]],
+    pre_generated_audio: Path,
+    output_path: Path,
+    total_duration: float,
+    max_rate_multiplier: float = 1.6,
+    performance_profile: Optional[Dict[str, Any]] = None,
+) -> Tuple[Path, List[Dict[str, Any]]]:
+    """Reuse one TTS master while locking each semantic cue to its visual window."""
+    import tempfile
+
+    master = Path(pre_generated_audio)
+    if not master.is_file():
+        raise RuntimeError(f"预生成连续口播不存在：{master}")
+    readable_lines = [line for line in script_lines if str(line.get("text") or "").strip()]
+    if not readable_lines:
+        raise RuntimeError("显式时长口播没有可读文案")
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="tts_windows_"))
+    audio_segments: List[Dict[str, Any]] = []
+    subtitles: List[Dict[str, Any]] = []
+    maximum_rate = 1.0
+    try:
+        for index, line in enumerate(readable_lines):
+            source_start = float(line.get("source_start", line.get("start", 0.0)))
+            source_end = float(line.get("source_end", line.get("end", source_start)))
+            target_start = float(line.get("start", 0.0))
+            target_end = float(line.get("end", target_start))
+            source_duration = source_end - source_start
+            available = target_end - target_start
+            if source_duration <= 0 or available <= 0:
+                raise RuntimeError(f"口播段 {line.get('segment', index)} 的源或目标时间窗无效")
+
+            rate = max(1.0, source_duration / max(0.1, available - 0.04))
+            if rate > max_rate_multiplier:
+                raise RuntimeError(
+                    f"口播段 {line.get('segment', index)} 无法装入指定画面时间窗："
+                    f"需要 {rate:.2f}x，允许上限 {max_rate_multiplier:.2f}x"
+                )
+            maximum_rate = max(maximum_rate, rate)
+            segment_path = tmp_dir / f"window_{index:03d}.m4a"
+            filters = [
+                f"atrim=start={source_start:.4f}:end={source_end:.4f}",
+                "asetpts=PTS-STARTPTS",
+            ]
+            if rate > 1.001:
+                filters.append(f"atempo={rate:.4f}")
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(master),
+                    "-filter:a", ",".join(filters),
+                    "-vn", "-c:a", "aac", "-b:a", "192k", str(segment_path),
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode != 0 or not segment_path.is_file():
+                stderr = result.stderr.decode("utf-8", errors="ignore")[:500] if result.stderr else ""
+                raise RuntimeError(f"口播语义段切分失败：{stderr}")
+
+            rendered_duration = _get_audio_duration(segment_path)
+            if rendered_duration > available + 0.08:
+                raise RuntimeError(
+                    f"口播段 {line.get('segment', index)} 编码后越过画面边界："
+                    f"{rendered_duration:.2f}s > {available:.2f}s"
+                )
+            audio_segments.append({
+                "path": segment_path,
+                "start": target_start,
+                "duration": rendered_duration,
+            })
+            local_line = {
+                **line,
+                "start": 0.0,
+                "end": min(rendered_duration, available),
+            }
+            for subtitle in split_and_align_voiceover_subtitles(
+                [local_line],
+                segment_path,
+                rendered_duration,
+            ):
+                subtitle_start = target_start + float(subtitle["start"])
+                subtitle_end = min(target_end, target_start + float(subtitle["end"]))
+                if subtitle_end <= subtitle_start:
+                    continue
+                subtitles.append({
+                    **subtitle,
+                    "start": round(subtitle_start, 4),
+                    "end": round(subtitle_end, 4),
+                })
+
+        _mix_audio_segments(audio_segments, output_path, total_duration)
+        if performance_profile is not None:
+            performance_profile.update({
+                "mode": "single_take_visual_windows",
+                "tts_requests": 1,
+                "tts_reused": True,
+                "tempo_multiplier": round(maximum_rate, 4),
+                "semantic_windows": len(audio_segments),
+            })
+        return output_path, sorted(subtitles, key=lambda item: float(item["start"]))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def _generate_continuous_voiceover(
     script_lines: List[Dict[str, any]],
     output_path: Path,

@@ -112,6 +112,7 @@ from tts_client import (
     generate_tts_audio,
     generate_voiceover_script,
     generate_full_voiceover,
+    fit_pre_generated_voiceover_to_windows,
     align_subtitles_to_voiceover,
     recommend_voice_for_narration,
     build_tts_synthesis_contract,
@@ -519,6 +520,87 @@ def _collapse_edit_timeline_by_semantic(
             "edit_indices": [int(edit["index"])],
         })
     return semantic_timeline
+
+
+def _apply_local_timeline_authority(
+    rhythm_template: Dict[str, Any],
+    one_take_timeline: Dict[str, Any],
+    *,
+    target_duration_explicit: bool,
+) -> str:
+    """Select one timing authority without mixing visual and narration clocks."""
+    if target_duration_explicit:
+        return "requested_visual_timeline"
+
+    duration_by_segment = one_take_timeline["clip_durations"]
+    for rhythm_segment in rhythm_template["segments"]:
+        segment_index = int(rhythm_segment["index"])
+        rhythm_segment["duration"] = float(duration_by_segment[segment_index])
+    rhythm_template["total_duration"] = float(one_take_timeline["main_duration"])
+    rhythm_template["actual_total_duration"] = float(one_take_timeline["main_duration"])
+    rhythm_template["duration_source"] = "single_take_tts_timeline"
+    return "single_take_tts_timeline"
+
+
+def _map_voiceover_lines_to_semantic_timeline(
+    voiceover_lines: List[Dict[str, Any]],
+    semantic_timeline: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Preserve TTS source cuts while placing each cue inside its visual segment."""
+    windows = {
+        int(item["index"]): (float(item["start"]), float(item["end"]))
+        for item in semantic_timeline
+    }
+    grouped: Dict[int, List[Tuple[int, Dict[str, Any]]]] = {}
+    mapped = [dict(line) for line in voiceover_lines]
+    for position, line in enumerate(voiceover_lines):
+        if line.get("is_outro"):
+            continue
+        segment = int(line.get("segment", position))
+        if segment not in windows:
+            raise ValueError(f"口播语义段 {segment} 没有对应画面时间窗")
+        grouped.setdefault(segment, []).append((position, line))
+
+    for segment, entries in grouped.items():
+        window_start, window_end = windows[segment]
+        weights = [
+            max(0.001, float(line["end"]) - float(line["start"]))
+            for _, line in entries
+        ]
+        total_weight = sum(weights)
+        cursor = window_start
+        for entry_index, ((position, line), weight) in enumerate(zip(entries, weights)):
+            target_end = (
+                window_end
+                if entry_index == len(entries) - 1 else
+                cursor + (window_end - window_start) * weight / total_weight
+            )
+            mapped[position] = {
+                **line,
+                "source_start": float(line["start"]),
+                "source_end": float(line["end"]),
+                "start": round(cursor, 4),
+                "end": round(target_end, 4),
+                "alignment_precision": "requested_visual_segment_window",
+            }
+            cursor = target_end
+
+    visual_end = max((end for _, end in windows.values()), default=0.0)
+    outro_cursor = visual_end
+    for position, line in enumerate(voiceover_lines):
+        if not line.get("is_outro"):
+            continue
+        source_duration = max(0.1, float(line["end"]) - float(line["start"]))
+        mapped[position] = {
+            **line,
+            "source_start": float(line["start"]),
+            "source_end": float(line["end"]),
+            "start": round(outro_cursor, 4),
+            "end": round(outro_cursor + source_duration, 4),
+            "alignment_precision": "requested_visual_outro_window",
+        }
+        outro_cursor += source_duration
+    return mapped
 
 
 _REF_BINDING_STRENGTH = {
@@ -4857,6 +4939,7 @@ def run_generation_pipeline(
     strict_mode: bool = True,
     force: bool = False,
     target_duration: Optional[int] = None,
+    target_duration_explicit: Optional[bool] = None,
     rhythm_style: str = "moderate",
     parallel: bool = True,
     min_clips: int = 3,
@@ -4904,6 +4987,7 @@ def run_generation_pipeline(
         script_style: 广告脚本风格（pain_point_solution/before_after/storytelling/demonstration/social_proof）
         force: 为 True 时跳过 high 风险合规拦截（默认 False；critical 风险始终拦截）
         target_duration: 目标总时长（秒），None 时使用 duration × 片段数 的默认计算
+        target_duration_explicit: 是否由用户/调用方明确指定目标时长；None 时按直接 API 参数推断
         rhythm_style: 节奏风格：fast / moderate / cinematic
         parallel: 是否并行生成第 2-N 段（默认 True，更快；设为 False 串行，极致一致性）
         min_clips: 最少成功片段数，低于此数则终止（默认 3，即 60%）
@@ -4941,6 +5025,11 @@ def run_generation_pipeline(
     final_dir = output_dir / "final"
 
     local_asset_mode = local_assets is not None
+    target_duration_explicit = (
+        target_duration is not None
+        if target_duration_explicit is None else
+        bool(target_duration_explicit)
+    )
     client = None if local_asset_mode else KlingClient()
     local_asset_index = None
     local_planning_asset_index = None
@@ -6569,20 +6658,19 @@ def run_generation_pipeline(
                 voiceover_style=voiceover_style,
             )
             voice = str(local_one_take_timeline["voice"])
-            def _apply_one_take_timeline() -> None:
-                duration_by_segment = local_one_take_timeline["clip_durations"]
-                for rhythm_segment in rhythm_template["segments"]:
-                    segment_index = int(rhythm_segment["index"])
-                    rhythm_segment["duration"] = float(duration_by_segment[segment_index])
-                rhythm_template["total_duration"] = float(local_one_take_timeline["main_duration"])
-                rhythm_template["actual_total_duration"] = float(local_one_take_timeline["main_duration"])
-                rhythm_template["duration_source"] = "single_take_tts_timeline"
-
-            _apply_one_take_timeline()
+            _timeline_authority = _apply_local_timeline_authority(
+                rhythm_template,
+                local_one_take_timeline,
+                target_duration_explicit=target_duration_explicit,
+            )
             print(
                 f"✅ 单条口播母带：{local_one_take_timeline['audio_duration']:.2f}s，"
-                f"主片 {local_one_take_timeline['main_duration']:.2f}s，"
+                f"主片时间轴 {rhythm_template['actual_total_duration']:.2f}s，"
                 f"CTA {local_one_take_timeline['outro_duration']:.2f}s"
+            )
+            print(
+                "   时间权威："
+                + ("用户指定的视觉时间轴" if _timeline_authority == "requested_visual_timeline" else "智能实测口播时间轴")
             )
             for line in local_one_take_timeline["voiceover_lines"]:
                 print(
@@ -6732,7 +6820,11 @@ def run_generation_pipeline(
                 float(selected["target_duration"])
                 for selected in selected_material_segments
             ),
-            "duration_source": "single_take_tts_edit_clip_timeline",
+            "duration_source": (
+                "requested_visual_edit_clip_timeline"
+                if target_duration_explicit else
+                "single_take_tts_edit_clip_timeline"
+            ),
         }
         print(
             f"✅ 本地素材选片完成：{expected_segments} 个语义段 / "
@@ -7187,7 +7279,11 @@ def run_generation_pipeline(
                 max(
                     0.0,
                     sum(_get_clip_duration(path) for path in clip_paths)
-                    - float(local_one_take_timeline["main_duration"]),
+                    - float(
+                        rhythm_template["actual_total_duration"]
+                        if target_duration_explicit
+                        else local_one_take_timeline["main_duration"]
+                    ),
                 )
                 if local_asset_mode and local_one_take_timeline else None
             ),
@@ -7577,10 +7673,15 @@ def run_generation_pipeline(
             )
             # 从广告脚本生成口播文案（比模板更丰富）
             # P1 #2（v2）：透传实际成功段索引，处理中间段失败的情况
-            voiceover_script = (
-                list(local_one_take_timeline["voiceover_lines"])
-                if local_one_take_timeline else
-                script_to_voiceover(
+            if local_one_take_timeline and target_duration_explicit:
+                voiceover_script = _map_voiceover_lines_to_semantic_timeline(
+                    list(local_one_take_timeline["voiceover_lines"]),
+                    _rendered_segment_timeline,
+                )
+            elif local_one_take_timeline:
+                voiceover_script = list(local_one_take_timeline["voiceover_lines"])
+            else:
+                voiceover_script = script_to_voiceover(
                     ad_script,
                     clip_duration=duration,
                     transition_duration=actual_transition_dur,
@@ -7590,7 +7691,6 @@ def run_generation_pipeline(
                     segment_timeline=_rendered_segment_timeline,
                     voiceover_style=voiceover_style,
                 )
-            )
             if local_one_take_timeline:
                 _voice_reason = str(local_one_take_timeline["voice_reason"])
             else:
@@ -7658,18 +7758,28 @@ def run_generation_pipeline(
                 continuous_voiceover_text = str(ad_script.get("voiceover_full") or "").strip()
             _generated_narration = bool(voiceover_script)
             if _generated_narration:
-                voiceover_audio, voiceover_subs = generate_full_voiceover(
-                    voiceover_script,
-                    voiceover_audio,
-                    voice=voice,
-                    total_duration=total_duration,
-                    max_rate_multiplier=1.15 if _personal_vlog_audio_mode else 1.6,
-                    continuous_narration=local_asset_mode and not _personal_vlog_audio_mode,
-                    continuous_text=continuous_voiceover_text,
-                    performance_profile=voice_performance,
-                    pre_generated_audio=local_one_take_master,
-                    allow_sparse_narration=_personal_vlog_audio_mode,
-                )
+                if local_one_take_timeline and target_duration_explicit:
+                    voiceover_audio, voiceover_subs = fit_pre_generated_voiceover_to_windows(
+                        voiceover_script,
+                        local_one_take_master,
+                        voiceover_audio,
+                        total_duration=total_duration,
+                        max_rate_multiplier=1.6,
+                        performance_profile=voice_performance,
+                    )
+                else:
+                    voiceover_audio, voiceover_subs = generate_full_voiceover(
+                        voiceover_script,
+                        voiceover_audio,
+                        voice=voice,
+                        total_duration=total_duration,
+                        max_rate_multiplier=1.15 if _personal_vlog_audio_mode else 1.6,
+                        continuous_narration=local_asset_mode and not _personal_vlog_audio_mode,
+                        continuous_text=continuous_voiceover_text,
+                        performance_profile=voice_performance,
+                        pre_generated_audio=local_one_take_master,
+                        allow_sparse_narration=_personal_vlog_audio_mode,
+                    )
                 if _personal_vlog_audio_mode:
                     ensure_planned_narration_survived(
                         _planned_vlog_narration_count,
@@ -8871,10 +8981,18 @@ def run_one_click_create(
         print("🎙️ 个人 Vlog 默认启用稀疏间隙旁白；原素材口播仍优先保留")
     # 目标总时长适配：通过节奏模板动态调整每段时长
     target_duration = getattr(args, "target_duration", None)
+    target_duration_explicit = (
+        "target_duration" in set(getattr(args, "_explicit_args", set()) or set())
+        or bool(getattr(args, "load", None) and target_duration is not None)
+    )
     rhythm_style = getattr(args, "rhythm_style", "moderate")
     actual_duration = args.duration
     if target_duration:
-        print(f"⏱️  目标总时长：{target_duration}s，节奏风格：{rhythm_style}")
+        duration_source = "用户指定" if target_duration_explicit else "智能推荐"
+        print(
+            f"⏱️  目标总时长：{target_duration}s（{duration_source}），"
+            f"节奏风格：{rhythm_style}"
+        )
         if local_asset_mode:
             print("   混剪策略：目标时长作为偏好，最终时间轴服从素材理解与自然叙事")
         else:
@@ -8904,6 +9022,7 @@ def run_one_click_create(
             strict_mode=getattr(args, "strict", True),
             force=getattr(args, "force", False),
             target_duration=target_duration,
+            target_duration_explicit=target_duration_explicit,
             rhythm_style=rhythm_style,
             parallel=not getattr(args, "serial", False),
             min_clips=getattr(args, "min_clips", 3),
@@ -9452,7 +9571,11 @@ def main():
                         args.hook = _llm_args["hook"]
                     if _llm_args.get("rhythm_style") in _VALID_RHYTHMS:
                         args.rhythm_style = _llm_args["rhythm_style"]
-                    if isinstance(_llm_args.get("target_duration"), int):
+                    _explicit_args = set(getattr(args, "_explicit_args", set()) or set())
+                    if (
+                        "target_duration" not in _explicit_args
+                        and isinstance(_llm_args.get("target_duration"), int)
+                    ):
                         args.target_duration = _llm_args["target_duration"]
                     if isinstance(_llm_args.get("voiceover"), bool):
                         args.voiceover = _llm_args["voiceover"]
