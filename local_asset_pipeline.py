@@ -71,7 +71,7 @@ MIN_SCENE_SECONDS = 1.0
 MOTION_SAMPLE_FRAMES = 12
 MAX_INITIAL_SCRIPT_JSON_ATTEMPTS = 3
 MAX_SCRIPT_RESPONSE_TOKENS = 6000
-SCRIPT_CONTRACT_VERSION = 57
+SCRIPT_CONTRACT_VERSION = 63
 MIN_VOICEOVER_UNITS_PER_SECOND = 4.2
 MIN_OUTRO_VOICEOVER_UNITS_PER_SECOND = 4.4
 MAX_OUTRO_VOICEOVER_UNITS_PER_SECOND = 5.4
@@ -91,6 +91,16 @@ UNVERIFIED_COPY_TERM_EXAMPLES = (
 PRODUCT_STORY_ROLES = {
     "finished_product", "ingredient", "origin", "production",
     "usage", "result", "context", "unknown",
+}
+MATERIAL_CONTEXT_CLAIM_TYPES = {
+    "ingredient": {"ingredient"},
+    "origin": {"ingredient", "origin"},
+    "production": {"production"},
+}
+MATERIAL_CONTEXT_ROLE_LABELS = {
+    "ingredient": "原料情境",
+    "origin": "产地与种植情境",
+    "production": "生产工艺情境",
 }
 CULTIVATION_SCENE = re.compile(
     r"种植(?:园|基地|区|场)?|栽培|培育|农场|庄园|果园|花园|茶园|花田|"
@@ -974,6 +984,9 @@ def _story_role_supported(segment: Dict[str, Any], analysis: Dict[str, Any]) -> 
             and not material_copy_contract["concrete_product_claim"]
         )
     if required in {"ingredient", "origin", "production"}:
+        visual_queries = _compile_material_copy_contract(segment)["visual_queries"]
+        if visual_queries:
+            return False
         return (
             actual == "finished_product"
             and str(analysis.get("product_relevance_prior") or "").lower() == "high"
@@ -1217,8 +1230,31 @@ def _copy_preflight_check(
     evidence_anchors: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Reject only copy claims that exceed trusted product or visual evidence."""
-    violations = _marketing_claim_violations(segment, product_info, analysis)
-    material_copy_contract = _compile_material_copy_contract(segment, evidence_anchors)
+    grounded_segment = _bind_material_context_evidence(
+        segment,
+        {
+            "product_story_role": str(analysis.get("product_story_role") or ""),
+            "visual_capability": {
+                field: list(analysis.get(field) or [])
+                for field in (
+                    "primary_visuals", "visual_concepts", "literal_actions", "visible_text",
+                )
+            },
+        },
+        evidence_anchors,
+    )
+    material_context_grounded = bool(
+        grounded_segment.get("_material_context_grounded_role")
+    )
+    violations = (
+        {}
+        if material_context_grounded else
+        _marketing_claim_violations(segment, product_info, analysis)
+    )
+    material_copy_contract = _compile_material_copy_contract(
+        grounded_segment,
+        evidence_anchors,
+    )
     if material_copy_contract["evidence_violations"]:
         violations["evidence_refs"] = list(material_copy_contract["evidence_violations"])
     identity_violations = _product_identity_violations(
@@ -3478,9 +3514,9 @@ def _build_coverage_driven_narrative_plan(
             copy_goal = "只表达该镜头与可信资料共同支持的事实证据"
         elif role in {"ingredient", "origin", "production", "context"}:
             narrative = "source_context"
-            intent = "value"
+            intent = "proof"
             copy_goal = (
-                "将当前产品相关的原料、产地或生产情境转译成消费者能理解的购买理由；"
+                "只表达素材支持的情境证据，作为消费者的选择信息；"
                 "不得虚构具体地名、配方比例、品质结论或功效"
             )
         elif role == "usage":
@@ -3493,8 +3529,12 @@ def _build_coverage_driven_narrative_plan(
             copy_goal = "只表达画面可见结果，不扩展成功效承诺"
         else:
             narrative = "product_showcase"
-            intent = "value"
-            copy_goal = "把清晰可见的产品信息翻译成新的购买理由"
+            intent = "value" if verified else "proof"
+            copy_goal = (
+                "把已核验产品事实翻译成新的购买理由"
+                if verified else
+                "只确认画面可见的产品对象与形态，不扩展成品质、功效或规格结论"
+            )
         plan.append({
             "segment": index,
             "narrative": narrative,
@@ -3739,6 +3779,22 @@ def _global_material_capability_pool(
                 "kind": "verified_fact",
                 "usage_scope": "product_fact",
             })
+    for capability in role_capabilities:
+        role = str(capability.get("role") or "").strip().lower()
+        primary_visuals = list(capability.get("primary_visuals") or [])
+        if role not in MATERIAL_CONTEXT_CLAIM_TYPES or not primary_visuals:
+            continue
+        evidence_anchors.append({
+            "id": f"material_context:{role}",
+            "text": (
+                f"{MATERIAL_CONTEXT_ROLE_LABELS[role]}："
+                + "；".join(str(value) for value in primary_visuals[:2])
+            ),
+            "kind": "material_context",
+            "usage_scope": "user_supplied_material_context",
+            "material_role": role,
+            "allowed_claim_types": sorted(MATERIAL_CONTEXT_CLAIM_TYPES[role]),
+        })
     anchored_text = {str(anchor.get("text") or "") for anchor in evidence_anchors}
     for material in material_catalog:
         if not material.get("product_relationship_verified"):
@@ -3805,6 +3861,15 @@ def _semantic_copy_constraints(
         for item in capability_pool.get("role_capabilities") or []
         if str(item.get("role") or "").strip()
     }
+    context_anchors_by_role = {
+        role: [
+            anchor
+            for anchor in capability_pool.get("evidence_anchors") or []
+            if anchor.get("usage_scope") == "user_supplied_material_context"
+            and str(anchor.get("material_role") or "").strip().lower() == role
+        ]
+        for role in MATERIAL_CONTEXT_CLAIM_TYPES
+    }
     constraints: Dict[str, Dict[str, Any]] = {}
     for index in range(num_segments):
         plan_item = plan_by_index.get(index) or {}
@@ -3849,12 +3914,25 @@ def _semantic_copy_constraints(
             "segment_duration": round(float(segment_durations.get(index) or 0.0), 3),
             "marketing_intent": intent,
             "copy_goal": goal,
+            "requires_buyer_value": intent == "value",
             "product_story_role": role,
             "visual_capability": visual_capability,
-            "evidence_anchors": [],
-            "evidence_scope": "trusted_product_facts_only",
-            "relation_boundary": "具体产地原料工艺功效必须来自可信产品资料",
-            "claims_rule": "事实主张必须引用可信产品事实",
+            "evidence_anchors": context_anchors_by_role.get(role, []),
+            "evidence_scope": (
+                "trusted_product_facts_or_bounded_user_material_context"
+                if role in MATERIAL_CONTEXT_CLAIM_TYPES else
+                "trusted_product_facts_only"
+            ),
+            "relation_boundary": (
+                "素材情境只支持当前原料产地工艺角色；具体实体地点品质功效仍须可信产品资料"
+                if role in MATERIAL_CONTEXT_CLAIM_TYPES else
+                "具体产地原料工艺功效必须来自可信产品资料"
+            ),
+            "claims_rule": (
+                "可引用本段 material_context 表达通用情境，不得扩展成品质功效或风味因果"
+                if role in MATERIAL_CONTEXT_CLAIM_TYPES else
+                "事实主张必须引用可信产品事实"
+            ),
             "forbidden_without_verified_facts": [],
         }
     return constraints
@@ -3907,6 +3985,12 @@ def _build_compact_script_prompt(
             )
             if constraint.get(field) not in (None, "", [], {})
         }
+        visual_capability = constraint.get("visual_capability") or {}
+        if visual_capability:
+            segment_contract["visual_capability"] = {
+                "role": str(visual_capability.get("role") or ""),
+                "primary_visuals": list(visual_capability.get("primary_visuals") or []),
+            }
         segment_contract["evidence_anchors"] = ranked_anchors
         segment_contracts.append(segment_contract)
     outro_contract = None
@@ -4003,13 +4087,13 @@ def _build_compact_script_prompt(
         "rules": [
             "每段返回一个语义节拍和 cue，按 segment 顺序拼接为一条连续口播",
             "各 cue 只作语义锚点，不按镜头限字；narration_guidance 仅为非阻断性精炼建议",
-            "只引用全局 evidence_anchors:product:name 只证身份，具体事实须引用相关非名称锚点",
+            "evidence_refs只引用直接支持cue原文的全局锚点；product:name只证身份",
             "spoken_summaries 和 spoken_intents 只用于理解原素材表达与叙事，不是事实来源，不得复制其中未经核验的主张",
             "product_story_role 由素材理解确定，不得改写",
-            "cue 只推进购买理由；visual_query 只能取本段 visual_capability，不得含素材 ID 或文件名",
+            "value段cue必须把素材证据转成购买理由，不得只描述画面",
             (
-                "required只绑定当前可见动作/状态；claim取最短原句，query取对应primary_visuals；"
-                "其余supportive/none"
+                "勿返回visual_binding/visual_claim；visual_query只取本段primary_visuals"
+                "并支持cue中的可见动作/状态"
             ),
             "cue 可跨段成句，标点供单次 TTS 断句",
             "返回三个不同候选；差异方向由素材、script_style、参考片观察和使用者规则决定",
@@ -4068,13 +4152,11 @@ def _build_compact_script_prompt(
         "json_shape": {"creative_candidates": [{
             "route": "candidate direction name",
             "segments": [{
-                    "segment": 0,
+                "segment": 0,
                 "marketing_intent": "hook or proof or value or cta",
                 "cue": "connected spoken copy grounded in referenced evidence",
                 "evidence_refs": ["allowed evidence id"],
                 "claims": [],
-                "visual_binding": "required|supportive|none",
-                "visual_claim": "visible cue clause or empty string",
                 "visual_query": ["one item from this segment visual_capability"],
             }],
             **({"outro_cue": "connected CTA ending containing required_text"} if external_cta else {}),
@@ -4159,6 +4241,77 @@ def _material_copy_text(segment: Dict[str, Any]) -> str:
         if value:
             return value
     return ""
+
+
+def _bind_material_context_evidence(
+    segment: Dict[str, Any],
+    segment_contract: Dict[str, Any],
+    evidence_anchors: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Bind a local-material context anchor only within its visual role boundary."""
+    from material_copy_optimizer import semantic_overlap
+
+    bound = dict(segment)
+    bound.pop("_material_context_grounded_role", None)
+    role = str(segment_contract.get("product_story_role") or "").strip().lower()
+    if role not in MATERIAL_CONTEXT_CLAIM_TYPES:
+        return bound
+    anchor = next(
+        (
+            item
+            for item in evidence_anchors or []
+            if item.get("usage_scope") == "user_supplied_material_context"
+            and str(item.get("material_role") or "").strip().lower() == role
+        ),
+        None,
+    )
+    if not anchor:
+        return bound
+
+    queries = segment.get("visual_query") or []
+    if isinstance(queries, str):
+        queries = [queries]
+    capability = segment_contract.get("visual_capability") or {}
+    allowed_visuals = [
+        str(value).strip()
+        for field in ("primary_visuals", "visual_concepts", "literal_actions", "visible_text")
+        for value in capability.get(field) or []
+        if str(value).strip()
+    ]
+    if not queries or not allowed_visuals or max(
+        semantic_overlap(str(query), visual)
+        for query in queries
+        for visual in allowed_visuals
+    ) < 0.16:
+        return bound
+
+    claim_types = {
+        str(claim.get("type") or "").strip().lower()
+        for claim in _infer_copy_claims(_material_copy_text(segment))
+        if str(claim.get("type") or "").strip()
+    }
+    claim_types.update(
+        str(claim.get("type") or "").strip().lower()
+        for claim in segment.get("claims") or []
+        if isinstance(claim, dict) and str(claim.get("type") or "").strip()
+    )
+    allowed_claim_types = {
+        str(value).strip().lower()
+        for value in anchor.get("allowed_claim_types") or []
+        if str(value).strip()
+    }
+    if claim_types and not claim_types <= allowed_claim_types:
+        return bound
+
+    refs = bound.get("evidence_refs") or []
+    if isinstance(refs, str):
+        refs = [refs]
+    bound["evidence_refs"] = list(dict.fromkeys([
+        *(str(value).strip() for value in refs if str(value).strip()),
+        str(anchor["id"]),
+    ]))
+    bound["_material_context_grounded_role"] = role
+    return bound
 
 
 def _compile_material_copy_contract(
@@ -4250,17 +4403,43 @@ def _compile_material_copy_contract(
             )
         )
     )
+    material_claim_types = {
+        str(claim.get("type") or "").strip().lower()
+        for claim in [
+            *_infer_copy_claims(copy_text),
+            *(claim for claim in raw_claims if isinstance(claim, dict)),
+        ]
+        if str(claim.get("type") or "").strip()
+    }
+    grounded_material_role = str(
+        segment.get("_material_context_grounded_role") or ""
+    ).strip().lower()
     relevant_non_name_refs = [
         reference
         for reference in non_name_refs
-        if max(
-            (
-                semantic_overlap(text, str(anchors[reference].get("text") or ""))
-                for text in [copy_text, *structured_claim_texts]
-                if text
-            ),
-            default=0.0,
-        ) >= 0.16
+        if (
+            str(anchors[reference].get("usage_scope") or "")
+            == "user_supplied_material_context"
+            and grounded_material_role
+            == str(anchors[reference].get("material_role") or "").strip().lower()
+            and bool(material_claim_types)
+            and material_claim_types <= {
+                str(value).strip().lower()
+                for value in anchors[reference].get("allowed_claim_types") or []
+                if str(value).strip()
+            }
+        ) or (
+            str(anchors[reference].get("usage_scope") or "")
+            != "user_supplied_material_context"
+            and max(
+                (
+                    semantic_overlap(text, str(anchors[reference].get("text") or ""))
+                    for text in [copy_text, *structured_claim_texts]
+                    if text
+                ),
+                default=0.0,
+            ) >= 0.16
+        )
     ]
     evidence_violations = [
         "引用了不存在的 Evidence Anchor：" + ",".join(invalid_refs)
@@ -4311,12 +4490,20 @@ def _visual_grounding_violations(
         if not isinstance(segment, dict) or not str(segment.get("segment", "")).isdigit():
             continue
         index = int(segment["segment"])
-        material_copy_contract = _compile_material_copy_contract(segment, evidence_anchors)
+        contract = contracts.get(index) or {}
+        grounded_segment = _bind_material_context_evidence(
+            segment,
+            contract,
+            evidence_anchors,
+        )
+        material_copy_contract = _compile_material_copy_contract(
+            grounded_segment,
+            evidence_anchors,
+        )
         cue = material_copy_contract["copy_text"]
         explicit_claim = str(segment.get("visual_claim") or "").strip()
         claim = str(material_copy_contract["observable_visual_claim"])
         queries = list(material_copy_contract["visual_queries"])
-        contract = contracts.get(index) or {}
         capability = contract.get("visual_capability") or {}
         visual_binding = str(material_copy_contract["effective_visual_binding"])
         violations.extend(
@@ -4408,6 +4595,96 @@ def _visual_grounding_violations(
         ):
             violations.append(f"segment {index} 的 visual_claim 与 visual_query 不一致")
     return violations
+
+
+def _sales_copy_quality_violations(
+    candidate: Dict[str, Any],
+    segment_contracts: List[Dict[str, Any]],
+    evidence_anchors: Optional[List[Dict[str, Any]]] = None,
+) -> List[str]:
+    """Enforce sales-purpose copy separately from factual and visual grounding."""
+    from material_copy_optimizer import evaluate_candidate
+
+    contracts = {
+        int(item.get("segment")): item
+        for item in segment_contracts
+        if isinstance(item, dict) and str(item.get("segment", "")).isdigit()
+    }
+    anchors = {
+        str(anchor.get("id")): anchor
+        for anchor in evidence_anchors or []
+        if isinstance(anchor, dict) and anchor.get("id")
+    }
+    segments = {
+        int(item.get("segment")): item
+        for item in candidate.get("segments") or []
+        if isinstance(item, dict) and str(item.get("segment", "")).isdigit()
+    }
+    top_level_cues = candidate.get("voiceover_cues") or []
+    if not isinstance(top_level_cues, list):
+        top_level_cues = []
+    texts = {
+        index: (
+            _material_copy_text(segment)
+            or str(top_level_cues[index] if index < len(top_level_cues) else "").strip()
+        )
+        for index, segment in segments.items()
+    }
+    violations: List[str] = []
+    for index, segment in sorted(segments.items()):
+        contract = dict(contracts.get(index) or {})
+        referenced_specific_fact = any(
+            reference in anchors
+            and str(anchors[reference].get("usage_scope") or "")
+            not in {"product_identity", "user_supplied_material_context"}
+            for reference in segment.get("evidence_refs") or []
+        )
+        requires_buyer_value = contract.get("requires_buyer_value")
+        if requires_buyer_value is None:
+            requires_buyer_value = str(contract.get("marketing_intent") or "") == "value"
+        if not requires_buyer_value or referenced_specific_fact:
+            continue
+        contract["requires_buyer_value"] = True
+        contract["evidence_anchors"] = []
+
+        quality_candidate = dict(segment)
+        quality_candidate.pop("marketing_device", None)
+        quality_candidate.pop("buyer_value", None)
+        quality_candidate["voiceover"] = texts[index]
+        quality_candidate["evidence_refs"] = []
+        neighbors = [
+            texts[neighbor]
+            for neighbor in (index - 1, index + 1)
+            if neighbor in texts
+        ]
+        evaluation = evaluate_candidate(quality_candidate, contract, neighbors)
+        errors = list(evaluation["errors"])
+        segment["marketing_device"] = evaluation["marketing_device"]
+        segment["buyer_value"] = evaluation["buyer_value"]
+        violations.extend(
+            f"segment {index} 的{error}"
+            for error in dict.fromkeys(errors)
+        )
+    return violations
+
+
+def _model_script_candidate_violations(
+    candidate: Dict[str, Any],
+    segment_contracts: List[Dict[str, Any]],
+    evidence_anchors: Optional[List[Dict[str, Any]]] = None,
+) -> List[str]:
+    """Validate model-authored semantics after removing code-derived visual fields."""
+    for segment in candidate.get("segments") or []:
+        if not isinstance(segment, dict):
+            continue
+        segment.pop("visual_binding", None)
+        segment.pop("visual_claim", None)
+        segment.pop("marketing_device", None)
+        segment.pop("buyer_value", None)
+    return [
+        *_visual_grounding_violations(candidate, segment_contracts, evidence_anchors),
+        *_sales_copy_quality_violations(candidate, segment_contracts, evidence_anchors),
+    ]
 
 
 def _punctuate_voiceover_cue(cue: Any) -> str:
@@ -4587,8 +4864,12 @@ def _materialize_semantic_script_segments(
     }
     segments: List[Dict[str, Any]] = []
     for index in sorted(expected):
-        copy = copy_by_index[index]
         contract = copy_constraints[str(index)]
+        copy = _bind_material_context_evidence(
+            copy_by_index[index],
+            contract,
+            capability_pool.get("evidence_anchors") or [],
+        )
         referenced_anchors = [
             anchor_by_id[str(reference)]
             for reference in copy.get("evidence_refs") or []
@@ -4887,7 +5168,7 @@ def build_material_constrained_script(
                 creative_blueprint=creative_blueprint,
                 segment_contracts=prompt_segment_contracts,
                 require_creative_candidates=True,
-                candidate_validator=lambda candidate: _visual_grounding_violations(
+                candidate_validator=lambda candidate: _model_script_candidate_violations(
                     candidate,
                     prompt_segment_contracts,
                     capability_pool.get("evidence_anchors") or [],
@@ -5149,6 +5430,13 @@ def _required_visual_support_reason(
         return ""
 
     primary_text = " ".join(primary_visuals)
+    if (
+        story_role in {"ingredient", "origin", "production"}
+        and _desired_product_story_role(segment) == story_role
+        and queries
+        and _visual_intent_alignment(segment, analysis) >= 0.16
+    ):
+        return ""
     copy_subjects = {
         subject
         for subject in material_copy_contract["subject_kinds"]

@@ -13,10 +13,19 @@ DEVICE_PATTERNS = {
     "curiosity": re.compile(r"到底|关键|先看|再看|从.+看起|你见过|你发现"),
     "proof": re.compile(r"采用|来自|源自|原料|工艺|成分|参数|规格|标注"),
     "reason": re.compile(r"因为|所以|靠|离不开|关键在|原因是|这一步"),
-    "convenience": re.compile(r"方便|省事|省心|随手|直接|控制|一按|一推|一拉|开盖|随时"),
+    "convenience": re.compile(
+        r"方便|省事|省心|省时|省力|随手|直接|控制|一按|一推|一拉|"
+        r"开盖|随时|就能|适合|不用|无需|搞定"
+    ),
     "reveal": re.compile(r"先看|再看|原来|这里|这一点|重点是"),
     "action": re.compile(r"试试|入手|了解|去看|看看|带走|开始|选择"),
 }
+
+BUYER_VALUE_PATTERNS = re.compile(
+    r"更(?:方便|省事|省心|放心|踏实|清楚|明白|合适)|"
+    r"选(?:起来|的时候).{0,8}(?:放心|踏实|清楚|明白)|"
+    r"就能|适合|不用|无需|省(?:时|事|心|力)|搞定"
+)
 
 SCENE_DESCRIPTION_PATTERNS = re.compile(
     r"(?:你(?:现在)?看到的|画面(?:里|中)|镜头(?:里|中)|眼前(?:是|有)|这里(?:是|有))"
@@ -163,7 +172,9 @@ def evaluate_candidate(
     requires_buyer_value = bool(
         contract.get("requires_buyer_value", intent in {"value", "proof"})
     )
-    if not buyer_value and device == "convenience":
+    if not buyer_value and (
+        device == "convenience" or BUYER_VALUE_PATTERNS.search(text)
+    ):
         buyer_value = text
     if requires_buyer_value and not buyer_value:
         errors.append("没有说明该素材信息对购买选择的价值")

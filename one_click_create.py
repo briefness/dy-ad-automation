@@ -542,15 +542,42 @@ def _apply_local_timeline_authority(
     return "single_take_tts_timeline"
 
 
+def _semantic_voice_windows(
+    semantic_timeline: List[Dict[str, Any]],
+) -> Dict[int, Tuple[float, float]]:
+    """Return non-overlapping voice windows from the rendered semantic timeline."""
+    ordered: List[List[float]] = []
+    seen = set()
+    for item in semantic_timeline:
+        segment = int(item["index"])
+        start = float(item["start"])
+        end = float(item["end"])
+        if segment in seen:
+            raise ValueError(f"语义段 {segment} 存在重复画面时间窗")
+        if end <= start:
+            raise ValueError(f"语义段 {segment} 的画面时间窗无效：{start:.3f}-{end:.3f}")
+        if ordered and start < ordered[-1][1]:
+            handoff = (ordered[-1][1] + start) / 2.0
+            if handoff <= ordered[-1][0] or handoff >= end:
+                raise ValueError(
+                    f"语义段 {int(ordered[-1][2])} 与 {segment} 的画面时间窗无法分割"
+                )
+            ordered[-1][1] = handoff
+            start = handoff
+        ordered.append([start, end, float(segment)])
+        seen.add(segment)
+    return {
+        int(segment): (start, end)
+        for start, end, segment in ordered
+    }
+
+
 def _map_voiceover_lines_to_semantic_timeline(
     voiceover_lines: List[Dict[str, Any]],
     semantic_timeline: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """Preserve TTS source cuts while placing each cue inside its visual segment."""
-    windows = {
-        int(item["index"]): (float(item["start"]), float(item["end"]))
-        for item in semantic_timeline
-    }
+    windows = _semantic_voice_windows(semantic_timeline)
     grouped: Dict[int, List[Tuple[int, Dict[str, Any]]]] = {}
     mapped = [dict(line) for line in voiceover_lines]
     for position, line in enumerate(voiceover_lines):
@@ -577,11 +604,11 @@ def _map_voiceover_lines_to_semantic_timeline(
             )
             mapped[position] = {
                 **line,
-                "source_start": float(line["start"]),
-                "source_end": float(line["end"]),
+                "source_start": float(line.get("source_start", line["start"])),
+                "source_end": float(line.get("source_end", line["end"])),
                 "start": round(cursor, 4),
                 "end": round(target_end, 4),
-                "alignment_precision": "requested_visual_segment_window",
+                "alignment_precision": "rendered_visual_segment_window",
             }
             cursor = target_end
 
@@ -593,14 +620,37 @@ def _map_voiceover_lines_to_semantic_timeline(
         source_duration = max(0.1, float(line["end"]) - float(line["start"]))
         mapped[position] = {
             **line,
-            "source_start": float(line["start"]),
-            "source_end": float(line["end"]),
+            "source_start": float(line.get("source_start", line["start"])),
+            "source_end": float(line.get("source_end", line["end"])),
             "start": round(outro_cursor, 4),
             "end": round(outro_cursor + source_duration, 4),
-            "alignment_precision": "requested_visual_outro_window",
+            "alignment_precision": "rendered_visual_outro_window",
         }
         outro_cursor += source_duration
     return mapped
+
+
+def _validate_subtitle_semantic_windows(
+    subtitles: List[Dict[str, Any]],
+    semantic_timeline: List[Dict[str, Any]],
+    tolerance: float = 0.04,
+) -> None:
+    """Block subtitles that drift outside their final rendered semantic shot."""
+    windows = _semantic_voice_windows(semantic_timeline)
+    for position, subtitle in enumerate(subtitles):
+        if subtitle.get("is_outro"):
+            continue
+        segment = int(subtitle.get("segment", position))
+        if segment not in windows:
+            raise ValueError(f"字幕段 {segment} 没有对应画面时间窗")
+        window_start, window_end = windows[segment]
+        start = float(subtitle["start"])
+        end = float(subtitle["end"])
+        if start < window_start - tolerance or end > window_end + tolerance:
+            raise ValueError(
+                f"字幕段 {segment} 越出对应画面时间窗："
+                f"字幕 {start:.3f}-{end:.3f} / 画面 {window_start:.3f}-{window_end:.3f}"
+            )
 
 
 _REF_BINDING_STRENGTH = {
@@ -1227,6 +1277,8 @@ def _cap_aligned_voiceover_lines_to_material_capacity(
     for duration, (original_index, line) in zip(final_durations, main_entries):
         capped_lines[original_index] = {
             **line,
+            "source_start": float(line.get("source_start", line["start"])),
+            "source_end": float(line.get("source_end", line["end"])),
             "start": round(cursor, 3),
             "end": round(cursor + duration, 3),
             "alignment_precision": "capacity_capped_measured_audio_pause"
@@ -7673,13 +7725,11 @@ def run_generation_pipeline(
             )
             # 从广告脚本生成口播文案（比模板更丰富）
             # P1 #2（v2）：透传实际成功段索引，处理中间段失败的情况
-            if local_one_take_timeline and target_duration_explicit:
+            if local_one_take_timeline:
                 voiceover_script = _map_voiceover_lines_to_semantic_timeline(
                     list(local_one_take_timeline["voiceover_lines"]),
                     _rendered_segment_timeline,
                 )
-            elif local_one_take_timeline:
-                voiceover_script = list(local_one_take_timeline["voiceover_lines"])
             else:
                 voiceover_script = script_to_voiceover(
                     ad_script,
@@ -7758,7 +7808,7 @@ def run_generation_pipeline(
                 continuous_voiceover_text = str(ad_script.get("voiceover_full") or "").strip()
             _generated_narration = bool(voiceover_script)
             if _generated_narration:
-                if local_one_take_timeline and target_duration_explicit:
+                if local_one_take_timeline:
                     voiceover_audio, voiceover_subs = fit_pre_generated_voiceover_to_windows(
                         voiceover_script,
                         local_one_take_master,
@@ -7835,6 +7885,11 @@ def run_generation_pipeline(
             if outro_voiceover_subs:
                 _outro_voice_start = float(outro_voiceover_subs[0]["start"])
             subtitles = align_subtitles_to_voiceover(subtitles, main_voiceover_subs)
+            if local_one_take_timeline:
+                _validate_subtitle_semantic_windows(
+                    subtitles,
+                    _rendered_segment_timeline,
+                )
             voiceover_enabled = True
             _defer_full_voiceover_mix = bool(_reference_outro)
             if postproduction_contract:

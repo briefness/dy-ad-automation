@@ -5215,9 +5215,159 @@ class TestPostProcessingP0Fixes:
                 }],
             )
 
+        assert generate.call_count == 1
+        assert result["json_generation_attempt"] == 1
+        assert result["segments"][0]["visual_claim"] == ""
+
+    def test_model_derived_visual_fields_cannot_conflict_with_code_contract(self, tmp_path):
+        from unittest.mock import patch
+
+        from local_asset_pipeline import build_material_constrained_script
+
+        candidate = {
+            "segments": [{
+                "segment": 0,
+                "cue": "你看这瓶装产品，拿取很方便。",
+                "evidence_refs": ["product:name"],
+                "claims": [],
+                "visual_binding": "required",
+                "visual_claim": "展示瓶装产品",
+                "visual_query": ["手拿起瓶装产品"],
+            }],
+        }
+        window = {
+            "window_id": "product-action",
+            "source_video": "product.mp4",
+            "source_path": "/tmp/product.mp4",
+            "start": 0.0,
+            "end": 4.0,
+            "analysis": {
+                "usable_for_ad": True,
+                "confidence": 1.0,
+                "product_story_role": "finished_product",
+                "product_visibility": 5,
+                "primary_visuals": ["手拿起瓶装产品"],
+                "visible_objects": ["瓶装产品"],
+                "literal_actions": ["手拿起瓶装产品"],
+            },
+        }
+
+        with patch("config.LLM_ENABLED", True), \
+             patch("llm_client.generate_json", return_value=creative_candidates(
+                 candidate,
+                 candidate,
+                 candidate,
+             )) as generate, \
+             patch("local_asset_pipeline.LOCAL_ASSET_INDEX_PATH", tmp_path):
+            result = build_material_constrained_script(
+                product_info={"name": "产品", "type": "食品"},
+                coverage={},
+                num_segments=1,
+                script_style="demonstration",
+                asset_index={
+                    "asset_folder": "/tmp/model-derived-visual-fields",
+                    "windows": [window],
+                },
+                segment_durations={0: 4.0},
+                narrative_plan_override=[{
+                    "segment": 0,
+                    "marketing_intent": "hook",
+                    "product_story_role": "finished_product",
+                }],
+            )
+
+        assert generate.call_count == 1
+        assert result["segments"][0]["visual_claim"] == ""
+        assert result["segments"][0]["visual_binding"] == "supportive"
+
+    def test_sales_value_contract_retries_visual_restatement_then_accepts_buyer_value(self, tmp_path):
+        import json
+        from unittest.mock import patch
+
+        from local_asset_pipeline import build_material_constrained_script
+
+        descriptive = {
+            "segments": [
+                {
+                    "segment": 0,
+                    "cue": "这种瓶装产品你见过吗？",
+                    "evidence_refs": ["product:name"],
+                    "claims": [],
+                },
+                {
+                    "segment": 1,
+                    "cue": "瓶身放在桌面，还反着光。",
+                    "evidence_refs": ["product:name"],
+                    "claims": [],
+                },
+            ],
+        }
+        translated = {
+            "segments": [
+                descriptive["segments"][0],
+                {
+                    "segment": 1,
+                    "cue": "随手就能用，日常使用更省事。",
+                    "buyer_value": "日常使用更省事",
+                    "evidence_refs": ["product:name"],
+                    "claims": [],
+                },
+            ],
+        }
+        window = {
+            "window_id": "product-window",
+            "source_video": "product.mp4",
+            "source_path": "/tmp/product.mp4",
+            "start": 0.0,
+            "end": 5.0,
+            "analysis": {
+                "usable_for_ad": True,
+                "confidence": 1.0,
+                "product_story_role": "finished_product",
+                "product_visibility": 5,
+                "primary_visuals": ["桌面展示瓶装产品"],
+                "visible_objects": ["瓶装产品"],
+            },
+        }
+        narrative_plan = [
+            {
+                "segment": 0,
+                "narrative": "hook",
+                "marketing_intent": "hook",
+                "product_story_role": "finished_product",
+            },
+            {
+                "segment": 1,
+                "narrative": "product_showcase",
+                "marketing_intent": "value",
+                "product_story_role": "finished_product",
+            },
+        ]
+
+        with patch("config.LLM_ENABLED", True), \
+             patch("llm_client.generate_json", side_effect=[
+                 creative_candidates(descriptive, descriptive, descriptive),
+                 creative_candidates(translated, translated, translated),
+             ]) as generate, \
+             patch("local_asset_pipeline.LOCAL_ASSET_INDEX_PATH", tmp_path):
+            result = build_material_constrained_script(
+                product_info={"name": "产品", "type": "日用品"},
+                coverage={},
+                num_segments=2,
+                script_style="demonstration",
+                asset_index={
+                    "asset_folder": "/tmp/sales-value-retry",
+                    "windows": [window],
+                },
+                segment_durations={0: 2.5, 1: 2.5},
+                narrative_plan_override=narrative_plan,
+            )
+
         retry_prompt = json.loads(generate.call_args_list[1].args[0])
-        assert "visual_claim 不是 cue 原文片段" in retry_prompt["structured_output_retry"]["reason"]
-        assert result["json_generation_attempt"] == 2
+        assert generate.call_count == 2
+        assert "购买选择的价值" in retry_prompt["structured_output_retry"]["reason"]
+        assert result["segments"][1]["voiceover"] == "随手就能用，日常使用更省事。"
+        assert result["segments"][1]["buyer_value"] == "随手就能用，日常使用更省事。"
 
     def test_obsolete_script_repair_runtime_is_physically_absent(self):
         source = Path("local_asset_pipeline.py").read_text(encoding="utf-8")
@@ -5269,7 +5419,11 @@ class TestPostProcessingP0Fixes:
         shape = prompt["json_shape"]["creative_candidates"][0]["segments"][0]
         assert shape["segment"] == 0
         assert shape["cue"] == "connected spoken copy grounded in referenced evidence"
+        assert "marketing_device" not in shape
+        assert "buyer_value" not in shape
         assert "desired_story_role" not in shape
+        assert "visual_binding" not in shape
+        assert "visual_claim" not in shape
         assert "visual_query" in shape
         assert shape["evidence_refs"] == ["allowed evidence id"]
         assert shape["claims"] == []
@@ -5277,6 +5431,34 @@ class TestPostProcessingP0Fixes:
         assert prompt["segment_contracts"][0]["copy_goal"] == "制造产品好奇"
         assert "具体事实只取可信产品资料" in prompt["copywriting_brief"]["material_role"]
         assert "购买理由" in prompt["copywriting_brief"]["transformation"]
+
+    def test_script_prompt_exposes_only_primary_visual_choices(self):
+        from local_asset_pipeline import _build_compact_script_prompt
+
+        prompt = _build_compact_script_prompt(
+            product_info={"name": "产品", "type": "日用品"},
+            script_reference_profile={},
+            external_cta=False,
+            script_style="demonstration",
+            copy_constraints={
+                "0": {
+                    "segment": 0,
+                    "marketing_intent": "proof",
+                    "visual_capability": {
+                        "role": "finished_product",
+                        "primary_visuals": ["手持瓶装产品"],
+                        "visual_concepts": ["瓶装产品"],
+                        "literal_actions": ["手指向标签"],
+                        "visible_text": ["产品名"],
+                    },
+                },
+            },
+        )
+
+        assert prompt["segment_contracts"][0]["visual_capability"] == {
+            "role": "finished_product",
+            "primary_visuals": ["手持瓶装产品"],
+        }
 
     def test_reference_sales_copy_drives_style_without_becoming_product_facts(self):
         import json
@@ -5439,7 +5621,7 @@ class TestPostProcessingP0Fixes:
         assert _normalize_compact_script_response(response, 2) is True
         assert response["voiceover_cues"] == ["这瓶茶咖你试过吗？", "瓶装现成想喝更省事。"]
 
-    def test_unverified_source_context_translates_context_without_inventing_quality(self):
+    def test_unverified_source_context_is_bounded_proof_not_forced_buyer_value(self):
         from local_asset_pipeline import _build_coverage_driven_narrative_plan
 
         materials = [
@@ -5483,9 +5665,32 @@ class TestPostProcessingP0Fixes:
         plan = _build_coverage_driven_narrative_plan(materials, 3, False)
         source = next(item for item in plan if item["product_story_role"] == "origin")
 
-        assert "转译成消费者能理解的购买理由" in source["copy_goal"]
+        assert source["marketing_intent"] == "proof"
+        assert "只表达素材支持的情境证据" in source["copy_goal"]
         assert "不得虚构具体地名" in source["copy_goal"]
         assert "品质结论" in source["copy_goal"]
+
+    def test_unverified_product_showcase_is_proof_not_forced_buyer_value(self):
+        from local_asset_pipeline import _build_coverage_driven_narrative_plan
+
+        materials = [
+            {
+                "window_id": f"product-{index}",
+                "product_story_role": "finished_product",
+                "product_identity_supported": True,
+                "product_relationship_verified": False,
+                "matched_product_facts": [],
+                "confidence": 1.0,
+                "product_visibility": 5,
+                "motion": {"motion_class": "dynamic"},
+            }
+            for index in range(3)
+        ]
+
+        plan = _build_coverage_driven_narrative_plan(materials, 3, False)
+
+        assert plan[1]["marketing_intent"] == "proof"
+        assert "只确认画面可见的产品对象与形态" in plan[1]["copy_goal"]
 
     def test_external_cta_is_authored_inside_the_same_full_narration(self):
         from local_asset_pipeline import (
@@ -6367,7 +6572,7 @@ class TestMaterialDrivenPostProduction:
         assert contract["requested_duration_applied"] is True
         assert len(set(contract["selected_window_ids"])) == 4
 
-    def test_four_segment_plan_uses_available_ingredient_and_origin_without_forcing_proof(self):
+    def test_four_segment_plan_uses_available_ingredient_and_origin_as_bounded_proof(self):
         from local_asset_pipeline import _build_coverage_driven_narrative_plan
 
         catalog = [
@@ -6422,7 +6627,7 @@ class TestMaterialDrivenPostProduction:
         assert {"ingredient", "origin"}.issubset(roles)
         assert roles[-1] in {"finished_product", "usage"}
         assert all(
-            item["marketing_intent"] != "proof"
+            item["marketing_intent"] == "proof"
             for item in plan
             if item["product_story_role"] in {"ingredient", "origin"}
         )
@@ -7382,6 +7587,29 @@ class TestReferenceAdAnalysis:
         assert [item["duration"] for item in rhythm["segments"]] == [2.5, 3.5]
         assert rhythm["actual_total_duration"] == 6.0
 
+    def test_capacity_capping_preserves_measured_audio_source_windows(self):
+        import one_click_create
+
+        capped, changed = one_click_create._cap_aligned_voiceover_lines_to_material_capacity(
+            [
+                {"segment": 0, "text": "第一句", "start": 0.0, "end": 4.0},
+                {"segment": 1, "text": "第二句", "start": 4.0, "end": 8.0},
+            ],
+            max_clip_durations={0: 2.0, 1: 6.0},
+            main_duration=8.0,
+            transition_duration=0.0,
+        )
+
+        assert changed is True
+        assert [(line["start"], line["end"]) for line in capped] == [
+            (0.0, 2.0),
+            (2.0, 8.0),
+        ]
+        assert [(line["source_start"], line["source_end"]) for line in capped] == [
+            (0.0, 4.0),
+            (4.0, 8.0),
+        ]
+
     def test_explicit_duration_keeps_visual_timeline_authority(self):
         import one_click_create
 
@@ -7436,6 +7664,55 @@ class TestReferenceAdAnalysis:
             (8.88, 11.25),
         ]
 
+    def test_transition_overlap_has_one_semantic_voiceover_handoff(self):
+        import one_click_create
+
+        mapped = one_click_create._map_voiceover_lines_to_semantic_timeline(
+            [
+                {"segment": 0, "text": "第一句", "start": 0.0, "end": 3.0},
+                {"segment": 1, "text": "第二句", "start": 3.0, "end": 6.0},
+            ],
+            [
+                {"index": 0, "start": 0.0, "end": 3.0},
+                {"index": 1, "start": 2.6, "end": 6.0},
+            ],
+        )
+
+        assert [(item["start"], item["end"]) for item in mapped] == [
+            (0.0, 2.8),
+            (2.8, 6.0),
+        ]
+
+    def test_local_one_take_always_uses_final_rendered_semantic_windows(self):
+        import inspect
+        import one_click_create
+
+        source = inspect.getsource(one_click_create.run_generation_pipeline)
+
+        assert "if local_one_take_timeline and target_duration_explicit:" not in source
+        assert source.count("if local_one_take_timeline:") >= 2
+
+    def test_local_subtitles_cannot_cross_their_rendered_semantic_window(self):
+        import one_click_create
+
+        timeline = [
+            {"index": 0, "start": 0.0, "end": 3.0},
+            {"index": 1, "start": 3.0, "end": 6.0},
+        ]
+        one_click_create._validate_subtitle_semantic_windows(
+            [
+                {"segment": 0, "text": "第一句", "start": 0.2, "end": 2.9},
+                {"segment": 1, "text": "第二句", "start": 3.0, "end": 5.8},
+            ],
+            timeline,
+        )
+
+        with pytest.raises(ValueError, match="字幕段 1 越出对应画面时间窗"):
+            one_click_create._validate_subtitle_semantic_windows(
+                [{"segment": 1, "text": "提前出现", "start": 2.8, "end": 5.8}],
+                timeline,
+            )
+
     def test_explicit_duration_accepts_rendered_timeline_already_collapsed_from_ten_edits(self):
         import one_click_create
 
@@ -7477,12 +7754,12 @@ class TestReferenceAdAnalysis:
         ]
 
         source = Path("one_click_create.py").read_text(encoding="utf-8")
-        explicit_branch = source[
-            source.index("if local_one_take_timeline and target_duration_explicit:"):
-            source.index("elif local_one_take_timeline:", source.index("if local_one_take_timeline and target_duration_explicit:"))
-        ]
-        assert "_collapse_edit_timeline_by_semantic" not in explicit_branch
-        assert "_rendered_segment_timeline" in explicit_branch
+        mapping_start = source.index(
+            "voiceover_script = _map_voiceover_lines_to_semantic_timeline("
+        )
+        mapping_call = source[mapping_start:mapping_start + 300]
+        assert "_collapse_edit_timeline_by_semantic" not in mapping_call
+        assert "_rendered_segment_timeline" in mapping_call
 
     def test_explicit_duration_reuses_one_take_master_inside_visual_windows(self, tmp_path):
         import tts_client
@@ -8516,6 +8793,91 @@ class TestReferenceAdAnalysis:
         assert quality["dimensions"]["evidence_to_buyer_value"] == 1.0
         assert "素材证据没有充分转译成购买理由" not in quality["errors"]
 
+    def test_local_material_sales_contract_rejects_visual_restatements_across_categories(self):
+        from local_asset_pipeline import _sales_copy_quality_violations
+
+        contracts = [
+            {
+                "segment": 0,
+                "marketing_intent": "hook",
+                "requires_buyer_value": False,
+            },
+            {
+                "segment": 1,
+                "marketing_intent": "value",
+                "requires_buyer_value": True,
+            },
+        ]
+        descriptive = {
+            "segments": [
+                {"segment": 0, "cue": "这种新搭配你见过吗？"},
+                {"segment": 1, "cue": "新鲜原料调配，还带着热气。"},
+            ],
+        }
+        translated = {
+            "segments": [
+                {"segment": 0, "cue": "这种新搭配你见过吗？"},
+                {
+                    "segment": 1,
+                    "cue": "原料生长环境看得见，选的时候更踏实。",
+                    "marketing_device": "reason",
+                    "buyer_value": "选的时候更踏实",
+                },
+            ],
+        }
+        appliance = {
+            "segments": [
+                {"segment": 0, "cue": "这种省事的清理方式你见过吗？"},
+                {
+                    "segment": 1,
+                    "cue": "往前一推就能处理灰尘，日常清理更省事。",
+                    "marketing_device": "convenience",
+                    "buyer_value": "日常清理更省事",
+                },
+            ],
+        }
+        metadata_only = {
+            "segments": [
+                descriptive["segments"][0],
+                {
+                    "segment": 1,
+                    "cue": "原料生长在连片田地里。",
+                    "marketing_device": "reason",
+                    "buyer_value": "选的时候更踏实",
+                },
+            ],
+        }
+        verified_fact = {
+            "segments": [
+                descriptive["segments"][0],
+                {
+                    "segment": 1,
+                    "cue": "采用高温烘焙工艺。",
+                    "evidence_refs": ["product:production_process:0"],
+                },
+            ],
+        }
+
+        descriptive_errors = _sales_copy_quality_violations(descriptive, contracts)
+
+        assert any("购买选择的价值" in error for error in descriptive_errors)
+        assert _sales_copy_quality_violations(translated, contracts) == []
+        assert _sales_copy_quality_violations(appliance, contracts) == []
+        assert any(
+            "购买选择的价值" in error
+            for error in _sales_copy_quality_violations(metadata_only, contracts)
+        )
+        assert _sales_copy_quality_violations(
+            verified_fact,
+            contracts,
+            [{
+                "id": "product:production_process:0",
+                "text": "高温烘焙",
+                "kind": "verified_fact",
+                "usage_scope": "product_fact",
+            }],
+        ) == []
+
     def test_cold_start_selects_first_execution_valid_route_without_subjective_scoring(self):
         from local_asset_pipeline import _normalize_compact_script_response
 
@@ -9055,12 +9417,7 @@ class TestReferenceAdAnalysis:
         assert plan[-1]["narrative"] == "cta"
         assert plan[-1]["product_story_role"] == "finished_product"
         assert any(item["marketing_intent"] == "proof" for item in plan)
-        assert all(
-            item["product_relationship_verified"]
-            for item in plan
-            if item["marketing_intent"] == "proof"
-        )
-        assert "unverified-origin" not in {
+        assert "unverified-origin" in {
             item["asset_window_ids"][0]
             for item in plan
             if item["marketing_intent"] == "proof"
@@ -9380,7 +9737,7 @@ class TestReferenceAdAnalysis:
 
         source = inspect.getsource(build_material_constrained_script)
 
-        assert "_visual_grounding_violations" in source
+        assert "_model_script_candidate_violations" in source
         assert "candidate_factual_violations" not in source
         assert "global_factual_evidence_failed" not in source
 
@@ -10023,7 +10380,7 @@ class TestGlobalMaterialDrivenScriptArchitecture:
             record_failure=False,
         )
 
-        assert script["segments"][0]["visual_claim"] == "这只哈士奇正把头凑近食盘"
+        assert script["segments"][0]["visual_claim"] == "你看，这只哈士奇正把头凑近食盘。"
         assert script["segments"][0]["visual_binding"] == "required"
         assert result["selected_segments"][0]["source_video"] == "subject-action.mp4"
 
@@ -10283,16 +10640,23 @@ class TestGlobalMaterialDrivenScriptArchitecture:
         assert script["segments"][0]["emphasis_terms"] == ["茉莉花茶"]
 
     def test_visual_roles_are_not_claimable_copy_evidence(self):
-        from local_asset_pipeline import _global_material_capability_pool
+        from local_asset_pipeline import (
+            _global_material_capability_pool,
+            _materialize_semantic_script_segments,
+            _semantic_copy_constraints,
+            _visual_grounding_violations,
+        )
 
         pool = _global_material_capability_pool(
             [{
                 "window_id": "origin-window",
+                "source_path": "/tmp/origin.mp4",
                 "start": 0.0,
                 "end": 3.0,
                 "product_story_role": "origin",
                 "product_relationship_verified": False,
                 "matched_product_facts": [],
+                "primary_visuals": ["成片绿色作物生长在自然山地环境中"],
                 "visible_objects": ["山地茶园"],
                 "literal_actions": [],
                 "visible_text": [],
@@ -10301,11 +10665,118 @@ class TestGlobalMaterialDrivenScriptArchitecture:
         )
 
         assert "origin" in pool["available_story_roles"]
-        assert all(
-            anchor["kind"] != "material_capability"
-            and not str(anchor["id"]).startswith("material_role:")
+        context_anchor = next(
+            anchor
             for anchor in pool["evidence_anchors"]
+            if anchor.get("usage_scope") == "user_supplied_material_context"
         )
+        assert context_anchor["kind"] == "material_context"
+        assert context_anchor["material_role"] == "origin"
+        assert context_anchor["allowed_claim_types"] == ["ingredient", "origin"]
+
+        constraints = _semantic_copy_constraints(
+            pool,
+            num_segments=1,
+            segment_durations={0: 3.0},
+            external_cta=False,
+            narrative_plan=[{
+                "segment": 0,
+                "narrative": "source_context",
+                "marketing_intent": "value",
+                "product_story_role": "origin",
+            }],
+        )
+        candidate = {
+            "segments": [{
+                "segment": 0,
+                "cue": "原料来自自然产地。",
+                "evidence_refs": ["product:name"],
+                "claims": [],
+                "visual_binding": "supportive",
+                "visual_claim": "",
+                "visual_query": ["成片绿色作物生长在自然山地环境中"],
+            }],
+        }
+        assert _visual_grounding_violations(
+            candidate,
+            list(constraints.values()),
+            pool["evidence_anchors"],
+        ) == []
+
+        for unsupported_cue in ("好原料带来好风味。", "好环境种出好原料。"):
+            quality_candidate = {
+                "segments": [{
+                    **candidate["segments"][0],
+                    "cue": unsupported_cue,
+                    "_material_context_grounded_role": "origin",
+                }],
+            }
+            quality_violations = _visual_grounding_violations(
+                quality_candidate,
+                list(constraints.values()),
+                pool["evidence_anchors"],
+            )
+            assert any("非名称 Evidence Anchor" in item for item in quality_violations)
+
+        materialized = _materialize_semantic_script_segments(
+            candidate,
+            constraints,
+            pool,
+            {"name": "茶咖", "type": "食品"},
+        )
+        assert context_anchor["id"] in materialized[0]["evidence_refs"]
+        assert "_material_context_grounded_role" not in materialized[0]
+
+    def test_material_context_remains_grounded_during_clip_preflight(self):
+        from local_asset_pipeline import _copy_preflight_check
+
+        visual = "成片种植的带白色小花的绿色作物田"
+        anchor = {
+            "id": "material_context:origin",
+            "text": f"产地与种植情境：{visual}",
+            "kind": "material_context",
+            "usage_scope": "user_supplied_material_context",
+            "material_role": "origin",
+            "allowed_claim_types": ["ingredient", "origin"],
+        }
+        analysis = {
+            "product_story_role": "origin",
+            "primary_visuals": [visual],
+            "visual_concepts": ["连片种植"],
+            "literal_actions": [],
+            "visible_text": [],
+        }
+        segment = {
+            "segment": 0,
+            "product_story_role": "origin",
+            "marketing_intent": "proof",
+            "voiceover": "原料来自大片连片种植的作物，来源清晰。",
+            "subtitle": "原料来自大片连片种植的作物，来源清晰。",
+            "evidence_refs": [anchor["id"]],
+            "visual_query": [visual],
+            "claims": [],
+        }
+
+        assert _copy_preflight_check(
+            segment,
+            None,
+            {"name": "产品", "type": "食品"},
+            analysis,
+            [anchor],
+        ) is None
+
+        unsupported = {
+            **segment,
+            "voiceover": "天然优质原料带来更好品质。",
+            "subtitle": "天然优质原料带来更好品质。",
+        }
+        assert _copy_preflight_check(
+            unsupported,
+            None,
+            {"name": "产品", "type": "食品"},
+            analysis,
+            [anchor],
+        ) is not None
 
     def test_verified_visual_relationship_entity_becomes_bounded_copy_evidence(self):
         """产品标签与高置信视觉实体共同确认后，具体原料实体才可供脚本引用。"""
@@ -11473,11 +11944,89 @@ class TestLocalMultiClipPlanning:
             "product_story_role": "finished_product",
             "product_relevance_prior": "high",
             "product_visibility": 5,
-        }) is True
+        }) is False
         assert _story_role_supported(source_segment, {
             "product_story_role": "origin",
             "product_relevance_prior": "high",
         }) is False
+
+    def test_specific_source_role_visual_query_cannot_fall_back_to_product_shot(
+        self,
+        tmp_path,
+    ):
+        from local_asset_pipeline import plan_and_materialize_local_clips
+
+        def window(window_id, role, primary_visual, visible_text):
+            return {
+                "window_id": window_id,
+                "source_video": f"{window_id}.mp4",
+                "source_path": str(tmp_path / f"{window_id}.mp4"),
+                "start": 0.0,
+                "end": 2.0,
+                "duration": 2.0,
+                "analysis": {
+                    "usable_for_ad": True,
+                    "confidence": 0.9 if role == "origin" else 1.0,
+                    "product_story_role": role,
+                    "product_visibility": 0 if role == "origin" else 5,
+                    "product_relevance_prior": "high",
+                    "primary_visuals": [primary_visual],
+                    "visible_objects": [primary_visual],
+                    "visible_text": visible_text,
+                    "literal_actions": [],
+                    "narrative_roles": ["product_showcase"],
+                },
+                "motion": {"motion_class": "semi_dynamic"},
+                "frame_quality": {"passed": True},
+            }
+
+        visual_query = "成片种植的带白色小花的绿色作物田"
+        script = {
+            "segments": [{
+                "segment": 0,
+                "narrative": "source_context",
+                "marketing_intent": "value",
+                "product_story_role": "origin",
+                "desired_product_story_role": "origin",
+                "visual_story_role": "origin",
+                "visual_binding": "supportive",
+                "visual_query": [visual_query],
+                "asset_query": ["饮品"],
+                "evidence_refs": ["product:name"],
+                "voiceover": "原料生长在自然环境里。",
+                "subtitle": "原料生长在自然环境里。",
+                "claims": [],
+            }],
+            "material_capability_pool": {
+                "evidence_anchors": [{
+                    "id": "product:name",
+                    "kind": "product_info",
+                    "text": "饮品",
+                }],
+            },
+        }
+
+        result = plan_and_materialize_local_clips(
+            asset_index={
+                "asset_folder": str(tmp_path),
+                "windows": [
+                    window("product", "finished_product", "桌面上的瓶装饮品", ["饮品"]),
+                    window("origin", "origin", visual_query, []),
+                ],
+                "coverage": {},
+            },
+            ad_script=script,
+            rhythm_template={"segments": [{"index": 0, "duration": 2.0}]},
+            clips_dir=tmp_path / "clips",
+            final_dir=tmp_path / "final",
+            output_name="source-role-authority",
+            product_info={"name": "饮品", "type": "食品"},
+            plan_only=True,
+            record_failure=False,
+        )
+
+        assert result["selected_segments"][0]["source_video"] == "origin.mp4"
+        assert result["bound_segments"][0]["matched_product_story_roles"] == ["origin"]
 
     def test_planning_is_idempotent_and_never_rewrites_script_constraints(self, tmp_path):
         import copy
