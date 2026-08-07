@@ -1,4 +1,4 @@
-# Kling Ad Automation
+# Dy Ad Automation
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![ffmpeg 4.0+](https://img.shields.io/badge/ffmpeg-4.0%2B-007808?logo=ffmpeg&logoColor=white)](https://ffmpeg.org/)
@@ -25,10 +25,10 @@
 
 ## 工作模式
 
-| 模式 | 画面来源 | 核心流程 | 可灵图片/视频 API |
-| --- | --- | --- | --- |
-| 本地视频混剪 | 用户提供的视频目录 | 素材理解 → 证据约束脚本 → 单条口播 → 智能选片 → 后期 | 不调用 |
-| 可灵 AI 视频生成 | 产品信息、角色和商品参考图 | 广告脚本 → 视觉约束 → 分镜生成与择优 → 后期 | 调用 |
+| 模式             | 画面来源                   | 核心流程                                             | 可灵图片/视频 API |
+| ---------------- | -------------------------- | ---------------------------------------------------- | ----------------- |
+| 本地视频混剪     | 用户提供的视频目录         | 素材理解 → 证据约束脚本 → 单条口播 → 智能选片 → 后期 | 不调用            |
+| 可灵 AI 视频生成 | 产品信息、角色和商品参考图 | 广告脚本 → 视觉约束 → 分镜生成与择优 → 后期          | 调用              |
 
 两种模式不会在同一次任务中混用画面生成链路。本地模式不会生成角色定妆照或估算可灵费用；AI 模式保留图片先行、分镜生成、候选择优和成本预估。
 
@@ -51,7 +51,7 @@
 - 与所选工作模式对应的 API 凭据
 
 ```bash
-cd kling-ad-automation
+cd dy-ad-automation
 pip install -r requirements.txt
 ```
 
@@ -73,13 +73,13 @@ sudo apt install ffmpeg
 cp .env.example .env
 ```
 
-| 配置 | 使用场景 | 是否必需 |
-| --- | --- | --- |
-| `VISION_ENABLED=true`、`VISION_API_KEY`、`VISION_BASE_URL`、`VISION_MODEL` | 本地素材视觉理解，模型需支持 `image_url` | 本地素材模式必需 |
-| `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL` | 主题解析和广告文案 | 本地素材带货流程必需 |
-| `KLING_ACCESS_KEY` + `KLING_SECRET_KEY`，或 `KLING_API_KEY` | 可灵图片/视频生成 | 可灵 AI 模式必需 |
-| `VOLC_API_KEY` | 豆包 TTS 和可选火山 ASR | 可选 |
-| `ASR_PROVIDER`、`ASR_API_KEY`、`ASR_MODEL` | 原素材人声转写 | 素材有人声时按需配置 |
+| 配置                                                                       | 使用场景                                 | 是否必需             |
+| -------------------------------------------------------------------------- | ---------------------------------------- | -------------------- |
+| `VISION_ENABLED=true`、`VISION_API_KEY`、`VISION_BASE_URL`、`VISION_MODEL` | 本地素材视觉理解，模型需支持 `image_url` | 本地素材模式必需     |
+| `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`                                 | 主题解析和广告文案                       | 本地素材带货流程必需 |
+| `KLING_ACCESS_KEY` + `KLING_SECRET_KEY`，或 `KLING_API_KEY`                | 可灵图片/视频生成                        | 可灵 AI 模式必需     |
+| `VOLC_API_KEY`                                                             | 豆包 TTS 和可选火山 ASR                  | 可选                 |
+| `ASR_PROVIDER`、`ASR_API_KEY`、`ASR_MODEL`                                 | 原素材人声转写                           | 素材有人声时按需配置 |
 
 本地素材模式不需要可灵 Key。`--no-llm` 只适用于支持模板降级的非本地素材流程；本地素材带货流程会在没有 LLM 时阻断，避免生成无法验证的脚本。未配置豆包 TTS 时可降级到本机可用的 TTS。
 
@@ -199,19 +199,19 @@ output/
 
 ## 项目结构
 
-| 模块 | 职责 |
-| --- | --- |
-| `one_click_create.py` | CLI、模式路由、时间轴权威和一键成片编排 |
-| `local_asset_pipeline.py` | 素材理解、证据合同、脚本约束、自然时间轴和智能选片 |
-| `material_copy_optimizer.py` | 素材证据到带货文案的营销语义评估 |
-| `semantic_stickers.py` | 证据约束的语义贴图规划和渲染 |
-| `kling_client.py` | 可灵图片/视频 API 客户端 |
-| `video_merger.py` | ffmpeg 拼接、字幕、音频、调色和导出 |
-| `tts_client.py` | 豆包 TTS 优先、本地 TTS 降级的口播生成 |
-| `bgm_client.py` | BGM 搜索、匹配、缓存和混音 |
-| `quality_checker.py` | 清晰度、黑帧、冻结帧和音频等质量检测 |
-| `compliance_checker.py` | 广告合规检测和风险拦截 |
-| `batch.py` | YAML 批量任务和并发控制 |
+| 模块                         | 职责                                               |
+| ---------------------------- | -------------------------------------------------- |
+| `one_click_create.py`        | CLI、模式路由、时间轴权威和一键成片编排            |
+| `local_asset_pipeline.py`    | 素材理解、证据合同、脚本约束、自然时间轴和智能选片 |
+| `material_copy_optimizer.py` | 素材证据到带货文案的营销语义评估                   |
+| `semantic_stickers.py`       | 证据约束的语义贴图规划和渲染                       |
+| `kling_client.py`            | 可灵图片/视频 API 客户端                           |
+| `video_merger.py`            | ffmpeg 拼接、字幕、音频、调色和导出                |
+| `tts_client.py`              | 豆包 TTS 优先、本地 TTS 降级的口播生成             |
+| `bgm_client.py`              | BGM 搜索、匹配、缓存和混音                         |
+| `quality_checker.py`         | 清晰度、黑帧、冻结帧和音频等质量检测               |
+| `compliance_checker.py`      | 广告合规检测和风险拦截                             |
+| `batch.py`                   | YAML 批量任务和并发控制                            |
 
 架构与两条执行链路见 [架构说明](docs/architecture.md)。
 
