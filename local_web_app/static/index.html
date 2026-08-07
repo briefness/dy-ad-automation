@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f2fbf8">
+  <title>本地混剪工作台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="本地混剪工作台首页">
+      <span class="brand-mark" aria-hidden="true">LM</span>
+      <span><strong>本地混剪工作台</strong><small>素材理解 · 自然时长 · 成片交付</small></span>
+    </a>
+    <div class="topbar-actions">
+      <span id="env" class="status-badge pending">环境检查中</span>
+      <button id="open" class="icon-button" type="button" title="打开输出目录" aria-label="打开输出目录">↗</button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="form-column">
+      <div class="eyebrow">01 / 输入</div>
+      <h1>把素材变成一条完整成片</h1>
+      <p class="lede">先锁定可验证的产品事实，再让本地素材决定镜头顺序和自然时长。</p>
+
+      <form id="run-form" novalidate>
+        <fieldset>
+          <legend>素材目录</legend>
+          <label for="asset_path">本地素材路径 <span class="required">必填</span></label>
+          <input id="asset_path" name="asset_path" autocomplete="off" placeholder="/Users/你/Videos/项目素材" required>
+          <p id="asset-hint" class="field-hint">支持常见视频格式，目录和视频文件需要可读</p>
+        </fieldset>
+
+        <fieldset>
+          <legend>产品事实</legend>
+          <label for="name">产品名称 <span class="required">必填</span></label>
+          <input id="name" name="name" required>
+          <label for="type">产品类型</label>
+          <input id="type" name="type" placeholder="食品 / 美妆 / 服装 / app">
+          <label for="selling_point">核心卖点 <span class="required">必填</span></label>
+          <textarea id="selling_point" name="selling_point" rows="2" required></textarea>
+          <label for="verified_claims">已核验卖点 <span class="field-note">逗号分隔</span></label>
+          <textarea id="verified_claims" name="verified_claims" rows="2" placeholder="真实可证明的购买理由"></textarea>
+          <div class="field-grid">
+            <label for="ingredients">原料 <span class="field-note">可选</span></label>
+            <label for="origin">产地 <span class="field-note">可选</span></label>
+            <input id="ingredients" name="ingredients" placeholder="如：茉莉花、茶叶">
+            <input id="origin" name="origin" placeholder="不确定请留空">
+          </div>
+          <label for="production_process">生产工艺 <span class="field-note">可选 · 逗号分隔</span></label>
+          <textarea id="production_process" name="production_process" rows="2"></textarea>
+          <label for="audience">目标人群</label>
+          <input id="audience" name="audience" placeholder="如：18-35 岁都市女性">
+          <label for="extra_requirements">额外文案要求 <span class="field-note">可选</span></label>
+          <textarea id="extra_requirements" name="extra_requirements" rows="2"></textarea>
+        </fieldset>
+
+      </form>
+    </aside>
+
+    <section class="content-column" aria-live="polite">
+      <section class="panel" aria-labelledby="preflight-title">
+        <div class="panel-heading"><div><div class="eyebrow">02 / 预检</div><h2 id="preflight-title">素材能力与推荐</h2></div></div>
+        <div id="preflight-result" class="empty-state">等待素材预检</div>
+        <div class="metric-grid" id="preflight-metrics" hidden></div>
+        <div class="recommendation-strip" id="recommendation-strip" hidden><span class="recommendation-dot" aria-hidden="true"></span><span id="recommendation-copy">推荐值会根据本次素材预检生成</span></div>
+        <div class="preflight-action"><button id="preflight" class="button primary" type="submit" form="run-form"><span aria-hidden="true">⌁</span> 预检素材</button></div>
+        <div class="task-progress preflight-progress">
+          <div class="progress-summary"><span>预检进度</span><strong id="preflight-progress">0%</strong></div>
+          <div class="progress-track"><i id="preflight-progress-bar"></i></div>
+          <pre id="preflight-logs" class="logs" aria-label="预检日志">等待预检</pre>
+          <div id="preflight-error" class="error-box" hidden></div>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="settings-title">
+        <div class="panel-heading"><div><div class="eyebrow">03 / 混剪</div><h2 id="settings-title">生成成片</h2></div><span class="subtle">推荐值可修改</span></div>
+        <div class="settings-grid">
+          <label for="target_duration">目标时长（秒）<input id="target_duration" type="number" min="1" max="60" step="1" placeholder="自然时长"></label>
+          <label for="video_style">视频风格<select id="video_style"><option value="auto">自动推荐</option><option value="带货">带货</option><option value="个人vlog">个人 Vlog</option><option value="种草">种草</option><option value="测评">测评</option><option value="开箱">开箱</option></select></label>
+          <label for="rhythm_style">节奏<select id="rhythm_style"><option value="moderate">适中</option><option value="fast">快速</option><option value="cinematic">电影感</option></select></label>
+          <label for="voice">音色<select id="voice"><option value="auto">自动</option><option value="female_young">年轻女声</option><option value="female_warm">温柔女声</option><option value="male_pro">专业男声</option><option value="male_magnetic">磁性男声</option><option value="energetic_female">活力女声</option></select></label>
+          <label for="stickers">语义贴图<select id="stickers"><option value="auto">自动</option><option value="on">开启</option><option value="off">关闭</option></select></label>
+          <label for="output_name">输出名称<input id="output_name" placeholder="默认使用稳定命名"></label>
+        </div>
+        <div class="toggle-row"><label class="toggle-label"><input id="voiceover" type="checkbox" checked><span class="toggle-ui" aria-hidden="true"></span><span>生成口播</span></label><label class="toggle-label"><input id="resume" type="checkbox" checked><span class="toggle-ui" aria-hidden="true"></span><span>断点续跑</span></label></div>
+        <div class="action-row"><button id="run" class="button primary" type="button" disabled><span aria-hidden="true">▶</span> 开始混剪</button><button id="cancel" class="button danger" type="button" disabled><span aria-hidden="true">■</span> 取消任务</button></div>
+        <p class="cancellation-note">取消会立即终止本机 worker；已经被远程服务接受的请求无法撤回。</p>
+        <div class="task-progress run-progress">
+          <div class="progress-summary"><span>混剪进度</span><strong id="progress">0%</strong></div>
+          <div class="progress-track"><i id="progress-bar"></i></div>
+          <ol id="stage-rail" class="stage-rail"><li data-stage="asset_analysis">素材分析</li><li data-stage="script">脚本生成</li><li data-stage="clip_selection">智能选片</li><li data-stage="audio_and_subtitles">口播与字幕</li><li data-stage="render">视频合成</li><li data-stage="quality">质量检查</li></ol>
+          <pre id="logs" class="logs" aria-label="混剪日志">等待混剪</pre>
+          <div id="error-box" class="error-box" hidden></div>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="result-title">
+        <div class="panel-heading"><div><div class="eyebrow">04 / 交付</div><h2 id="result-title">成片与历史</h2></div><button id="refresh-history" class="text-button" type="button">刷新</button></div>
+        <div id="results" class="empty-state">尚无成片</div>
+        <div id="history" class="history-list"></div>
+      </section>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

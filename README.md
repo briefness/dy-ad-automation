@@ -1,5 +1,9 @@
 # Kling Ad Automation
 
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![ffmpeg 4.0+](https://img.shields.io/badge/ffmpeg-4.0%2B-007808?logo=ffmpeg&logoColor=white)](https://ffmpeg.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-2ea44f.svg)](LICENSE)
+
 面向抖音广告的一键成片工具。项目支持“本地视频混剪”和“可灵 AI 视频生成”两种互斥的画面来源，并共享脚本、单条口播、字幕、BGM、转场、语义贴图、调色、质量检测和最终导出链路。
 
 ## 目录
@@ -9,6 +13,7 @@
 - [安装](#安装)
 - [配置](#配置)
 - [快速开始](#快速开始)
+- [Web 工作台](#web-工作台)
 - [本地素材证据合同](#本地素材证据合同)
 - [时长规则](#时长规则)
 - [输出产物](#输出产物)
@@ -41,7 +46,7 @@
 
 前置条件：
 
-- Python 及 `pip`
+- Python 3.10 或更高版本及 `pip`
 - ffmpeg 4.0 或更高版本
 - 与所选工作模式对应的 API 凭据
 
@@ -135,6 +140,22 @@ python one_click_create.py --list-styles
 ```
 
 完整参数和默认值见 [CLI 参考](docs/cli-reference.md)。
+
+## Web 工作台
+
+本地素材混剪也可以通过浏览器工作台运行：
+
+![本地混剪工作台](assets/local-mix-workbench.jpg)
+
+> 填写可验证的产品事实，完成素材预检、参数确认、成片生成和历史产物查看。
+
+```bash
+python local_web.py
+```
+
+启动后打开终端输出的本地地址，默认尝试使用 `http://127.0.0.1:8765`；如果端口已被占用，程序会自动选择其他可用端口。
+
+工作台覆盖产品事实录入、素材预检、推荐参数确认、混剪进度、任务取消和历史产物查看。它仅绑定本机回环地址，不对局域网或公网提供服务。可灵 AI 视频生成及高级参数仍使用 CLI。
 
 ## 本地素材证据合同
 
