@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **kling-ad-automation** (4078 symbols, 7387 relationships, 266 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **dy-ad-automation** (4112 symbols, 7762 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
@@ -25,10 +25,10 @@ This project is indexed by GitNexus as **kling-ad-automation** (4078 symbols, 73
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/kling-ad-automation/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/kling-ad-automation/clusters` | All functional areas |
-| `gitnexus://repo/kling-ad-automation/processes` | All execution flows |
-| `gitnexus://repo/kling-ad-automation/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/dy-ad-automation/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/dy-ad-automation/clusters` | All functional areas |
+| `gitnexus://repo/dy-ad-automation/processes` | All execution flows |
+| `gitnexus://repo/dy-ad-automation/process/{name}` | Step-by-step execution trace |
 
 ## CLI
 

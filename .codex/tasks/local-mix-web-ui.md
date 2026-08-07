@@ -31,6 +31,7 @@ Validation
 - `rtk python -m py_compile local_web.py local_web_app/*.py`
 - `rtk pytest -q tests/test_local_web.py` -> 7 passed.
 - Second pass: matching completed preflight required before formal run; worker process-group cancellation and preflight log capture; API-key-aware environment gate; artifact suffix/path hardening; occupied-port fallback; refreshed light UI.
+- Director-workbench pass: state-driven central stage, concise project brief, adjustable parameter inspector, fixed action dock, and a version-only history tab. The existing payload, preflight matching, polling, cancellation, results, and history APIs stay unchanged.
 
 Remaining work
 - Parent agent to perform final diff review and broader integration verification.
