@@ -981,9 +981,33 @@ def _get_font_postscript_name(font_path: str) -> str:
     return Path(font_path).stem
 
 
+def _rewrite_hw_cmd_to_sw(cmd: List[str]) -> Optional[List[str]]:
+    """If an FFmpeg command used a hardware H.264 encoder, return a safe libx264 equivalent."""
+    hw_codecs = {"h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_vaapi"}
+    if not any(token in hw_codecs for token in cmd):
+        return None
+    rewritten: List[str] = []
+    skip_next = False
+    for idx, token in enumerate(cmd):
+        if skip_next:
+            skip_next = False
+            continue
+        if token in {"-allow_sw", "-cq", "-global_quality"}:
+            skip_next = True
+            continue
+        if token in hw_codecs:
+            rewritten.extend(["libx264", "-preset", "veryfast", "-crf", "16"])
+            continue
+        if token == "-preset" and idx + 1 < len(cmd) and cmd[idx + 1] in {"p4", "p5", "p6"}:
+            skip_next = True
+            continue
+        rewritten.append(token)
+    return rewritten
+
+
 def run_ffmpeg(cmd: List[str], timeout: int = 300, retries: int = 2) -> subprocess.CompletedProcess:
     """
-    执行 ffmpeg 命令（带自动重试）
+    执行 ffmpeg 命令（带硬件编码自动软件回退 + 自动重试）
 
     Args:
         cmd: ffmpeg 命令参数列表
@@ -998,7 +1022,8 @@ def run_ffmpeg(cmd: List[str], timeout: int = 300, retries: int = 2) -> subproce
     """
     import time
 
-    cmd_str = " ".join(cmd)
+    active_cmd = list(cmd)
+    sw_fallback_used = False
     last_error = None
     last_stderr = ""
     last_result = None
@@ -1011,7 +1036,7 @@ def run_ffmpeg(cmd: List[str], timeout: int = 300, retries: int = 2) -> subproce
 
         try:
             result = subprocess.run(
-                cmd,
+                active_cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -1023,6 +1048,12 @@ def run_ffmpeg(cmd: List[str], timeout: int = 300, retries: int = 2) -> subproce
             last_result = result
             last_error = last_stderr[-500:] if last_stderr else "unknown error"
             print(f"[FFmpeg] 失败（第 {attempt + 1} 次）：{last_error[:200]}")
+            if not sw_fallback_used:
+                sw_cmd = _rewrite_hw_cmd_to_sw(active_cmd)
+                if sw_cmd is not None:
+                    print("[FFmpeg] 硬件编码回退到 libx264...")
+                    active_cmd = sw_cmd
+                    sw_fallback_used = True
 
         except subprocess.TimeoutExpired as e:
             last_error = f"timeout after {timeout}s"
@@ -1238,6 +1269,89 @@ def adjust_clip_duration(
         print("     回退到原文件...")
         shutil.copy2(clip_path, output_path)
         return output_path
+
+
+def adjust_clip_speed_ramp(
+    clip_path: Path,
+    target_duration: float,
+    output_path: Path,
+    *,
+    mode: str = "ease_in_out",
+    interpolate_slowmo: bool = True,
+) -> Path:
+    """Adjust clip duration with a 3-zone speed ramp or motion-interpolated slow-mo.
+
+    - When slowing down (``speed_ratio < 0.85``) and ``interpolate_slowmo=True``,
+      uses FFmpeg ``minterpolate`` (MCI/blend) so slow-motion stays fluid rather
+      than stuttering.
+    - When speeding up with ``mode="ease_in_out"`` on clips >= 1.5s, applies a
+      fast-in / normal-hero / fast-out speed curve that preserves natural motion
+      during the middle hero beat while landing cleanly on ``target_duration``.
+    """
+    from render_backend import video_encode_args
+
+    clip_path = Path(clip_path)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    orig_dur = _get_clip_duration(clip_path)
+    if orig_dur <= 0.1 or abs(orig_dur - target_duration) < 0.08:
+        shutil.copy2(clip_path, output_path)
+        return output_path
+
+    speed_ratio = max(0.5, min(2.0, orig_dur / max(target_duration, 0.2)))
+
+    # Smooth motion-interpolated slow-motion
+    if speed_ratio < 0.85 and interpolate_slowmo:
+        vf = (
+            f"setpts={1.0 / speed_ratio:.4f}*PTS,"
+            f"minterpolate=fps={OUTPUT_FPS}:mi_mode=blend"
+        )
+        cmd = [
+            "ffmpeg", "-y", "-i", str(clip_path),
+            "-vf", vf,
+            "-t", f"{target_duration:.3f}",
+            *video_encode_args(profile="intermediate", bitrate=OUTPUT_BITRATE, allow_hw=True),
+            "-an", "-movflags", "+faststart",
+            str(output_path),
+        ]
+        try:
+            run_ffmpeg(cmd, timeout=180, retries=1)
+            if output_path.is_file() and output_path.stat().st_size > 1000:
+                return output_path
+        except Exception:
+            pass
+
+    # 3-zone ease-in / hero / ease-out speed ramp for sped-up showcase clips
+    if mode == "ease_in_out" and speed_ratio > 1.15 and orig_dur >= 1.5:
+        edge_src = orig_dur * 0.25
+        mid_src = orig_dur * 0.50
+        mid_speed = max(1.0, min(speed_ratio, 1.0 + (speed_ratio - 1.0) * 0.45))
+        mid_out = mid_src / mid_speed
+        rem_out = max(0.2, target_duration - mid_out)
+        edge_speed = max(1.0, min(2.5, (2.0 * edge_src) / rem_out))
+        fc = (
+            f"[0:v]trim=0:{edge_src:.3f},setpts=(PTS-STARTPTS)/{edge_speed:.4f}[v0];"
+            f"[0:v]trim={edge_src:.3f}:{edge_src + mid_src:.3f},setpts=(PTS-STARTPTS)/{mid_speed:.4f}[v1];"
+            f"[0:v]trim={edge_src + mid_src:.3f}:{orig_dur:.3f},setpts=(PTS-STARTPTS)/{edge_speed:.4f}[v2];"
+            f"[v0][v1][v2]concat=n=3:v=1:a=0,fps={OUTPUT_FPS}[vout]"
+        )
+        cmd = [
+            "ffmpeg", "-y", "-i", str(clip_path),
+            "-filter_complex", fc,
+            "-map", "[vout]",
+            "-t", f"{target_duration:.3f}",
+            *video_encode_args(profile="intermediate", bitrate=OUTPUT_BITRATE, allow_hw=True),
+            "-an", "-movflags", "+faststart",
+            str(output_path),
+        ]
+        try:
+            run_ffmpeg(cmd, timeout=180, retries=1)
+            if output_path.is_file() and output_path.stat().st_size > 1000:
+                return output_path
+        except Exception:
+            pass
+
+    return adjust_clip_duration(clip_path, target_duration, output_path, method="speed")
 
 
 def _build_atempo_filter(speed_ratio: float) -> str:
@@ -1488,11 +1602,10 @@ def add_logo_watermark(
     # #6 修复：无音轨保护，没有音频流时不映射 0:a
     if _has_audio_stream(video):
         cmd.extend(["-map", "0:a", "-c:a", "copy"])
+    from render_backend import video_encode_args as _rb_video_encode_args
+
     cmd.extend([
-        "-c:v", "libx264",
-        "-preset", "slow",
-        "-crf", "16",   # 与主流水线统一为 CRF 16（原 18 偏松）
-        *_video_vbv_args(),
+        *_rb_video_encode_args(profile="intermediate", bitrate=OUTPUT_BITRATE, allow_hw=True),
         "-movflags", "+faststart",
         str(output),
     ])
@@ -2214,14 +2327,16 @@ def _merge_with_transitions(
         cmd.extend(["-map", audio_map])
     # norm_parts 已在 filter_complex 中将各片段精确归一化到 OUTPUT_RESOLUTION，
     # 无需再加 -vf scale+pad（否则会对已归一化的输出流做二次 scale，引入额外压缩损耗）
-    cmd.extend([
-        "-c:v", "libx264",
-        "-preset", "slow",
-        "-crf", "16",
-        *_video_vbv_args(),
-        "-r", str(OUTPUT_FPS),
-        "-pix_fmt", "yuv420p", *_color_range_args(),
-    ])
+    from render_backend import video_encode_args as _rb_video_encode_args
+
+    cmd.extend(
+        _rb_video_encode_args(
+            profile="intermediate",
+            bitrate=OUTPUT_BITRATE,
+            allow_hw=True,
+            fps=OUTPUT_FPS,
+        )
+    )
     if audio_map:
         cmd.extend([
             "-c:a", "aac",
@@ -3019,6 +3134,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 f"Dialogue: 0,{start_str},{end_str},{base_style},,0,0,{item_margin_v},,{display_text}"
             )
 
+        elif item_animation == "karaoke":
+            word_timings = sub.get("word_timings") or []
+            if word_timings:
+                parts = []
+                for wt in word_timings:
+                    token = str(wt.get("word") or "")
+                    if not token:
+                        continue
+                    cs = max(2, int(round(max(0.02, float(wt.get("end", 0)) - float(wt.get("start", 0))) * 100)))
+                    parts.append(f"{{\\kf{cs}}}{token}")
+                karaoke_body = "".join(parts) or text
+            else:
+                chars = list(text)
+                per_cs = max(2, int(round((duration * 100) / max(len(chars), 1))))
+                karaoke_body = "".join(f"{{\\kf{per_cs}}}{ch}" for ch in chars)
+            display_text = f"{{\\1c{ass_accent}\\2c{ass_primary}}}{karaoke_body}"
+            ass_lines.append(
+                f"Dialogue: 0,{start_str},{end_str},{base_style},,0,0,{item_margin_v},,{display_text}"
+            )
+
         elif item_animation == "highlight":
             display_text = _inject_highlights(text, highlight_words, color_tag)
             _t = display_text.replace(chr(10), "\\N")
@@ -3050,15 +3185,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         else:
             subtitle_filter = f"ass={_ffmpeg_escape_filter_path(ass_path)}"
 
-        # Bug #2 修复：补充 -c:v libx264，防止 ffmpeg 回退到低质量 mpeg4 编码器
+        from render_backend import video_encode_args as _rb_video_encode_args
+
         cmd = [
             "ffmpeg",
             "-y",
             "-i", str(video),
             "-vf", subtitle_filter,
-            "-c:v", "libx264", "-preset", "slow", "-crf", "16",
-            *_video_vbv_args(),
-            "-pix_fmt", "yuv420p", *_color_range_args(),
+            *_rb_video_encode_args(profile="intermediate", bitrate=OUTPUT_BITRATE, allow_hw=True),
         ]
         # P1 修复：输入无音轨时 -c:a copy 会导致 ffmpeg 崩溃
         if _has_audio_stream(video):
@@ -3970,63 +4104,63 @@ def convert_to_aspect_ratio(
     input_video: Path,
     output: Path,
     target_aspect_ratio: str = "16:9",
+    smart_reframe: bool = True,
 ) -> Path:
     """
-    转换视频画幅比例
+    转换视频画幅比例（默认启用 Smart Reframe 主体追踪智能构图）
 
     Args:
         input_video: 输入视频
         output: 输出路径
-        target_aspect_ratio: 目标画幅比例（如 16:9、1:1）
+        target_aspect_ratio: 目标画幅比例（如 16:9、9:16、1:1）
+        smart_reframe: True 时优先跟踪人脸/显著主体平滑裁切，False 时退回居中裁切
 
     Returns:
         输出文件路径
     """
-    # 解析目标比例
+    from render_backend import video_encode_args
+
     w_ratio, h_ratio = map(int, target_aspect_ratio.split(":"))
-    target_w = 1920
-    target_h = int(target_w * h_ratio / w_ratio)
-
-    # 对于 9:16 -> 16:9 的转换：
-    # 先 scale 到目标宽度，高度自动按比例
-    # 然后从中间裁切出目标高度
-    # 这样可以保留画面中心的内容
-
-    # 如果是 9:16 转 16:9，需要裁切上下部分
-    # 如果是 16:9 转 9:16，需要裁切左右部分
-    # 如果是 1:1，需要裁切成正方形
-
     if target_aspect_ratio == "16:9":
-        # 9:16 (1080x1920) -> 16:9 (1920x1080)
-        # scale 到宽度 1920，然后裁切中间 1080 高度
-        vf_filter = (
-            "scale=1920:-1,"
-            "crop=1920:1080:(iw-1920)/2:(ih-1080)/2"
-        )
+        target_w, target_h = 1920, 1080
+    elif target_aspect_ratio == "9:16":
+        target_w, target_h = 1080, 1920
     elif target_aspect_ratio == "1:1":
-        # 裁切为正方形，从中间裁切
-        vf_filter = (
-            "scale=1080:-1,"
-            "crop=1080:1080:(iw-1080)/2:(ih-1080)/2"
-        )
+        target_w, target_h = 1080, 1080
     else:
-        # 通用转换：scale 到目标宽度，然后裁切
-        vf_filter = (
-            f"scale={target_w}:-1,"
-            f"crop={target_w}:{target_h}:(iw-{target_w})/2:(ih-{target_h})/2"
-        )
+        target_w = 1920
+        target_h = int(target_w * h_ratio / w_ratio)
+
+    vf_filter = ""
+    if smart_reframe:
+        try:
+            from smart_reframe import build_smart_reframe_vf
+
+            dur = max(0.5, _get_clip_duration(input_video))
+            reframe = build_smart_reframe_vf(
+                Path(input_video), 0.0, dur, target_w, target_h, mode="crop"
+            )
+            vf_filter = reframe["vf"]
+        except Exception:
+            vf_filter = ""
+
+    if not vf_filter:
+        if target_aspect_ratio == "16:9":
+            vf_filter = "scale=1920:-1,crop=1920:1080:(iw-1920)/2:(ih-1080)/2"
+        elif target_aspect_ratio == "1:1":
+            vf_filter = "scale=1080:-1,crop=1080:1080:(iw-1080)/2:(ih-1080)/2"
+        else:
+            vf_filter = (
+                f"scale={target_w}:-1,"
+                f"crop={target_w}:{target_h}:(iw-{target_w})/2:(ih-{target_h})/2"
+            )
 
     cmd = [
         "ffmpeg",
         "-y",
         "-i", str(input_video),
         "-vf", vf_filter,
-        "-c:v", "libx264",
-        "-preset", "slow",
-        "-crf", "16",
-        *_video_vbv_args(),
-        "-r", str(OUTPUT_FPS),
-        "-pix_fmt", "yuv420p", *_color_range_args(),
+        *video_encode_args(profile="intermediate", bitrate=OUTPUT_BITRATE, allow_hw=True, fps=OUTPUT_FPS),
     ]
     if _has_audio_stream(input_video):
         cmd.extend(["-c:a", "copy"])

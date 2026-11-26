@@ -17,9 +17,9 @@ from .services import environment_check, normalize_product
 from .validation import AssetPathError, is_safe_artifact
 
 STATIC_DIR = Path(__file__).with_name("static")
-ARTIFACT_SUFFIXES = {".mp4", ".json", ".txt", ".html", ".md", ".jpg", ".jpeg", ".png"}
-PRESENTATION_SUFFIXES = {".mp4", ".jpg", ".jpeg", ".png", ".json", ".html"}
-TEXT_SUFFIXES = {".txt", ".json", ".html", ".md"}
+ARTIFACT_SUFFIXES = {".mp4", ".json", ".txt", ".html", ".md", ".jpg", ".jpeg", ".png", ".otio", ".fcpxml"}
+PRESENTATION_SUFFIXES = {".mp4", ".jpg", ".jpeg", ".png", ".json", ".html", ".otio", ".fcpxml"}
+TEXT_SUFFIXES = {".txt", ".json", ".html", ".md", ".otio", ".fcpxml"}
 
 
 def output_dir() -> Path:
@@ -36,6 +36,10 @@ def artifact_label(path: Path) -> str:
     name = path.name.lower()
     if path.suffix.lower() == ".mp4": return "最终成片" if name.endswith(("_final.mp4", "_enhanced.mp4")) else "视频"
     if path.suffix.lower() in {".jpg", ".jpeg", ".png"}: return "封面图"
+    if path.suffix.lower() == ".otio": return "OTIO 工程"
+    if path.suffix.lower() == ".fcpxml": return "FCPXML 工程"
+    if name == "draft_content.json": return "剪映草稿"
+    if name.endswith("_production_plan.json"): return "成片计划"
     if name.endswith("_script.json"): return "脚本"
     if name.endswith("_run_manifest.json"): return "运行清单"
     if name.endswith("_edit_decision_report.json"): return "剪辑报告"
@@ -47,15 +51,25 @@ def artifact_label(path: Path) -> str:
 def is_presentable_artifact(path: Path) -> bool:
     name = path.name.lower()
     if path.suffix.lower() not in PRESENTATION_SUFFIXES: return False
-    if path.suffix.lower() in {".mp4", ".jpg", ".jpeg", ".png"}: return True
-    return name.endswith(("_script.json", "_run_manifest.json", "_edit_decision_report.json", "_timeline_review.html", "_frame_evidence_report.html"))
+    if path.suffix.lower() in {".mp4", ".jpg", ".jpeg", ".png", ".otio", ".fcpxml"}: return True
+    if name == "draft_content.json": return True
+    return name.endswith(("_production_plan.json", "_script.json", "_run_manifest.json", "_edit_decision_report.json", "_timeline_review.html", "_frame_evidence_report.html"))
 
 
 def artifacts_for(path: Path, prefix: str | None = None) -> list[dict[str, str]]:
     root = output_dir()
     files = sorted(root.rglob("*"), key=lambda item: item.stat().st_mtime if item.is_file() else 0, reverse=True)
     prefix = prefix or path.stem.removesuffix("_final")
-    candidates = [item for item in files if item.is_file() and is_presentable_artifact(item) and (item == path or item.name.startswith(prefix))]
+    candidates = [
+        item for item in files
+        if item.is_file()
+        and is_presentable_artifact(item)
+        and (
+            item == path
+            or item.name.startswith(prefix)
+            or (item.name == "draft_content.json" and item.parent.name.startswith(prefix))
+        )
+    ]
     videos = [item for item in candidates if item.suffix.lower() == ".mp4"]
     preferred_video = next((item for item in videos if item.name.endswith("_final.mp4")), None) or next((item for item in videos if item.name.endswith("_enhanced.mp4")), None) or next(iter(videos), None)
     candidates = [item for item in candidates if item.suffix.lower() != ".mp4" or item == preferred_video]
@@ -119,6 +133,21 @@ class LocalWebHandler(SimpleHTTPRequestHandler):
                 status["result"] = result
             return self._json(status)
         if parsed.path == "/api/history": return self._json({"runs": recent_history()})
+        if parsed.path == "/api/plan":
+            relative = unquote(parse_qs(parsed.query).get("path", [""])[0])
+            if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
+                return self._json({"error": "无效的计划路径"}, HTTPStatus.FORBIDDEN)
+            target = (output_dir() / relative).resolve()
+            if not target.is_file() or not target.name.endswith("_production_plan.json") or not is_safe_artifact(target, output_dir()):
+                return self._json({"error": "成片计划不存在或不可访问"}, HTTPStatus.NOT_FOUND)
+            plan = json.loads(target.read_text(encoding="utf-8"))
+            from plan_rerender import find_candidate_windows_for_plan
+            candidates = {}
+            for root in cache_roots():
+                candidates = find_candidate_windows_for_plan(plan, root)
+                if candidates:
+                    break
+            return self._json({"path": relative, "plan": plan, "candidates": candidates})
         if parsed.path == "/api/artifact": return self._serve_artifact(unquote(parse_qs(parsed.query).get("path", [""])[0]))
         if parsed.path in {"/", "/index.html"}: return self._serve_static("index.html")
         if parsed.path in {"/styles.css", "/app.js"}: return self._serve_static(parsed.path.lstrip("/"))
@@ -148,6 +177,45 @@ class LocalWebHandler(SimpleHTTPRequestHandler):
                 return self._json(self.manager.start("run", payload), HTTPStatus.ACCEPTED)
             if parsed.path in {"/api/cancel", "/api/jobs/cancel", "/api/heartbeat"}:
                 return self._json(self.manager.cancel() if parsed.path != "/api/heartbeat" or body.get("closing") else self.manager.poll())
+            if parsed.path == "/api/plan/rerender":
+                self.manager.poll()
+                if self.manager.public_status().get("active"): raise RuntimeError("已有任务正在运行")
+                relative = str(body.get("plan_path") or "")
+                if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
+                    return self._json({"error": "无效的计划路径"}, HTTPStatus.FORBIDDEN)
+                target = (output_dir() / relative).resolve()
+                if not target.is_file() or not target.name.endswith("_production_plan.json") or not is_safe_artifact(target, output_dir()):
+                    return self._json({"error": "成片计划不存在"}, HTTPStatus.NOT_FOUND)
+                payload = {
+                    "plan_path": str(target),
+                    "edits": body.get("edits") or {},
+                    "reframe_mode": str(body.get("reframe_mode") or "auto"),
+                    "output_dir": str(target.parent),
+                }
+                return self._json(self.manager.start("rerender", payload), HTTPStatus.ACCEPTED)
+            if parsed.path == "/api/plan/export":
+                relative = str(body.get("plan_path") or "")
+                if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
+                    return self._json({"error": "无效的计划路径"}, HTTPStatus.FORBIDDEN)
+                target = (output_dir() / relative).resolve()
+                if not target.is_file() or not target.name.endswith("_production_plan.json") or not is_safe_artifact(target, output_dir()):
+                    return self._json({"error": "成片计划不存在"}, HTTPStatus.NOT_FOUND)
+                from timeline_export import export_all_nle_timelines
+                plan = json.loads(target.read_text(encoding="utf-8"))
+                stem = target.name.removesuffix("_production_plan.json")
+                exported = export_all_nle_timelines(plan, target.parent, stem)
+                root = output_dir()
+                links = [
+                    {
+                        "kind": kind,
+                        "name": p.name,
+                        "label": artifact_label(p),
+                        "path": str(p.resolve().relative_to(root)),
+                        "url": "/api/artifact?path=" + quote(str(p.resolve().relative_to(root)), safe=""),
+                    }
+                    for kind, p in exported.items()
+                ]
+                return self._json({"ok": True, "exports": links})
             if parsed.path == "/api/open-output":
                 self._open_output(); return self._json({"ok": True})
             self.send_error(HTTPStatus.NOT_FOUND)

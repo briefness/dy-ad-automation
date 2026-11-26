@@ -8658,6 +8658,42 @@ def run_generation_pipeline(
                 production_plan_path,
                 timeline_review_path,
             )
+            try:
+                from timeline_export import export_all_nle_timelines
+
+                _nle_audio_tracks: List[Dict[str, Any]] = []
+                if voiceover_enabled and voiceover_audio and Path(voiceover_audio).is_file():
+                    _nle_audio_tracks.append({
+                        "name": "voiceover",
+                        "role": "voiceover",
+                        "path": str(voiceover_audio),
+                        "start": 0.0,
+                        "volume": 1.0,
+                    })
+                if bgm_file and Path(bgm_file).is_file():
+                    _bgm_seg = _selected_bgm_segment if "_selected_bgm_segment" in locals() else {}
+                    _nle_audio_tracks.append({
+                        "name": Path(bgm_file).stem,
+                        "role": "bgm",
+                        "path": str(bgm_file),
+                        "start": 0.0,
+                        "source_start": float((_bgm_seg or {}).get("start_time") or 0.0),
+                        "volume": 0.25 if voiceover_enabled else 0.6,
+                    })
+                _nle_exports = export_all_nle_timelines(
+                    local_production_plan,
+                    final_dir,
+                    output_name,
+                    audio_tracks=_nle_audio_tracks,
+                    resolution=DOUYIN_CONFIG.get("resolution", OUTPUT_RESOLUTION),
+                    fps=int(DOUYIN_CONFIG.get("fps", OUTPUT_FPS)),
+                )
+                print(
+                    f"🎞️  已导出可编辑工程文件：{_nle_exports['otio'].name} / "
+                    f"{_nle_exports['fcpxml'].name} / {_nle_exports['jianying_draft'].parent.name}/"
+                )
+            except Exception as _nle_err:
+                print(f"⚠️  NLE 工程导出跳过：{_nle_err}")
     except Exception as sticker_error:
         sticker_plan = {
             "version": 1,
@@ -8688,7 +8724,81 @@ def run_generation_pipeline(
                 production_plan_path,
                 timeline_review_path,
             )
+            try:
+                from timeline_export import export_all_nle_timelines
+
+                _nle_audio_tracks: List[Dict[str, Any]] = []
+                if voiceover_enabled and voiceover_audio and Path(voiceover_audio).is_file():
+                    _nle_audio_tracks.append({
+                        "name": "voiceover",
+                        "role": "voiceover",
+                        "path": str(voiceover_audio),
+                        "start": 0.0,
+                        "volume": 1.0,
+                    })
+                if bgm_file and Path(bgm_file).is_file():
+                    _bgm_seg = _selected_bgm_segment if "_selected_bgm_segment" in locals() else {}
+                    _nle_audio_tracks.append({
+                        "name": Path(bgm_file).stem,
+                        "role": "bgm",
+                        "path": str(bgm_file),
+                        "start": 0.0,
+                        "source_start": float((_bgm_seg or {}).get("start_time") or 0.0),
+                        "volume": 0.25 if voiceover_enabled else 0.6,
+                    })
+                _nle_exports = export_all_nle_timelines(
+                    local_production_plan,
+                    final_dir,
+                    output_name,
+                    audio_tracks=_nle_audio_tracks,
+                    resolution=DOUYIN_CONFIG.get("resolution", OUTPUT_RESOLUTION),
+                    fps=int(DOUYIN_CONFIG.get("fps", OUTPUT_FPS)),
+                )
+                print(
+                    f"🎞️  已导出可编辑工程文件：{_nle_exports['otio'].name} / "
+                    f"{_nle_exports['fcpxml'].name} / {_nle_exports['jianying_draft'].parent.name}/"
+                )
+            except Exception as _nle_err:
+                print(f"⚠️  NLE 工程导出跳过：{_nle_err}")
         print(f"⚠️  智能语义贴图失败，保留原片：{sticker_error}")
+
+    if local_asset_mode and local_production_plan:
+        try:
+            from timeline_export import export_all_nle_timelines
+
+            _nle_audio_tracks: List[Dict[str, Any]] = []
+            if voiceover_enabled and voiceover_audio and Path(voiceover_audio).is_file():
+                _nle_audio_tracks.append({
+                    "name": "voiceover",
+                    "role": "voiceover",
+                    "path": str(voiceover_audio),
+                    "start": 0.0,
+                    "volume": 1.0,
+                })
+            if bgm_file and Path(bgm_file).is_file():
+                _bgm_seg = _selected_bgm_segment if "_selected_bgm_segment" in locals() else {}
+                _nle_audio_tracks.append({
+                    "name": Path(bgm_file).stem,
+                    "role": "bgm",
+                    "path": str(bgm_file),
+                    "start": 0.0,
+                    "source_start": float((_bgm_seg or {}).get("start_time") or 0.0),
+                    "volume": 0.25 if voiceover_enabled else 0.6,
+                })
+            _nle_exports = export_all_nle_timelines(
+                local_production_plan,
+                final_dir,
+                output_name,
+                audio_tracks=_nle_audio_tracks,
+                resolution=DOUYIN_CONFIG.get("resolution", OUTPUT_RESOLUTION),
+                fps=int(DOUYIN_CONFIG.get("fps", OUTPUT_FPS)),
+            )
+            print(
+                f"🎞️  已导出可编辑工程文件：{_nle_exports['otio'].name} / "
+                f"{_nle_exports['fcpxml'].name} / {_nle_exports['jianying_draft'].parent.name}/"
+            )
+        except Exception as _nle_err:
+            print(f"⚠️  NLE 工程导出跳过：{_nle_err}")
 
     # ============================================================
     # 发布级质量门禁：放在 pipeline 内部，保证单条和批量入口都执行

@@ -117,8 +117,10 @@ def place_source_dialogue(
     trim_start: float,
     total_duration: float,
     max_dialogue_ratio: float = MAX_DIALOGUE_RATIO,
+    j_cut_lead: float = 0.0,
+    l_cut_trail: float = 0.0,
 ) -> List[Dict[str, Any]]:
-    """Map source utterances onto the rendered timeline without cutting or overlap."""
+    """Map source utterances onto the rendered timeline with optional J-Cut/L-Cut overlap."""
     timeline = {int(item["index"]): item for item in edit_timeline}
     placed: List[Dict[str, Any]] = []
     for candidate in candidates:
@@ -159,7 +161,77 @@ def place_source_dialogue(
             continue
         chosen.append(candidate)
         used += duration
-    return sorted(chosen, key=lambda item: item["timeline_start"])
+    ordered = sorted(chosen, key=lambda item: item["timeline_start"])
+    if j_cut_lead > 0.0 or l_cut_trail > 0.0:
+        return apply_j_l_cuts(
+            ordered,
+            total_duration=total_duration,
+            j_cut_lead=j_cut_lead,
+            l_cut_trail=l_cut_trail,
+        )
+    return ordered
+
+
+def apply_j_l_cuts(
+    dialogue_plan: Iterable[Dict[str, Any]],
+    *,
+    total_duration: float,
+    j_cut_lead: float = 0.25,
+    l_cut_trail: float = 0.20,
+) -> List[Dict[str, Any]]:
+    """Apply natural J-Cut (audio pre-roll) and L-Cut (audio carry-over) transitions.
+
+    Safely clamps against timeline bounds, source start >= 0, and adjacent dialogue
+    gap constraints so utterances never collide while gaining cinematic audio flow.
+    """
+    items = [dict(item) for item in dialogue_plan]
+    lead = max(0.0, min(0.6, float(j_cut_lead)))
+    trail = max(0.0, min(0.6, float(l_cut_trail)))
+    if not items or (lead <= 0.0 and trail <= 0.0):
+        return items
+
+    for idx, item in enumerate(items):
+        tl_start = float(item["timeline_start"])
+        tl_end = float(item["timeline_end"])
+        src_start = float(item["source_start"])
+        src_end = float(item["source_end"])
+
+        # J-Cut: bring audio in slightly before the visual cut (skip opening clip at t=0)
+        if idx > 0 and lead > 0.0 and tl_start > 0.05:
+            prev_end = float(items[idx - 1]["timeline_end"])
+            max_lead = min(
+                lead,
+                src_start,
+                max(0.0, tl_start - (prev_end + DIALOGUE_GAP_SECONDS)),
+            )
+            if max_lead >= 0.05:
+                tl_start -= max_lead
+                src_start -= max_lead
+                item["j_cut_lead"] = round(max_lead, 3)
+
+        # L-Cut: carry audio slightly past the cut boundary into the next shot
+        if trail > 0.0 and tl_end < total_duration - 0.05:
+            next_start = (
+                float(items[idx + 1]["timeline_start"])
+                if idx + 1 < len(items)
+                else total_duration
+            )
+            max_trail = min(
+                trail,
+                max(0.0, total_duration - tl_end),
+                max(0.0, next_start - DIALOGUE_GAP_SECONDS - tl_end),
+            )
+            if max_trail >= 0.05:
+                tl_end += max_trail
+                src_end += max_trail
+                item["l_cut_trail"] = round(max_trail, 3)
+
+        item["timeline_start"] = round(tl_start, 3)
+        item["timeline_end"] = round(tl_end, 3)
+        item["source_start"] = round(src_start, 3)
+        item["source_end"] = round(src_end, 3)
+        item["duration"] = round(tl_end - tl_start, 3)
+    return items
 
 
 def dialogue_subtitles(dialogue_plan: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:

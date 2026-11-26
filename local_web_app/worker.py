@@ -56,6 +56,36 @@ def run_worker(kind: str, payload: dict, queue) -> None:
             }
             _emit(queue, "result", result=public_result)
             return
+        if kind == "rerender":
+            from plan_rerender import rerender_production_plan
+
+            _emit(queue, "stage", stage="render", progress=30)
+            with contextlib.redirect_stdout(Tee()), contextlib.redirect_stderr(Tee()):
+                res = rerender_production_plan(
+                    Path(payload["plan_path"]),
+                    edits=payload.get("edits") or {},
+                    output_dir=Path(payload["output_dir"]) if payload.get("output_dir") else None,
+                    reframe_mode=str(payload.get("reframe_mode") or "auto"),
+                    export_nle=True,
+                )
+            _emit(queue, "stage", stage="finishing", progress=96)
+            _emit(queue, "result", result=res)
+            return
+        if kind == "rerender":
+            from plan_rerender import rerender_production_plan
+
+            _emit(queue, "stage", stage="render", progress=30)
+            with contextlib.redirect_stdout(Tee()), contextlib.redirect_stderr(Tee()):
+                res = rerender_production_plan(
+                    Path(payload["plan_path"]),
+                    edits=payload.get("edits"),
+                    output_dir=Path(payload["output_dir"]) if payload.get("output_dir") else None,
+                    reframe_mode=str(payload.get("reframe_mode") or "auto"),
+                    export_nle=True,
+                )
+            _emit(queue, "stage", stage="finishing", progress=96)
+            _emit(queue, "result", result=res)
+            return
         from one_click_create import run_one_click_create
         output_dir = Path(payload.get("output_dir"))
         args = Namespace(style="auto", video_style=payload.get("video_style", "auto"), duration=int(payload.get("duration") or 5), mode="pro", aspect_ratio="9:16", output_name=payload.get("output_name"), dual_output=False, product_image=None, voiceover=bool(payload.get("voiceover", True)), voiceover_style="standard", voice=payload.get("voice", "auto"), script_style="pain_point_solution", strict=True, resume=bool(payload.get("resume", True)), target_duration=payload.get("target_duration"), rhythm_style=payload.get("rhythm_style", "moderate"), local_assets=str(payload["asset_path"]), stickers=payload.get("stickers", "auto"), _explicit_args=set(), hook="demonstration", serial=False, min_clips=3, best_of=1, quality_frames=12, keep_candidates=False, preview=False, max_workers=4, stabilize=True, brand_intro_outro=False, kling_model=None, multi_shot=False, preflight_keyframe=True, image_first=True, image_first_mode="standard", image_first_variants=2, reference_video=None, allow_no_product_image=True, force=False, seed=None, image_fidelity=0.9, human_fidelity=0.9, output_dir=str(output_dir))

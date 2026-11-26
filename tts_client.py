@@ -1307,6 +1307,40 @@ def align_voiceover_lines_to_audio_pauses(
             "alignment_precision": precision,
         })
         cursor = boundary
+
+    # Refine speech-weight fallback lines using acoustic energy-valley DP (or local Whisper)
+    # when real continuous audio had no deep -42dB silences.
+    has_unmeasured = any(
+        item.get("alignment_precision") == "speech_weight_estimate"
+        for item in aligned[:-1]
+    )
+    if has_unmeasured and audio_path.is_file() and audio_path.stat().st_size > 256:
+        try:
+            from audio_alignment import align_lines_acoustic_dp
+
+            refined = align_lines_acoustic_dp(
+                lines,
+                audio_path,
+                duration,
+                preserve_container_edges=preserve_container_edges,
+            )
+            if refined and len(refined) == len(aligned):
+                aligned = refined
+        except Exception:
+            pass
+
+    try:
+        from audio_alignment import build_word_timings
+
+        for item in aligned:
+            if not item.get("word_timings"):
+                item["word_timings"] = build_word_timings(
+                    str(item.get("text") or ""),
+                    float(item["start"]),
+                    float(item["end"]),
+                )
+    except Exception:
+        pass
     return aligned
 
 

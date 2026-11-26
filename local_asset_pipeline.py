@@ -361,22 +361,36 @@ def _load_reusable_window_analyses(
 
 
 def _detect_scene_ranges(source: Path, duration: float) -> List[Dict[str, Any]]:
-    """Use FFmpeg's content detector so windows never straddle a real edit."""
+    """Detect shot boundaries using adaptive HSV content deltas with FFmpeg fallback."""
     if duration <= MIN_SCENE_SECONDS:
         return [{"scene_id": 0, "start": 0.0, "end": max(duration - 0.05, 0.5)}]
-    cmd = [
-        "ffmpeg", "-hide_banner", "-i", str(source),
-        "-vf", f"select='gt(scene,{SCENE_CHANGE_THRESHOLD})',showinfo",
-        "-an", "-f", "null", "-",
-    ]
+
+    boundaries: List[float] = []
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90, check=False)
-        boundaries = [
-            float(value)
-            for value in re.findall(r"pts_time:([0-9]+(?:\.[0-9]+)?)", result.stderr or "")
-        ]
+        from visual_search import detect_adaptive_scene_cuts
+
+        boundaries = detect_adaptive_scene_cuts(
+            source,
+            duration,
+            min_scene_seconds=MIN_SCENE_SECONDS,
+        )
     except Exception:
         boundaries = []
+
+    if not boundaries:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-i", str(source),
+            "-vf", f"select='gt(scene,{SCENE_CHANGE_THRESHOLD})',showinfo",
+            "-an", "-f", "null", "-",
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=90, check=False)
+            boundaries = [
+                float(value)
+                for value in re.findall(r"pts_time:([0-9]+(?:\.[0-9]+)?)", result.stderr or "")
+            ]
+        except Exception:
+            boundaries = []
 
     usable_end = max(duration - 0.05, 0.5)
     clean = []
@@ -422,8 +436,13 @@ def _candidate_windows(source: Dict[str, Any], window_seconds: float, stride: fl
     return windows
 
 
-def _sample_motion_frames(source: Path, start: float, end: float, count: int) -> List[Tuple[float, Any]]:
-    """Decode evenly spaced frames for temporal analysis without writing intermediates."""
+def _sample_window_frames_bgr(
+    source: Path,
+    start: float,
+    end: float,
+    count: int,
+) -> List[Tuple[float, Any, Any]]:
+    """Decode evenly spaced (timestamp, bgr, gray) frames in a single OpenCV pass."""
     try:
         import cv2
     except ImportError as exc:
@@ -432,7 +451,7 @@ def _sample_motion_frames(source: Path, start: float, end: float, count: int) ->
     capture = cv2.VideoCapture(str(source))
     if not capture.isOpened():
         raise LocalAssetError(f"无法为动态分析打开视频：{source.name}")
-    frames: List[Tuple[float, Any]] = []
+    frames: List[Tuple[float, Any, Any]] = []
     try:
         duration = max(end - start, 0.2)
         for index in range(max(3, count)):
@@ -445,7 +464,7 @@ def _sample_motion_frames(source: Path, start: float, end: float, count: int) ->
             scale = min(1.0, 320.0 / max(width, 1))
             if scale < 1.0:
                 frame = cv2.resize(frame, (int(width * scale), int(height * scale)))
-            frames.append((round(timestamp, 3), cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)))
+            frames.append((round(timestamp, 3), frame, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)))
     finally:
         capture.release()
     if len(frames) < 3:
@@ -453,7 +472,17 @@ def _sample_motion_frames(source: Path, start: float, end: float, count: int) ->
     return frames
 
 
-def _analyze_window_motion(source: Path, start: float, end: float) -> Dict[str, Any]:
+def _sample_motion_frames(source: Path, start: float, end: float, count: int) -> List[Tuple[float, Any]]:
+    """Decode evenly spaced frames for temporal analysis without writing intermediates."""
+    return [(ts, gray) for ts, _bgr, gray in _sample_window_frames_bgr(source, start, end, count)]
+
+
+def _analyze_window_motion(
+    source: Path,
+    start: float,
+    end: float,
+    predecoded_frames: Optional[List[Tuple[float, Any]]] = None,
+) -> Dict[str, Any]:
     """Separate global camera motion from residual foreground/subject motion."""
     try:
         import cv2
@@ -461,7 +490,11 @@ def _analyze_window_motion(source: Path, start: float, end: float) -> Dict[str, 
     except ImportError as exc:
         raise LocalAssetError("动态视频理解需要现有 OpenCV/NumPy 运行时，当前环境不可用") from exc
 
-    frames = _sample_motion_frames(source, start, end, MOTION_SAMPLE_FRAMES)
+    frames = (
+        predecoded_frames
+        if predecoded_frames is not None
+        else _sample_motion_frames(source, start, end, MOTION_SAMPLE_FRAMES)
+    )
     samples = []
     camera_vectors = []
     residual_ratios = []
@@ -573,7 +606,12 @@ def _analyze_window_motion(source: Path, start: float, end: float) -> Dict[str, 
     }
 
 
-def _analyze_window_frame_quality(source: Path, start: float, end: float) -> Dict[str, Any]:
+def _analyze_window_frame_quality(
+    source: Path,
+    start: float,
+    end: float,
+    predecoded_frames: Optional[List[Tuple[float, Any]]] = None,
+) -> Dict[str, Any]:
     """Measure whether sampled frames are clear and exposed enough for factual VLM reading."""
     try:
         import cv2
@@ -581,7 +619,11 @@ def _analyze_window_frame_quality(source: Path, start: float, end: float) -> Dic
     except ImportError as exc:
         raise LocalAssetError("静态视频理解质量分析需要现有 OpenCV/NumPy 运行时") from exc
 
-    frames = _sample_motion_frames(source, start, end, MOTION_SAMPLE_FRAMES)
+    frames = (
+        predecoded_frames
+        if predecoded_frames is not None
+        else _sample_motion_frames(source, start, end, MOTION_SAMPLE_FRAMES)
+    )
     samples = []
     for timestamp, gray in frames:
         brightness = float(np.mean(gray))
@@ -2718,110 +2760,195 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
             flush=True,
         )
 
-    for plan_position, (source, win_idx, win) in enumerate(window_plan, start=1):
-            path = Path(source["path"])
-            source_id = str(source["source_id"])
-            window_id = f"{source_id}_{win_idx:04d}"
-            if window_id in completed_window_ids:
-                print(
-                    f"   [{plan_position}/{total_windows}] {path.name} "
-                    f"{win['start']:.1f}-{win['end']:.1f}s：断点缓存命中",
-                    flush=True,
-                )
-                continue
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import inspect
+    import threading
+
+    draft_lock = threading.Lock()
+    index_workers = max(1, min(6, int(os.getenv("LOCAL_ASSET_INDEX_WORKERS", "4"))))
+
+    def _call_motion(src_path: Path, s: float, e: float, pre_gray):
+        try:
+            sig = inspect.signature(_analyze_window_motion)
+            if "predecoded_frames" in sig.parameters:
+                return _analyze_window_motion(src_path, s, e, predecoded_frames=pre_gray)
+        except Exception:
+            pass
+        return _analyze_window_motion(src_path, s, e)
+
+    def _call_quality(src_path: Path, s: float, e: float, pre_gray):
+        try:
+            sig = inspect.signature(_analyze_window_frame_quality)
+            if "predecoded_frames" in sig.parameters:
+                return _analyze_window_frame_quality(src_path, s, e, predecoded_frames=pre_gray)
+        except Exception:
+            pass
+        return _analyze_window_frame_quality(src_path, s, e)
+
+    def _process_window(plan_position: int, source: Dict[str, Any], win_idx: int, win: Dict[str, Any]) -> Optional[Tuple[int, Dict[str, Any]]]:
+        path = Path(source["path"])
+        source_id = str(source["source_id"])
+        window_id = f"{source_id}_{win_idx:04d}"
+        if window_id in completed_window_ids:
             print(
                 f"   [{plan_position}/{total_windows}] {path.name} "
-                f"{win['start']:.1f}-{win['end']:.1f}s：动态/静态分析与帧证据",
+                f"{win['start']:.1f}-{win['end']:.1f}s：断点缓存命中",
                 flush=True,
             )
-            sheet_path = sheets_dir / f"{window_id}.jpg"
-            metadata = {
-                "source_video": path.name,
-                "start": win["start"],
-                "end": win["end"],
-                "duration": round(win["end"] - win["start"], 3),
-                "frame_count": max(4, LOCAL_ASSET_CONTACT_SHEET_FRAMES),
-            }
-            audio_context = audio_context_for_window(
-                source.get("audio_understanding") or {},
-                float(win["start"]),
-                float(win["end"]),
+            return None
+        print(
+            f"   [{plan_position}/{total_windows}] {path.name} "
+            f"{win['start']:.1f}-{win['end']:.1f}s：动态/静态分析与帧证据",
+            flush=True,
+        )
+        sheet_path = sheets_dir / f"{window_id}.jpg"
+        metadata = {
+            "source_video": path.name,
+            "start": win["start"],
+            "end": win["end"],
+            "duration": round(win["end"] - win["start"], 3),
+            "frame_count": max(4, LOCAL_ASSET_CONTACT_SHEET_FRAMES),
+        }
+        audio_context = audio_context_for_window(
+            source.get("audio_understanding") or {},
+            float(win["start"]),
+            float(win["end"]),
+        )
+        metadata["audio_context"] = audio_context
+
+        # Single-pass OpenCV frame decode reused for motion, quality, and visual descriptor
+        pre_bgr_frames = None
+        pre_gray_frames = None
+        visual_descriptor: List[float] = []
+        try:
+            sampled_bgr = _sample_window_frames_bgr(path, win["start"], win["end"], MOTION_SAMPLE_FRAMES)
+            pre_bgr_frames = [bgr for _ts, bgr, _gray in sampled_bgr]
+            pre_gray_frames = [(ts, gray) for ts, _bgr, gray in sampled_bgr]
+            from visual_search import compute_visual_descriptor_from_frames
+
+            visual_descriptor = compute_visual_descriptor_from_frames(pre_bgr_frames)
+        except Exception:
+            pre_gray_frames = None
+            visual_descriptor = []
+
+        motion = _call_motion(path, win["start"], win["end"], pre_gray_frames)
+        frame_quality = _call_quality(path, win["start"], win["end"], pre_gray_frames)
+        motion_peaks = sorted(
+            motion.get("active_ranges") or [],
+            key=lambda item: float(item.get("strength") or 0.0),
+            reverse=True,
+        )[:4]
+        preferred_times = []
+        for active_range in motion_peaks:
+            range_start = float(active_range["start"])
+            range_end = float(active_range["end"])
+            preferred_times.extend([range_start, (range_start + range_end) / 2.0, range_end])
+        frame_evidence = build_contact_sheet_evidence(
+            source=path,
+            start=win["start"],
+            end=win["end"],
+            output=sheet_path,
+            frame_count=max(4, LOCAL_ASSET_CONTACT_SHEET_FRAMES),
+            preferred_times=preferred_times,
+        )
+        selected_frame_records = [
+            candidate
+            for candidate in frame_evidence["candidates"]
+            if candidate["kept"]
+        ]
+        reason_counts: Dict[str, int] = {}
+        for candidate in selected_frame_records:
+            reason = str(candidate["selection_reason"])
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        metadata["frame_count"] = int(frame_evidence["kept_count"])
+        metadata["frame_evidence"] = {
+            "schema_version": FRAME_EVIDENCE_VERSION,
+            "candidate_count": frame_evidence["candidate_count"],
+            "kept_count": frame_evidence["kept_count"],
+            "selected_timestamps": [
+                candidate["timestamp"] for candidate in selected_frame_records
+            ],
+            "selection_reasons": reason_counts,
+        }
+        metadata["motion"] = {
+            key: value for key, value in motion.items() if key != "samples"
+        }
+        metadata["frame_quality"] = {
+            key: value for key, value in frame_quality.items() if key != "samples"
+        }
+        analysis = reusable_analyses.get(window_id)
+        if analysis is None:
+            print("      素材语义：请求视觉模型", flush=True)
+            analysis = analyzer.analyze_window(sheet_path, metadata)
+        else:
+            print("      素材语义：复用同源窗口的已验证理解", flush=True)
+        consistency = _motion_consistency(analysis, motion)
+        if not consistency["passed"] or not frame_quality["passed"]:
+            analysis["usable_for_ad"] = False
+            analysis["confidence"] = min(float(analysis.get("confidence") or 0.0), 0.5)
+        record = {
+            "window_id": window_id,
+            "source_id": source_id,
+            "scene_id": win.get("scene_id", 0),
+            "source_path": str(path),
+            "source_video": path.name,
+            "start": win["start"],
+            "end": win["end"],
+            "duration": round(win["end"] - win["start"], 3),
+            "contact_sheet": str(sheet_path),
+            "analysis": analysis,
+            "motion": motion,
+            "frame_quality": frame_quality,
+            "frame_evidence": frame_evidence,
+            "motion_consistency": consistency,
+            "audio_context": audio_context,
+            "visual_descriptor": visual_descriptor,
+        }
+        return plan_position, record
+
+    pending_tasks = [
+        (plan_position, source, win_idx, win)
+        for plan_position, (source, win_idx, win) in enumerate(window_plan, start=1)
+        if f"{source['source_id']}_{win_idx:04d}" not in completed_window_ids
+    ]
+    for plan_position, (source, win_idx, win) in enumerate(window_plan, start=1):
+        wid = f"{source['source_id']}_{win_idx:04d}"
+        if wid in completed_window_ids:
+            print(
+                f"   [{plan_position}/{total_windows}] {Path(source['path']).name} "
+                f"{win['start']:.1f}-{win['end']:.1f}s：断点缓存命中",
+                flush=True,
             )
-            metadata["audio_context"] = audio_context
-            motion = _analyze_window_motion(path, win["start"], win["end"])
-            frame_quality = _analyze_window_frame_quality(path, win["start"], win["end"])
-            motion_peaks = sorted(
-                motion.get("active_ranges") or [],
-                key=lambda item: float(item.get("strength") or 0.0),
-                reverse=True,
-            )[:4]
-            preferred_times = []
-            for active_range in motion_peaks:
-                range_start = float(active_range["start"])
-                range_end = float(active_range["end"])
-                preferred_times.extend([range_start, (range_start + range_end) / 2.0, range_end])
-            frame_evidence = build_contact_sheet_evidence(
-                source=path,
-                start=win["start"],
-                end=win["end"],
-                output=sheet_path,
-                frame_count=max(4, LOCAL_ASSET_CONTACT_SHEET_FRAMES),
-                preferred_times=preferred_times,
-            )
-            selected_frame_records = [
-                candidate
-                for candidate in frame_evidence["candidates"]
-                if candidate["kept"]
-            ]
-            reason_counts: Dict[str, int] = {}
-            for candidate in selected_frame_records:
-                reason = str(candidate["selection_reason"])
-                reason_counts[reason] = reason_counts.get(reason, 0) + 1
-            metadata["frame_count"] = int(frame_evidence["kept_count"])
-            metadata["frame_evidence"] = {
-                "schema_version": FRAME_EVIDENCE_VERSION,
-                "candidate_count": frame_evidence["candidate_count"],
-                "kept_count": frame_evidence["kept_count"],
-                "selected_timestamps": [
-                    candidate["timestamp"] for candidate in selected_frame_records
-                ],
-                "selection_reasons": reason_counts,
-            }
-            metadata["motion"] = {
-                key: value for key, value in motion.items() if key != "samples"
-            }
-            metadata["frame_quality"] = {
-                key: value for key, value in frame_quality.items() if key != "samples"
-            }
-            analysis = reusable_analyses.get(window_id)
-            if analysis is None:
-                print("      素材语义：请求视觉模型", flush=True)
-                analysis = analyzer.analyze_window(sheet_path, metadata)
-            else:
-                print("      素材语义：复用同源窗口的已验证理解", flush=True)
-            consistency = _motion_consistency(analysis, motion)
-            if not consistency["passed"] or not frame_quality["passed"]:
-                analysis["usable_for_ad"] = False
-                analysis["confidence"] = min(float(analysis.get("confidence") or 0.0), 0.5)
-            windows.append({
-                "window_id": window_id,
-                "source_id": source_id,
-                "scene_id": win.get("scene_id", 0),
-                "source_path": str(path),
-                "source_video": path.name,
-                "start": win["start"],
-                "end": win["end"],
-                "duration": round(win["end"] - win["start"], 3),
-                "contact_sheet": str(sheet_path),
-                "analysis": analysis,
-                "motion": motion,
-                "frame_quality": frame_quality,
-                "frame_evidence": frame_evidence,
-                "motion_consistency": consistency,
-                "audio_context": audio_context,
-            })
-            completed_window_ids.add(window_id)
-            _write_draft()
+
+    new_records: List[Tuple[int, Dict[str, Any]]] = []
+    if index_workers <= 1 or len(pending_tasks) <= 1:
+        for task in pending_tasks:
+            res = _process_window(*task)
+            if res is not None:
+                pos, rec = res
+                new_records.append((pos, rec))
+                windows.append(rec)
+                completed_window_ids.add(rec["window_id"])
+                _write_draft()
+    else:
+        with ThreadPoolExecutor(max_workers=min(index_workers, len(pending_tasks))) as pool:
+            futures = {pool.submit(_process_window, *task): task[0] for task in pending_tasks}
+            for future in as_completed(futures):
+                res = future.result()
+                if res is not None:
+                    pos, rec = res
+                    with draft_lock:
+                        new_records.append((pos, rec))
+                        windows.append(rec)
+                        completed_window_ids.add(rec["window_id"])
+                        _write_draft()
+
+    # Keep deterministic window ordering matching window_plan
+    order_map = {
+        f"{source['source_id']}_{win_idx:04d}": idx
+        for idx, (source, win_idx, _win) in enumerate(window_plan)
+    }
+    windows.sort(key=lambda item: order_map.get(str(item.get("window_id") or ""), 999999))
 
     coverage = _coverage_from_windows(windows)
     write_frame_evidence_artifacts(
@@ -5685,26 +5812,39 @@ def _write_gap_report(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def _materialize_clip(source: Path, start: float, end: float, output: Path) -> Path:
+    from render_backend import video_encode_args
+    from smart_reframe import build_smart_reframe_vf
+
     output.parent.mkdir(parents=True, exist_ok=True)
     duration = max(end - start, 0.5)
-    width, height = OUTPUT_RESOLUTION.split("x")
-    vf = (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
+    width_str, height_str = OUTPUT_RESOLUTION.split("x")
+    reframe = build_smart_reframe_vf(
+        source,
+        start,
+        end,
+        int(width_str),
+        int(height_str),
     )
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", f"{start:.3f}",
-        "-i", str(source),
-        "-t", f"{duration:.3f}",
-        "-vf", vf,
-        "-r", str(OUTPUT_FPS),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-an",
-        "-movflags", "+faststart",
-        str(output),
-    ]
-    _run(cmd, timeout=180)
+    vf = reframe["vf"]
+
+    def _build_cmd(allow_hw: bool) -> List[str]:
+        return [
+            "ffmpeg", "-y",
+            "-ss", f"{start:.3f}",
+            "-i", str(source),
+            "-t", f"{duration:.3f}",
+            "-vf", vf,
+            *video_encode_args(profile="intermediate", allow_hw=allow_hw, fps=OUTPUT_FPS),
+            "-an",
+            "-movflags", "+faststart",
+            str(output),
+        ]
+
+    try:
+        _run(_build_cmd(allow_hw=True), timeout=180)
+    except Exception:
+        _run(_build_cmd(allow_hw=False), timeout=180)
+
     if not output.exists() or output.stat().st_size < 1000:
         raise LocalAssetError(f"本地素材裁剪失败：{output}")
     return output

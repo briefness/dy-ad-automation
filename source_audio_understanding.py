@@ -30,6 +30,8 @@ class AudioUnderstandingConfig:
 
     @property
     def available(self) -> bool:
+        if self.provider.strip().lower() in {"local", "faster_whisper", "mlx_whisper"}:
+            return True
         return bool(self.base_url and self.api_key and self.model)
 
 
@@ -117,12 +119,23 @@ def _normalize_segments(raw: Dict[str, Any], duration: float) -> List[Dict[str, 
         end = max(start, min(duration, float(value.get("end") or start)))
         if not text or end <= start or no_speech_probability > MAX_NO_SPEECH_PROBABILITY:
             continue
-        segments.append({
+        seg_item: Dict[str, Any] = {
             "start": round(start, 3),
             "end": round(end, 3),
             "text": text,
             "confidence": round(1.0 - no_speech_probability, 3),
-        })
+        }
+        if isinstance(value.get("words"), list) and value["words"]:
+            seg_item["words"] = [
+                {
+                    "word": str(w.get("word") or "").strip(),
+                    "start": round(max(0.0, min(duration, float(w.get("start") or start))), 3),
+                    "end": round(max(0.0, min(duration, float(w.get("end") or end))), 3),
+                }
+                for w in value["words"]
+                if isinstance(w, dict) and str(w.get("word") or "").strip()
+            ]
+        segments.append(seg_item)
     return segments
 
 
@@ -236,6 +249,14 @@ def _transcribe_audio(
         return _transcribe_openai_compatible(audio_path, settings)
     if provider == "volcengine":
         return _transcribe_volcengine_turbo(audio_path, settings)
+    if provider in {"local", "faster_whisper", "mlx_whisper"}:
+        from audio_alignment import transcribe_local_whisper
+
+        return transcribe_local_whisper(
+            audio_path,
+            language=settings.language,
+            model_name=settings.model or "small",
+        )
     raise ValueError(f"不支持的 ASR_PROVIDER：{settings.provider}")
 
 

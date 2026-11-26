@@ -129,12 +129,116 @@ function renderProgress(status) {
   if (running) setWorkbenchState(isPreflight ? "preflight" : "running", isPreflight ? "正在预检素材能力" : "正在混剪，随时可以取消任务");
 }
 
+let currentPlanData = null;
+
 function renderResult(result) {
   if (!result?.final_path) return;
   const videoUrl = result.video_url || "";
-  const links = (result.artifacts || []).map((artifact) => `<a class="artifact" href="${artifact.url}" target="_blank" rel="noreferrer" title="${escapeHtml(artifact.name)}">${escapeHtml(artifact.label || artifact.name)}</a>`).join("");
-  $("results").innerHTML = `<div class="result-card">${videoUrl ? `<video class="result-video" controls preload="metadata" src="${videoUrl}"></video>` : ""}<div class="result-details"><strong>最终成片</strong><p class="field-hint">${escapeHtml(result.final_path)}</p><div class="artifact-list">${links}</div></div></div>`;
+  const artifacts = result.artifacts || [];
+  const links = artifacts.map((artifact) => `<a class="artifact" href="${artifact.url}" target="_blank" rel="noreferrer" title="${escapeHtml(artifact.name)}">${escapeHtml(artifact.label || artifact.name)}</a>`).join("");
+  const planArtifact = artifacts.find((item) => item.name.endsWith("_production_plan.json"));
+  const editorMarkup = planArtifact
+    ? `<section class="timeline-editor" id="timeline-editor" data-plan-path="${escapeHtml(planArtifact.path)}">
+         <div class="timeline-editor-header">
+           <div><div class="section-kicker">局部微调 · Human-in-the-Loop</div><h3>时间线编辑器（跳过 AI，仅重渲染）</h3></div>
+           <div class="timeline-editor-actions">
+             <select id="reframe-mode" aria-label="智能构图模式"><option value="auto">智能构图（推荐）</option><option value="crop">强制主体裁切</option><option value="pad">保留黑边</option></select>
+             <button id="export-nle-btn" class="button secondary" type="button">导出剪映 / OTIO / FCPXML</button>
+             <button id="rerender-plan-btn" class="button primary" type="button">仅重渲染成片</button>
+           </div>
+         </div>
+         <div id="timeline-editor-body" class="timeline-editor-body"><span class="empty-copy">正在加载成片计划…</span></div>
+       </section>`
+    : "";
+  $("results").innerHTML = `<div class="result-card">${videoUrl ? `<video class="result-video" controls preload="metadata" src="${videoUrl}"></video>` : ""}<div class="result-details"><strong>最终成片</strong><p class="field-hint">${escapeHtml(result.final_path)}</p><div class="artifact-list">${links}</div></div></div>${editorMarkup}`;
+  if (planArtifact) loadPlanEditor(planArtifact.path);
   setWorkbenchState("result");
+}
+
+async function loadPlanEditor(planPath) {
+  const body = $("timeline-editor-body");
+  if (!body) return;
+  try {
+    const data = await api(`/api/plan?path=${encodeURIComponent(planPath)}`);
+    currentPlanData = data;
+    const segments = data.plan?.segments || [];
+    const candidates = data.candidates || {};
+    const stickers = data.plan?.stickers?.items || [];
+    const shotRows = segments.map((seg) => {
+      const idx = Number(seg.edit_index ?? 0);
+      const alts = candidates[String(idx)] || candidates[idx] || [];
+      const altOptions = alts.map((cand, cIdx) => `<option value="${cIdx}">${escapeHtml(cand.source_video)} (${cand.start}s-${cand.end}s · ${escapeHtml(cand.role)})</option>`).join("");
+      return `<div class="shot-row" data-edit-index="${idx}">
+        <div class="shot-row-head"><strong>镜头 ${idx + 1}</strong><span class="field-note">${escapeHtml(seg.selected_role || "unknown")} · ${escapeHtml(seg.source_video || "")}</span></div>
+        <label>字幕文案<input type="text" class="shot-subtitle" value="${escapeHtml(seg.script_subtitle || "")}"></label>
+        <div class="shot-trim-grid">
+          <label>起点 (s)<input type="number" step="0.1" min="0" class="shot-start" value="${Number(seg.source_start || 0).toFixed(2)}"></label>
+          <label>终点 (s)<input type="number" step="0.1" min="0.1" class="shot-end" value="${Number(seg.source_end || 0).toFixed(2)}"></label>
+          ${altOptions ? `<label>替换为备选镜头<select class="shot-alt"><option value="">保持当前镜头</option>${altOptions}</select></label>` : ""}
+        </div>
+      </div>`;
+    }).join("");
+    const stickerRows = stickers.length
+      ? `<div class="sticker-toggles"><strong>语义贴图开关</strong><div class="sticker-toggle-list">${stickers.map((item, idx) => `<label class="sticker-chip"><input type="checkbox" class="sticker-keep" data-sticker-index="${idx}" checked><span>${escapeHtml(item.text || "")}</span></label>`).join("")}</div></div>`
+      : "";
+    body.innerHTML = `<div class="shot-list">${shotRows}</div>${stickerRows}`;
+
+    body.querySelectorAll(".shot-alt").forEach((select) => {
+      select.addEventListener("change", (ev) => {
+        const row = ev.target.closest(".shot-row");
+        const eidx = row.dataset.editIndex;
+        const cIdx = ev.target.value;
+        if (cIdx === "") return;
+        const cand = (candidates[String(eidx)] || candidates[Number(eidx)] || [])[Number(cIdx)];
+        if (!cand) return;
+        row.dataset.swapSource = cand.source_path || cand.source_video;
+        row.querySelector(".shot-start").value = Number(cand.start || 0).toFixed(2);
+        row.querySelector(".shot-end").value = Number(cand.end || 0).toFixed(2);
+      });
+    });
+
+    $("export-nle-btn")?.addEventListener("click", async () => {
+      try {
+        $("dock-status").textContent = "正在导出剪映草稿 / OTIO / FCPXML…";
+        const res = await api("/api/plan/export", { plan_path: planPath });
+        const count = Object.keys(res.exports || {}).length;
+        $("dock-status").textContent = `已导出 ${count} 份可编辑工程文件（可在版本列表下载）`;
+        await history();
+      } catch (err) {
+        $("dock-status").textContent = err.message;
+      }
+    });
+
+    $("rerender-plan-btn")?.addEventListener("click", async () => {
+      try {
+        const segPatches = [...body.querySelectorAll(".shot-row")].map((row) => {
+          const patch = {
+            edit_index: Number(row.dataset.editIndex),
+            script_subtitle: row.querySelector(".shot-subtitle").value,
+            source_start: Number(row.querySelector(".shot-start").value),
+            source_end: Number(row.querySelector(".shot-end").value),
+          };
+          if (row.dataset.swapSource) patch.source_video = row.dataset.swapSource;
+          return patch;
+        });
+        const disabledStickers = [...body.querySelectorAll(".sticker-keep")]
+          .filter((cb) => !cb.checked)
+          .map((cb) => Number(cb.dataset.stickerIndex));
+        const status = await api("/api/plan/rerender", {
+          plan_path: planPath,
+          reframe_mode: $("reframe-mode")?.value || "auto",
+          edits: { segments: segPatches, disabled_sticker_indices: disabledStickers },
+        });
+        activeJob = status.id;
+        setWorkbenchState("running", "正在按微调时间线快速重渲染…");
+        await poll();
+      } catch (err) {
+        $("dock-status").textContent = err.message;
+      }
+    });
+  } catch (error) {
+    body.innerHTML = `<span class="empty-copy">加载时间线计划失败：${escapeHtml(error.message)}</span>`;
+  }
 }
 
 function formatDate(value) { return value ? new Date(value * 1000).toLocaleString("zh-CN", { dateStyle: "short", timeStyle: "short" }) : ""; }
@@ -150,7 +254,7 @@ async function poll() {
     activeJob = status.active ? status.id : activeJob;
     renderProgress(status);
     if (status.kind === "preflight" && status.stage === "completed" && status.result) renderPreflight(status.result);
-    if (status.kind === "run" && status.stage === "completed" && status.id !== completedRunId) {
+    if ((status.kind === "run" || status.kind === "rerender") && status.stage === "completed" && status.id !== completedRunId) {
       completedRunId = status.id;
       renderResult(status.result);
       await history();
