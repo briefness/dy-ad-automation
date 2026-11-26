@@ -30,7 +30,7 @@ function setWorkbenchState(state, status) {
     idle: ["准备素材", "等待一次素材预检", "填写项目简报后预检素材"],
     preflight: ["素材能力", "这批素材可以怎样讲", "预检完成，检查推荐后开始混剪"],
     running: ["正在制作", "成片正在生成", "正在混剪，随时可以取消任务"],
-    result: ["成片交付", "当前成片已就绪", "成片已完成，可查看版本或打开输出目录"],
+    result: ["成片交付", "当前成片已就绪", "成片已完成，可审阅并记录真实反馈"],
   }[state];
   if (!content) return;
   $("stage-kicker").textContent = content[0];
@@ -57,6 +57,35 @@ function renderEnvironment(data) {
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character]));
+}
+
+function focusField(fieldId) {
+  const el = $(fieldId);
+  if (!el) return;
+  const details = el.closest("details");
+  if (details) details.open = true;
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.focus({ preventScroll: true });
+}
+
+function renderErrorBox(targetEl, errorText, diagnostics) {
+  if (!errorText) {
+    targetEl.hidden = true;
+    targetEl.innerHTML = "";
+    return;
+  }
+  targetEl.hidden = false;
+  if (!diagnostics || !diagnostics.summary) {
+    targetEl.textContent = `任务未完成\n${errorText}`;
+    return;
+  }
+  const actionsHtml = (diagnostics.actions || []).map((act) => (
+    `<div class="diag-action"><button type="button" class="diag-jump" data-field="${escapeHtml(act.field || "")}">${escapeHtml(act.label || "去调整")}</button><span>${escapeHtml(act.hint || "")}</span></div>`
+  )).join("");
+  targetEl.innerHTML = `<div class="diag-title">已按证据/质量红线阻断输出</div><p class="diag-summary">${escapeHtml(diagnostics.summary)}</p>${actionsHtml ? `<div class="diag-actions">${actionsHtml}</div>` : ""}<details class="diag-raw"><summary>原始阻断信息</summary><pre>${escapeHtml(errorText)}</pre></details>`;
+  targetEl.querySelectorAll(".diag-jump").forEach((btn) => {
+    btn.addEventListener("click", () => focusField(btn.dataset.field));
+  });
 }
 
 function renderList(target, values, className, emptyCopy) {
@@ -121,124 +150,86 @@ function renderProgress(status) {
   }
   const defaultLog = isPreflight && status.stage === "completed" ? "预检完成" : isPreflight ? "等待预检" : "等待混剪";
   logs.textContent = (status.logs || []).map((entry) => entry.line).join("\n") || defaultLog;
-  errorBox.hidden = !status.error;
-  errorBox.textContent = status.error ? `任务未完成\n${status.error}` : "";
+  renderErrorBox(errorBox, status.error, status.diagnostics);
   const running = Boolean(status.active);
   $("cancel").disabled = !running;
   $("run").disabled = running || !preflightReady;
   if (running) setWorkbenchState(isPreflight ? "preflight" : "running", isPreflight ? "正在预检素材能力" : "正在混剪，随时可以取消任务");
 }
 
-let currentPlanData = null;
+function renderRuleChips(rules, targetKind) {
+  if (!rules || !rules.length) return '<span class="empty-copy">冷启动为空：仅由你在不同成片上的明确反馈逐步积累。</span>';
+  return rules.map((rule) => {
+    const isActive = rule.status === "active";
+    const badge = isActive ? "已生效" : `试用 ${rule.distinct_video_count}/2`;
+    return `<button type="button" class="rule-pill ${isActive ? "active" : "provisional"}" data-target="${escapeHtml(targetKind)}" data-rule="${escapeHtml(rule.text)}"><span>${escapeHtml(rule.text)}</span><small>${badge}</small></button>`;
+  }).join("");
+}
+
+async function refreshFeedbackPolicy() {
+  const container = $("feedback-policy-list");
+  if (!container) return;
+  try {
+    const category = encodeURIComponent($("type")?.value?.trim() || "");
+    const style = encodeURIComponent($("video_style")?.value || "");
+    const policy = await api(`/api/feedback/policy?category=${category}&style=${style}`);
+    container.innerHTML = `<div class="policy-group"><span class="field-note">脚本规则</span><div class="rule-pill-list">${renderRuleChips(policy.script_rules, "script")}</div></div><div class="policy-group"><span class="field-note">贴图规则</span><div class="rule-pill-list">${renderRuleChips(policy.sticker_rules, "sticker")}</div></div>`;
+    container.querySelectorAll(".rule-pill").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        if ($("fb-target")) $("fb-target").value = btn.dataset.target || "script";
+        if ($("fb-rule")) $("fb-rule").value = btn.dataset.rule || "";
+        toggleStickerPicker();
+      });
+    });
+  } catch (err) {
+    container.innerHTML = `<span class="empty-copy">规则读取失败：${escapeHtml(err.message)}</span>`;
+  }
+}
+
+function toggleStickerPicker() {
+  const wrap = $("fb-sticker-wrap");
+  if (!wrap || !$("fb-target")) return;
+  wrap.hidden = $("fb-target").value !== "sticker";
+}
 
 function renderResult(result) {
   if (!result?.final_path) return;
   const videoUrl = result.video_url || "";
-  const artifacts = result.artifacts || [];
-  const links = artifacts.map((artifact) => `<a class="artifact" href="${artifact.url}" target="_blank" rel="noreferrer" title="${escapeHtml(artifact.name)}">${escapeHtml(artifact.label || artifact.name)}</a>`).join("");
-  const planArtifact = artifacts.find((item) => item.name.endsWith("_production_plan.json"));
-  const editorMarkup = planArtifact
-    ? `<section class="timeline-editor" id="timeline-editor" data-plan-path="${escapeHtml(planArtifact.path)}">
-         <div class="timeline-editor-header">
-           <div><div class="section-kicker">局部微调 · Human-in-the-Loop</div><h3>时间线编辑器（跳过 AI，仅重渲染）</h3></div>
-           <div class="timeline-editor-actions">
-             <select id="reframe-mode" aria-label="智能构图模式"><option value="auto">智能构图（推荐）</option><option value="crop">强制主体裁切</option><option value="pad">保留黑边</option></select>
-             <button id="export-nle-btn" class="button secondary" type="button">导出剪映 / OTIO / FCPXML</button>
-             <button id="rerender-plan-btn" class="button primary" type="button">仅重渲染成片</button>
-           </div>
-         </div>
-         <div id="timeline-editor-body" class="timeline-editor-body"><span class="empty-copy">正在加载成片计划…</span></div>
-       </section>`
-    : "";
-  $("results").innerHTML = `<div class="result-card">${videoUrl ? `<video class="result-video" controls preload="metadata" src="${videoUrl}"></video>` : ""}<div class="result-details"><strong>最终成片</strong><p class="field-hint">${escapeHtml(result.final_path)}</p><div class="artifact-list">${links}</div></div></div>${editorMarkup}`;
-  if (planArtifact) loadPlanEditor(planArtifact.path);
-  setWorkbenchState("result");
-}
-
-async function loadPlanEditor(planPath) {
-  const body = $("timeline-editor-body");
-  if (!body) return;
-  try {
-    const data = await api(`/api/plan?path=${encodeURIComponent(planPath)}`);
-    currentPlanData = data;
-    const segments = data.plan?.segments || [];
-    const candidates = data.candidates || {};
-    const stickers = data.plan?.stickers?.items || [];
-    const shotRows = segments.map((seg) => {
-      const idx = Number(seg.edit_index ?? 0);
-      const alts = candidates[String(idx)] || candidates[idx] || [];
-      const altOptions = alts.map((cand, cIdx) => `<option value="${cIdx}">${escapeHtml(cand.source_video)} (${cand.start}s-${cand.end}s · ${escapeHtml(cand.role)})</option>`).join("");
-      return `<div class="shot-row" data-edit-index="${idx}">
-        <div class="shot-row-head"><strong>镜头 ${idx + 1}</strong><span class="field-note">${escapeHtml(seg.selected_role || "unknown")} · ${escapeHtml(seg.source_video || "")}</span></div>
-        <label>字幕文案<input type="text" class="shot-subtitle" value="${escapeHtml(seg.script_subtitle || "")}"></label>
-        <div class="shot-trim-grid">
-          <label>起点 (s)<input type="number" step="0.1" min="0" class="shot-start" value="${Number(seg.source_start || 0).toFixed(2)}"></label>
-          <label>终点 (s)<input type="number" step="0.1" min="0.1" class="shot-end" value="${Number(seg.source_end || 0).toFixed(2)}"></label>
-          ${altOptions ? `<label>替换为备选镜头<select class="shot-alt"><option value="">保持当前镜头</option>${altOptions}</select></label>` : ""}
-        </div>
-      </div>`;
-    }).join("");
-    const stickerRows = stickers.length
-      ? `<div class="sticker-toggles"><strong>语义贴图开关</strong><div class="sticker-toggle-list">${stickers.map((item, idx) => `<label class="sticker-chip"><input type="checkbox" class="sticker-keep" data-sticker-index="${idx}" checked><span>${escapeHtml(item.text || "")}</span></label>`).join("")}</div></div>`
-      : "";
-    body.innerHTML = `<div class="shot-list">${shotRows}</div>${stickerRows}`;
-
-    body.querySelectorAll(".shot-alt").forEach((select) => {
-      select.addEventListener("change", (ev) => {
-        const row = ev.target.closest(".shot-row");
-        const eidx = row.dataset.editIndex;
-        const cIdx = ev.target.value;
-        if (cIdx === "") return;
-        const cand = (candidates[String(eidx)] || candidates[Number(eidx)] || [])[Number(cIdx)];
-        if (!cand) return;
-        row.dataset.swapSource = cand.source_path || cand.source_video;
-        row.querySelector(".shot-start").value = Number(cand.start || 0).toFixed(2);
-        row.querySelector(".shot-end").value = Number(cand.end || 0).toFixed(2);
-      });
-    });
-
-    $("export-nle-btn")?.addEventListener("click", async () => {
+  const videoRel = result.video_relative_path || "";
+  const stickers = result.stickers || [];
+  const links = (result.artifacts || []).map((artifact) => `<a class="artifact" href="${artifact.url}" target="_blank" rel="noreferrer" title="${escapeHtml(artifact.name)}">${escapeHtml(artifact.label || artifact.name)}</a>`).join("");
+  const stickerOptions = stickers.length
+    ? stickers.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.text)}（${escapeHtml(item.kind || "sticker")}）</option>`).join("")
+    : '<option value="">本次成片无渲染贴图</option>';
+  const feedbackPanel = videoRel ? `<section class="feedback-panel" aria-labelledby="fb-title"><div class="section-kicker">真实反馈学习闭环</div><h3 id="fb-title">审阅本条成片并记录偏好规则</h3><p class="field-hint">仅人工明确反馈可创建规则；同一规则在 2 条不同成片上确认后自动晋升为已生效规则。</p><div class="feedback-grid"><label>反馈对象<select id="fb-target"><option value="script">脚本 / 字幕文案</option><option value="sticker">语义贴图</option></select></label><label>判断结论<select id="fb-verdict"><option value="violated">违反规则（下次避免）</option><option value="satisfied">符合预期（下次保留）</option></select></label><label id="fb-sticker-wrap" hidden>对应贴图<select id="fb-sticker-id">${stickerOptions}</select></label></div><label>规则描述<input id="fb-rule" placeholder="例如：字幕应该像带货文案而不是画面描述 / 产地贴图不要遮挡主体"></label><label>具体批注 <span class="field-note">可选</span><input id="fb-comment" placeholder="记录这版哪里好或哪里不对"></label><div class="feedback-actions"><button id="fb-submit" class="button primary" type="button">记录真实反馈</button><span id="fb-status" class="field-hint"></span></div><div id="feedback-policy-list" class="policy-box">正在载入当前偏好规则…</div></section>` : "";
+  $("results").innerHTML = `<div class="result-card">${videoUrl ? `<video class="result-video" controls preload="metadata" src="${videoUrl}"></video>` : ""}<div class="result-details"><strong>最终成片</strong><p class="field-hint">${escapeHtml(result.final_path)}</p><div class="artifact-list">${links}</div></div></div>${feedbackPanel}`;
+  if (videoRel) {
+    $("fb-target").addEventListener("change", toggleStickerPicker);
+    $("fb-submit").addEventListener("click", async () => {
+      const ruleText = $("fb-rule").value.trim();
+      if (!ruleText) { $("fb-status").textContent = "请先填写规则描述"; return; }
       try {
-        $("dock-status").textContent = "正在导出剪映草稿 / OTIO / FCPXML…";
-        const res = await api("/api/plan/export", { plan_path: planPath });
-        const count = Object.keys(res.exports || {}).length;
-        $("dock-status").textContent = `已导出 ${count} 份可编辑工程文件（可在版本列表下载）`;
-        await history();
+        $("fb-status").textContent = "正在写入反馈…";
+        const resp = await api("/api/feedback", {
+          target: $("fb-target").value,
+          verdict: $("fb-verdict").value,
+          rule_text: ruleText,
+          comment: $("fb-comment").value.trim(),
+          video_path: videoRel,
+          sticker_id: $("fb-sticker-id")?.value || "",
+          product_category: $("type")?.value?.trim() || "",
+          video_style: $("video_style")?.value || "",
+        });
+        $("fb-status").textContent = resp.recorded ? "已记录到用户偏好库（点击已有规则可跨成片巩固）" : "相同反馈已存在，无需重复记录";
+        $("fb-comment").value = "";
+        await refreshFeedbackPolicy();
       } catch (err) {
-        $("dock-status").textContent = err.message;
+        $("fb-status").textContent = `记录失败：${err.message}`;
       }
     });
-
-    $("rerender-plan-btn")?.addEventListener("click", async () => {
-      try {
-        const segPatches = [...body.querySelectorAll(".shot-row")].map((row) => {
-          const patch = {
-            edit_index: Number(row.dataset.editIndex),
-            script_subtitle: row.querySelector(".shot-subtitle").value,
-            source_start: Number(row.querySelector(".shot-start").value),
-            source_end: Number(row.querySelector(".shot-end").value),
-          };
-          if (row.dataset.swapSource) patch.source_video = row.dataset.swapSource;
-          return patch;
-        });
-        const disabledStickers = [...body.querySelectorAll(".sticker-keep")]
-          .filter((cb) => !cb.checked)
-          .map((cb) => Number(cb.dataset.stickerIndex));
-        const status = await api("/api/plan/rerender", {
-          plan_path: planPath,
-          reframe_mode: $("reframe-mode")?.value || "auto",
-          edits: { segments: segPatches, disabled_sticker_indices: disabledStickers },
-        });
-        activeJob = status.id;
-        setWorkbenchState("running", "正在按微调时间线快速重渲染…");
-        await poll();
-      } catch (err) {
-        $("dock-status").textContent = err.message;
-      }
-    });
-  } catch (error) {
-    body.innerHTML = `<span class="empty-copy">加载时间线计划失败：${escapeHtml(error.message)}</span>`;
+    refreshFeedbackPolicy();
   }
+  setWorkbenchState("result");
 }
 
 function formatDate(value) { return value ? new Date(value * 1000).toLocaleString("zh-CN", { dateStyle: "short", timeStyle: "short" }) : ""; }
@@ -254,7 +245,7 @@ async function poll() {
     activeJob = status.active ? status.id : activeJob;
     renderProgress(status);
     if (status.kind === "preflight" && status.stage === "completed" && status.result) renderPreflight(status.result);
-    if ((status.kind === "run" || status.kind === "rerender") && status.stage === "completed" && status.id !== completedRunId) {
+    if (status.kind === "run" && status.stage === "completed" && status.id !== completedRunId) {
       completedRunId = status.id;
       renderResult(status.result);
       await history();
@@ -276,8 +267,7 @@ $("run-form").addEventListener("submit", async (event) => {
     await poll();
   } catch (error) {
     $("preflight-result").textContent = error.message;
-    $("preflight-error").hidden = false;
-    $("preflight-error").textContent = error.message;
+    renderErrorBox($("preflight-error"), error.message, null);
   }
 });
 
@@ -289,8 +279,7 @@ $("run").addEventListener("click", async () => {
     setWorkbenchState("running");
     await poll();
   } catch (error) {
-    $("error-box").hidden = false;
-    $("error-box").textContent = error.message;
+    renderErrorBox($("error-box"), error.message, null);
     setWorkbenchState("preflight", error.message);
   }
 });

@@ -649,6 +649,52 @@ def _analyze_window_frame_quality(
     }
 
 
+def _extract_sharpest_detail_frame(
+    source: Path,
+    frame_quality: Dict[str, Any],
+    output: Path,
+    *,
+    max_width: int = 1280,
+    min_sharpness: float = 35.0,
+) -> Optional[Path]:
+    """Extract the sharpest readable frame at high resolution for crisp packaging/label OCR."""
+    samples = [
+        sample for sample in (frame_quality.get("samples") or [])
+        if sample.get("readable") and float(sample.get("sharpness") or 0.0) >= min_sharpness
+    ]
+    if not samples:
+        return None
+    best = max(samples, key=lambda item: float(item.get("sharpness") or 0.0))
+    timestamp = float(best.get("time") or 0.0)
+    try:
+        import cv2
+
+        capture = cv2.VideoCapture(str(source))
+        if not capture.isOpened():
+            return None
+        try:
+            capture.set(cv2.CAP_PROP_POS_MSEC, max(0.0, timestamp) * 1000.0)
+            ok, frame = capture.read()
+        finally:
+            capture.release()
+        if not ok or frame is None:
+            return None
+        height, width = frame.shape[:2]
+        if width > max_width:
+            scale = max_width / float(width)
+            frame = cv2.resize(
+                frame,
+                (max_width, max(1, int(round(height * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if cv2.imwrite(str(output), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92]):
+            return output
+    except Exception:
+        return None
+    return None
+
+
 def _make_contact_sheet(
     source: Path,
     start: float,
@@ -1556,7 +1602,12 @@ class VisionAnalyzer:
         self.api_key = VISION_API_KEY
         self.model = VISION_MODEL
 
-    def analyze_window(self, sheet_path: Path, metadata: Dict[str, Any]) -> Dict[str, Any]:
+    def analyze_window(
+        self,
+        sheet_path: Path,
+        metadata: Dict[str, Any],
+        detail_frame_path: Optional[Path] = None,
+    ) -> Dict[str, Any]:
         system_prompt = (
             "你是严格的逐帧视频素材分析员。只描述画面直接可见事实；允许依据可见对象和环境做有证据的"
             "商品叙事角色归类，但不能据此断言它与当前产品存在事实关系，也不能推断产品配方、具体地名、"
@@ -1564,6 +1615,13 @@ class VisionAnalyzer:
             "使用、结果或背景角色，但关系候选只能描述画面本身，不能断言其属于某产品。"
             "必须区分桌面/柜台/货架，倒入/摆放/指向等动作。窗口口播仅用于理解说话内容和叙事意图，"
             "不能改变任何可见事实、产品关系或事实证据判断。只返回有效 JSON。"
+        )
+        has_detail_frame = bool(detail_frame_path and Path(detail_frame_path).is_file())
+        detail_rule = (
+            "\n- 第二张图为本窗口最清晰的高清关键帧，仅用于清晰辨认拼图多帧中已出现的产品包装/标签文字或形态细节；"
+            "动作时序和 visible_frame_count 仍必须严格以第一张时间戳拼图为准，严禁猜测模糊文字。"
+            if has_detail_frame
+            else ""
         )
         user_text = f"""
 Analyze this contact sheet for a local product ad edit.
@@ -1632,19 +1690,21 @@ Rules:
 - computed_motion is independent optical-flow evidence. Do not claim an action when both the frames and motion evidence are static.
 - original_audio_context 仅用于 spoken_*、speech_visual_relation 和 narrative_roles。口播不能证明画面事实或产品事实。
 - 不得把口播内容写入 visible_subjects、literal_actions、visible_objects、visible_text、relation_candidates、relation_evidence 或 evidence。
-- spoken_claim_candidates 必须保留为待核验候选，不得据此断言产品关系、功效、配方、产地或人物身份。
+- spoken_claim_candidates 必须保留为待核验候选，不得据此断言产品关系、功效、配方、产地或人物身份。{detail_rule}
 """
+        user_content: List[Dict[str, Any]] = [
+            {"type": "text", "text": user_text},
+            {"type": "image_url", "image_url": {"url": _image_data_url(sheet_path)}},
+        ]
+        if has_detail_frame and detail_frame_path is not None:
+            user_content.append(
+                {"type": "image_url", "image_url": {"url": _image_data_url(Path(detail_frame_path))}}
+            )
         payload = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": user_text},
-                        {"type": "image_url", "image_url": {"url": _image_data_url(sheet_path)}},
-                    ],
-                },
+                {"role": "user", "content": user_content},
             ],
             "temperature": 0.1,
             "max_tokens": 1600,
@@ -2762,6 +2822,7 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import inspect
+    import os
     import threading
 
     draft_lock = threading.Lock()
@@ -2785,23 +2846,31 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
             pass
         return _analyze_window_frame_quality(src_path, s, e)
 
-    def _process_window(plan_position: int, source: Dict[str, Any], win_idx: int, win: Dict[str, Any]) -> Optional[Tuple[int, Dict[str, Any]]]:
+    def _call_analyze_window(sheet_path: Path, metadata: Dict[str, Any], detail_frame: Optional[Path]):
+        try:
+            sig = inspect.signature(analyzer.analyze_window)
+            if "detail_frame_path" in sig.parameters:
+                return analyzer.analyze_window(sheet_path, metadata, detail_frame_path=detail_frame)
+        except Exception:
+            pass
+        return analyzer.analyze_window(sheet_path, metadata)
+
+    def _prepare_window_local(
+        plan_position: int,
+        source: Dict[str, Any],
+        win_idx: int,
+        win: Dict[str, Any],
+    ) -> Dict[str, Any]:
         path = Path(source["path"])
         source_id = str(source["source_id"])
         window_id = f"{source_id}_{win_idx:04d}"
-        if window_id in completed_window_ids:
-            print(
-                f"   [{plan_position}/{total_windows}] {path.name} "
-                f"{win['start']:.1f}-{win['end']:.1f}s：断点缓存命中",
-                flush=True,
-            )
-            return None
         print(
             f"   [{plan_position}/{total_windows}] {path.name} "
             f"{win['start']:.1f}-{win['end']:.1f}s：动态/静态分析与帧证据",
             flush=True,
         )
         sheet_path = sheets_dir / f"{window_id}.jpg"
+        detail_path = sheets_dir / f"{window_id}_detail.jpg"
         metadata = {
             "source_video": path.name,
             "start": win["start"],
@@ -2816,8 +2885,6 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
         )
         metadata["audio_context"] = audio_context
 
-        # Single-pass OpenCV frame decode reused for motion, quality, and visual descriptor
-        pre_bgr_frames = None
         pre_gray_frames = None
         visual_descriptor: List[float] = []
         try:
@@ -2833,6 +2900,11 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
 
         motion = _call_motion(path, win["start"], win["end"], pre_gray_frames)
         frame_quality = _call_quality(path, win["start"], win["end"], pre_gray_frames)
+        extracted_detail = (
+            _extract_sharpest_detail_frame(path, frame_quality, detail_path)
+            if frame_quality.get("passed")
+            else None
+        )
         motion_peaks = sorted(
             motion.get("active_ranges") or [],
             key=lambda item: float(item.get("strength") or 0.0),
@@ -2876,35 +2948,51 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
         metadata["frame_quality"] = {
             key: value for key, value in frame_quality.items() if key != "samples"
         }
-        analysis = reusable_analyses.get(window_id)
-        if analysis is None:
-            print("      素材语义：请求视觉模型", flush=True)
-            analysis = analyzer.analyze_window(sheet_path, metadata)
-        else:
-            print("      素材语义：复用同源窗口的已验证理解", flush=True)
+        return {
+            "plan_position": plan_position,
+            "window_id": window_id,
+            "source_id": source_id,
+            "scene_id": win.get("scene_id", 0),
+            "path": path,
+            "win": win,
+            "sheet_path": sheet_path,
+            "detail_frame": extracted_detail,
+            "metadata": metadata,
+            "motion": motion,
+            "frame_quality": frame_quality,
+            "frame_evidence": frame_evidence,
+            "audio_context": audio_context,
+            "visual_descriptor": visual_descriptor,
+        }
+
+    def _finalize_window(prepared: Dict[str, Any], analysis: Dict[str, Any]) -> Dict[str, Any]:
+        motion = prepared["motion"]
+        frame_quality = prepared["frame_quality"]
         consistency = _motion_consistency(analysis, motion)
         if not consistency["passed"] or not frame_quality["passed"]:
             analysis["usable_for_ad"] = False
             analysis["confidence"] = min(float(analysis.get("confidence") or 0.0), 0.5)
-        record = {
-            "window_id": window_id,
-            "source_id": source_id,
-            "scene_id": win.get("scene_id", 0),
-            "source_path": str(path),
-            "source_video": path.name,
-            "start": win["start"],
-            "end": win["end"],
-            "duration": round(win["end"] - win["start"], 3),
-            "contact_sheet": str(sheet_path),
+        rec = {
+            "window_id": prepared["window_id"],
+            "source_id": prepared["source_id"],
+            "scene_id": prepared["scene_id"],
+            "source_path": str(prepared["path"]),
+            "source_video": prepared["path"].name,
+            "start": prepared["win"]["start"],
+            "end": prepared["win"]["end"],
+            "duration": round(prepared["win"]["end"] - prepared["win"]["start"], 3),
+            "contact_sheet": str(prepared["sheet_path"]),
             "analysis": analysis,
             "motion": motion,
             "frame_quality": frame_quality,
-            "frame_evidence": frame_evidence,
+            "frame_evidence": prepared["frame_evidence"],
             "motion_consistency": consistency,
-            "audio_context": audio_context,
-            "visual_descriptor": visual_descriptor,
+            "audio_context": prepared["audio_context"],
+            "visual_descriptor": prepared["visual_descriptor"],
         }
-        return plan_position, record
+        if prepared.get("detail_frame"):
+            rec["detail_frame"] = str(prepared["detail_frame"])
+        return rec
 
     pending_tasks = [
         (plan_position, source, win_idx, win)
@@ -2920,28 +3008,109 @@ def _build_local_asset_index_locked(ctx: LocalAssetContext) -> Dict[str, Any]:
                 flush=True,
             )
 
-    new_records: List[Tuple[int, Dict[str, Any]]] = []
-    if index_workers <= 1 or len(pending_tasks) <= 1:
-        for task in pending_tasks:
-            res = _process_window(*task)
-            if res is not None:
-                pos, rec = res
-                new_records.append((pos, rec))
-                windows.append(rec)
-                completed_window_ids.add(rec["window_id"])
-                _write_draft()
+    # Phase 1: Local frame decode, motion/quality measurement, detail-frame extraction
+    prepared_list: List[Dict[str, Any]] = [
+        _prepare_window_local(*task) for task in pending_tasks
+    ]
+
+    # Shot-aware static-window VLM deduplication: within the same (source_id, scene_id),
+    # if consecutive static windows share near-identical visual descriptors (>= 0.97)
+    # and identical speech key, reuse the anchor window's VLM analysis instead of
+    # making redundant VLM calls while preserving full clip duration capacity.
+    from visual_search import visual_cosine_similarity
+
+    static_anchors: Dict[Tuple[str, int, str], List[Dict[str, Any]]] = {}
+    duplicate_of: Dict[str, str] = {}
+    unique_vlm_items: List[Dict[str, Any]] = []
+    cached_items: List[Dict[str, Any]] = []
+
+    for item in prepared_list:
+        wid = item["window_id"]
+        if wid in reusable_analyses:
+            cached_items.append(item)
+            continue
+        scene_key = (
+            item["source_id"],
+            int(item["scene_id"]),
+            str((item["audio_context"] or {}).get("semantic_key") or ""),
+        )
+        is_static = str((item["motion"] or {}).get("motion_class") or "") == "static"
+        desc = item.get("visual_descriptor") or []
+        matched_anchor_id = None
+        if is_static and desc:
+            for anchor in static_anchors.get(scene_key, []):
+                if visual_cosine_similarity(anchor["visual_descriptor"], desc) >= 0.97:
+                    matched_anchor_id = anchor["window_id"]
+                    break
+        if matched_anchor_id:
+            duplicate_of[wid] = matched_anchor_id
+            print(
+                f"      同镜头静态去重：窗口 {wid} 复用 {matched_anchor_id} 的视觉语义（保留完整时长容量）",
+                flush=True,
+            )
+        else:
+            unique_vlm_items.append(item)
+            if is_static and desc:
+                static_anchors.setdefault(scene_key, []).append(item)
+
+    # Emit cached items immediately
+    resolved_analyses: Dict[str, Dict[str, Any]] = {}
+    for item in cached_items:
+        wid = item["window_id"]
+        print("      素材语义：复用同源窗口的已验证理解", flush=True)
+        analysis = copy.deepcopy(reusable_analyses[wid])
+        resolved_analyses[wid] = analysis
+        rec = _finalize_window(item, analysis)
+        windows.append(rec)
+        completed_window_ids.add(wid)
+        _write_draft()
+
+    # Phase 2: Bounded concurrent VLM semantic analysis for unique windows
+    def _run_vlm(item: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        print("      素材语义：请求视觉模型", flush=True)
+        analysis = _call_analyze_window(
+            item["sheet_path"],
+            item["metadata"],
+            item.get("detail_frame"),
+        )
+        return item, analysis
+
+    if index_workers <= 1 or len(unique_vlm_items) <= 1:
+        for item in unique_vlm_items:
+            _item, analysis = _run_vlm(item)
+            wid = _item["window_id"]
+            resolved_analyses[wid] = analysis
+            rec = _finalize_window(_item, analysis)
+            windows.append(rec)
+            completed_window_ids.add(wid)
+            _write_draft()
     else:
-        with ThreadPoolExecutor(max_workers=min(index_workers, len(pending_tasks))) as pool:
-            futures = {pool.submit(_process_window, *task): task[0] for task in pending_tasks}
+        with ThreadPoolExecutor(max_workers=min(index_workers, len(unique_vlm_items))) as pool:
+            futures = [pool.submit(_run_vlm, item) for item in unique_vlm_items]
             for future in as_completed(futures):
-                res = future.result()
-                if res is not None:
-                    pos, rec = res
-                    with draft_lock:
-                        new_records.append((pos, rec))
-                        windows.append(rec)
-                        completed_window_ids.add(rec["window_id"])
-                        _write_draft()
+                _item, analysis = future.result()
+                wid = _item["window_id"]
+                with draft_lock:
+                    resolved_analyses[wid] = analysis
+                    rec = _finalize_window(_item, analysis)
+                    windows.append(rec)
+                    completed_window_ids.add(wid)
+                    _write_draft()
+
+    # Propagate resolved analyses to deduplicated intra-shot static windows
+    for item in prepared_list:
+        wid = item["window_id"]
+        anchor_id = duplicate_of.get(wid)
+        if not anchor_id or wid in completed_window_ids:
+            continue
+        base_analysis = resolved_analyses.get(anchor_id)
+        if base_analysis is None:
+            continue
+        rec = _finalize_window(item, copy.deepcopy(base_analysis))
+        rec["vlm_reused_from"] = anchor_id
+        windows.append(rec)
+        completed_window_ids.add(wid)
+        _write_draft()
 
     # Keep deterministic window ordering matching window_plan
     order_map = {

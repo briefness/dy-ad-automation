@@ -6,7 +6,6 @@ import mimetypes
 import os
 import re
 import subprocess
-import threading
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,9 +16,9 @@ from .services import environment_check, normalize_product
 from .validation import AssetPathError, is_safe_artifact
 
 STATIC_DIR = Path(__file__).with_name("static")
-ARTIFACT_SUFFIXES = {".mp4", ".json", ".txt", ".html", ".md", ".jpg", ".jpeg", ".png", ".otio", ".fcpxml"}
-PRESENTATION_SUFFIXES = {".mp4", ".jpg", ".jpeg", ".png", ".json", ".html", ".otio", ".fcpxml"}
-TEXT_SUFFIXES = {".txt", ".json", ".html", ".md", ".otio", ".fcpxml"}
+ARTIFACT_SUFFIXES = {".mp4", ".json", ".txt", ".html", ".md", ".jpg", ".jpeg", ".png"}
+PRESENTATION_SUFFIXES = {".mp4", ".jpg", ".jpeg", ".png", ".json", ".html"}
+TEXT_SUFFIXES = {".txt", ".json", ".html", ".md"}
 
 
 def output_dir() -> Path:
@@ -32,15 +31,22 @@ def cache_roots() -> list[Path]:
     return [Path(LOCAL_ASSET_INDEX_PATH).resolve()]
 
 
+def script_feedback_db() -> Path:
+    from script_feedback import DEFAULT_DB_PATH
+    return DEFAULT_DB_PATH
+
+
+def sticker_feedback_db() -> Path:
+    from sticker_feedback import DEFAULT_DB_PATH
+    return DEFAULT_DB_PATH
+
+
 def artifact_label(path: Path) -> str:
     name = path.name.lower()
     if path.suffix.lower() == ".mp4": return "最终成片" if name.endswith(("_final.mp4", "_enhanced.mp4")) else "视频"
     if path.suffix.lower() in {".jpg", ".jpeg", ".png"}: return "封面图"
-    if path.suffix.lower() == ".otio": return "OTIO 工程"
-    if path.suffix.lower() == ".fcpxml": return "FCPXML 工程"
-    if name == "draft_content.json": return "剪映草稿"
-    if name.endswith("_production_plan.json"): return "成片计划"
     if name.endswith("_script.json"): return "脚本"
+    if name.endswith("_sticker_plan.json"): return "贴图计划"
     if name.endswith("_run_manifest.json"): return "运行清单"
     if name.endswith("_edit_decision_report.json"): return "剪辑报告"
     if name.endswith("_timeline_review.html"): return "时间线报告"
@@ -51,25 +57,22 @@ def artifact_label(path: Path) -> str:
 def is_presentable_artifact(path: Path) -> bool:
     name = path.name.lower()
     if path.suffix.lower() not in PRESENTATION_SUFFIXES: return False
-    if path.suffix.lower() in {".mp4", ".jpg", ".jpeg", ".png", ".otio", ".fcpxml"}: return True
-    if name == "draft_content.json": return True
-    return name.endswith(("_production_plan.json", "_script.json", "_run_manifest.json", "_edit_decision_report.json", "_timeline_review.html", "_frame_evidence_report.html"))
+    if path.suffix.lower() in {".mp4", ".jpg", ".jpeg", ".png"}: return True
+    return name.endswith((
+        "_script.json",
+        "_sticker_plan.json",
+        "_run_manifest.json",
+        "_edit_decision_report.json",
+        "_timeline_review.html",
+        "_frame_evidence_report.html",
+    ))
 
 
 def artifacts_for(path: Path, prefix: str | None = None) -> list[dict[str, str]]:
     root = output_dir()
     files = sorted(root.rglob("*"), key=lambda item: item.stat().st_mtime if item.is_file() else 0, reverse=True)
     prefix = prefix or path.stem.removesuffix("_final")
-    candidates = [
-        item for item in files
-        if item.is_file()
-        and is_presentable_artifact(item)
-        and (
-            item == path
-            or item.name.startswith(prefix)
-            or (item.name == "draft_content.json" and item.parent.name.startswith(prefix))
-        )
-    ]
+    candidates = [item for item in files if item.is_file() and is_presentable_artifact(item) and (item == path or item.name.startswith(prefix))]
     videos = [item for item in candidates if item.suffix.lower() == ".mp4"]
     preferred_video = next((item for item in videos if item.name.endswith("_final.mp4")), None) or next((item for item in videos if item.name.endswith("_enhanced.mp4")), None) or next(iter(videos), None)
     candidates = [item for item in candidates if item.suffix.lower() != ".mp4" or item == preferred_video]
@@ -88,6 +91,40 @@ def recent_history(limit: int = 12) -> list[dict]:
         final = next((item for item in candidates if item.name.endswith("_final.mp4")), None) or next((item for item in candidates if item.name.endswith("_enhanced.mp4")), None) or next(iter(candidates), None)
         entries.append({"name": stem, "created_at": manifest.stat().st_mtime, "manifest": str(manifest.relative_to(output_dir())), "video": str(final.relative_to(output_dir())) if final else None, "artifacts": artifacts_for(final or manifest, prefix=stem)})
     return entries
+
+
+def _build_feedback_policies(category: str = "", style: str = "") -> dict:
+    from script_feedback import ScriptFeedbackStore
+    from sticker_feedback import StickerFeedbackStore
+
+    script_policy = ScriptFeedbackStore(db_path=script_feedback_db()).build_policy(
+        product_category=category,
+        script_style="",
+    )
+    sticker_policy = StickerFeedbackStore(db_path=sticker_feedback_db()).build_policy(
+        product_category=category,
+        video_style=style,
+    )
+    return {
+        "source": "explicit_user_feedback_only",
+        "min_distinct_videos": 2,
+        "script_rules": script_policy.get("rules") or [],
+        "sticker_rules": sticker_policy.get("rules") or [],
+    }
+
+
+def _load_video_sidecar_json(video_path: Path, suffixes: tuple[str, ...]) -> dict:
+    stem = video_path.stem.removesuffix("_final").removesuffix("_enhanced")
+    for suffix in suffixes:
+        candidate = video_path.parent / f"{stem}{suffix}"
+        if candidate.is_file() and is_safe_artifact(candidate, output_dir()):
+            try:
+                data = json.loads(candidate.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except (OSError, json.JSONDecodeError):
+                pass
+    return {}
 
 
 class LocalWebHandler(SimpleHTTPRequestHandler):
@@ -129,25 +166,27 @@ class LocalWebHandler(SimpleHTTPRequestHandler):
             if final_path.is_file() and is_safe_artifact(final_path, output_dir()):
                 relative = str(final_path.resolve().relative_to(output_dir()))
                 result["video_url"] = "/api/artifact?path=" + quote(relative, safe="")
+                result["video_relative_path"] = relative
                 result["artifacts"] = artifacts_for(final_path)
+                sticker_plan = _load_video_sidecar_json(final_path, ("_sticker_plan.json",))
+                result["stickers"] = [
+                    {
+                        "id": str(item.get("id") or f"sticker-{idx}"),
+                        "kind": str(item.get("kind") or ""),
+                        "text": str(item.get("text") or ""),
+                        "segment": int(item.get("segment", 0)),
+                    }
+                    for idx, item in enumerate(sticker_plan.get("items") or [])
+                    if isinstance(item, dict) and str(item.get("text") or "").strip()
+                ]
                 status["result"] = result
             return self._json(status)
         if parsed.path == "/api/history": return self._json({"runs": recent_history()})
-        if parsed.path == "/api/plan":
-            relative = unquote(parse_qs(parsed.query).get("path", [""])[0])
-            if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
-                return self._json({"error": "无效的计划路径"}, HTTPStatus.FORBIDDEN)
-            target = (output_dir() / relative).resolve()
-            if not target.is_file() or not target.name.endswith("_production_plan.json") or not is_safe_artifact(target, output_dir()):
-                return self._json({"error": "成片计划不存在或不可访问"}, HTTPStatus.NOT_FOUND)
-            plan = json.loads(target.read_text(encoding="utf-8"))
-            from plan_rerender import find_candidate_windows_for_plan
-            candidates = {}
-            for root in cache_roots():
-                candidates = find_candidate_windows_for_plan(plan, root)
-                if candidates:
-                    break
-            return self._json({"path": relative, "plan": plan, "candidates": candidates})
+        if parsed.path == "/api/feedback/policy":
+            qs = parse_qs(parsed.query)
+            category = unquote(qs.get("category", [""])[0])
+            style = unquote(qs.get("style", [""])[0])
+            return self._json(_build_feedback_policies(category=category, style=style))
         if parsed.path == "/api/artifact": return self._serve_artifact(unquote(parse_qs(parsed.query).get("path", [""])[0]))
         if parsed.path in {"/", "/index.html"}: return self._serve_static("index.html")
         if parsed.path in {"/styles.css", "/app.js"}: return self._serve_static(parsed.path.lstrip("/"))
@@ -175,52 +214,76 @@ class LocalWebHandler(SimpleHTTPRequestHandler):
                 product = normalize_product(body.get("product") or body)
                 payload = {"asset_path": body["asset_path"], "product": product, "preflight_key": preflight_fingerprint(body["asset_path"], product, output_dir=output_dir()), "target_duration": body.get("target_duration"), "video_style": body.get("video_style", "auto"), "rhythm_style": body.get("rhythm_style", "moderate"), "voiceover": body.get("voiceover", True), "voice": body.get("voice", "auto"), "stickers": body.get("stickers", "auto"), "output_name": body.get("output_name"), "resume": body.get("resume", True), "output_dir": str(output_dir())}
                 return self._json(self.manager.start("run", payload), HTTPStatus.ACCEPTED)
+            if parsed.path == "/api/feedback":
+                return self._handle_feedback(body)
             if parsed.path in {"/api/cancel", "/api/jobs/cancel", "/api/heartbeat"}:
                 return self._json(self.manager.cancel() if parsed.path != "/api/heartbeat" or body.get("closing") else self.manager.poll())
-            if parsed.path == "/api/plan/rerender":
-                self.manager.poll()
-                if self.manager.public_status().get("active"): raise RuntimeError("已有任务正在运行")
-                relative = str(body.get("plan_path") or "")
-                if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
-                    return self._json({"error": "无效的计划路径"}, HTTPStatus.FORBIDDEN)
-                target = (output_dir() / relative).resolve()
-                if not target.is_file() or not target.name.endswith("_production_plan.json") or not is_safe_artifact(target, output_dir()):
-                    return self._json({"error": "成片计划不存在"}, HTTPStatus.NOT_FOUND)
-                payload = {
-                    "plan_path": str(target),
-                    "edits": body.get("edits") or {},
-                    "reframe_mode": str(body.get("reframe_mode") or "auto"),
-                    "output_dir": str(target.parent),
-                }
-                return self._json(self.manager.start("rerender", payload), HTTPStatus.ACCEPTED)
-            if parsed.path == "/api/plan/export":
-                relative = str(body.get("plan_path") or "")
-                if not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
-                    return self._json({"error": "无效的计划路径"}, HTTPStatus.FORBIDDEN)
-                target = (output_dir() / relative).resolve()
-                if not target.is_file() or not target.name.endswith("_production_plan.json") or not is_safe_artifact(target, output_dir()):
-                    return self._json({"error": "成片计划不存在"}, HTTPStatus.NOT_FOUND)
-                from timeline_export import export_all_nle_timelines
-                plan = json.loads(target.read_text(encoding="utf-8"))
-                stem = target.name.removesuffix("_production_plan.json")
-                exported = export_all_nle_timelines(plan, target.parent, stem)
-                root = output_dir()
-                links = [
-                    {
-                        "kind": kind,
-                        "name": p.name,
-                        "label": artifact_label(p),
-                        "path": str(p.resolve().relative_to(root)),
-                        "url": "/api/artifact?path=" + quote(str(p.resolve().relative_to(root)), safe=""),
-                    }
-                    for kind, p in exported.items()
-                ]
-                return self._json({"ok": True, "exports": links})
             if parsed.path == "/api/open-output":
                 self._open_output(); return self._json({"ok": True})
             self.send_error(HTTPStatus.NOT_FOUND)
         except (KeyError, ValueError, AssetPathError, RuntimeError) as exc:
             self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
+    def _handle_feedback(self, body: dict):
+        target = str(body.get("target") or "script").strip().lower()
+        verdict = str(body.get("verdict") or "").strip().lower()
+        rule_text = str(body.get("rule_text") or "").strip()
+        comment = str(body.get("comment") or "").strip()
+        video_rel = str(body.get("video_path") or "").strip()
+        category = str(body.get("product_category") or "").strip()
+        video_style = str(body.get("video_style") or "").strip()
+
+        if not video_rel or Path(video_rel).is_absolute() or ".." in Path(video_rel).parts:
+            raise ValueError("必须绑定具体的已生成视频文件")
+        video_file = (output_dir() / video_rel).resolve()
+        if not video_file.is_file() or not is_safe_artifact(video_file, output_dir()):
+            raise ValueError("找不到对应的已生成视频文件")
+        video_id = video_file.stem
+
+        if target == "script":
+            from script_feedback import ScriptFeedbackStore
+
+            script = _load_video_sidecar_json(video_file, ("_script.json", "_final.script.json"))
+            recorded = ScriptFeedbackStore(db_path=script_feedback_db()).record_feedback(
+                video_id=video_id,
+                rule_text=rule_text,
+                verdict=verdict,
+                source="user",
+                user_comment=comment,
+                script=script,
+                product_category=category,
+                script_style=str(script.get("script_style") or ""),
+            )
+        elif target == "sticker":
+            from sticker_feedback import StickerFeedbackStore
+
+            sticker_plan = _load_video_sidecar_json(video_file, ("_sticker_plan.json",))
+            sticker_id = str(body.get("sticker_id") or "").strip()
+            sticker_obj = next(
+                (
+                    item for item in (sticker_plan.get("items") or [])
+                    if isinstance(item, dict) and str(item.get("id") or "") == sticker_id
+                ),
+                {"id": sticker_id} if sticker_id else {},
+            )
+            recorded = StickerFeedbackStore(db_path=sticker_feedback_db()).record_feedback(
+                video_id=video_id,
+                rule_text=rule_text,
+                verdict=verdict,
+                source="user",
+                user_comment=comment,
+                sticker=sticker_obj,
+                product_category=category,
+                video_style=video_style,
+            )
+        else:
+            raise ValueError("target 必须是 script 或 sticker")
+
+        return self._json({
+            "ok": True,
+            "recorded": bool(recorded),
+            "policy": _build_feedback_policies(category=category, style=video_style),
+        })
 
     def _serve_static(self, name: str):
         path = STATIC_DIR / name

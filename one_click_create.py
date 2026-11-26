@@ -8326,6 +8326,7 @@ def run_generation_pipeline(
     logo_path_str = BRAND_CONFIG.get("logo_path", "")
     logo_cfg = BRAND_CONFIG.get("logo_watermark", {})
     logo_enabled = logo_cfg.get("enabled", False) and logo_path_str
+    _deferred_logo_config: Optional[Dict[str, Any]] = None
 
     watermarked_path = final_dir / f"{output_name}_watermarked.mp4"
     if logo_enabled:
@@ -8336,22 +8337,36 @@ def run_generation_pipeline(
             full_logo_path = PROJECT_ROOT / logo_path
 
         if full_logo_path.exists():
-            try:
-                print(f"🏷️  添加品牌 Logo 水印...")
-                add_logo_watermark(
-                    video=sfx_path,
-                    output=watermarked_path,
-                    logo_path=full_logo_path,
-                    position=logo_cfg.get("position", "top_right"),
-                    size_ratio=logo_cfg.get("size_ratio", 0.08),
-                    margin_ratio=logo_cfg.get("margin_ratio", 0.03),
-                    opacity=logo_cfg.get("opacity", 0.9),
-                    fade_in=logo_cfg.get("fade_in", 0.5),
-                    fade_out=logo_cfg.get("fade_out", 0.5),
-                )
-                sfx_path = watermarked_path
-            except Exception as e:
-                print(f"⚠️  Logo 水印添加失败：{e}")
+            # Fuse logo overlay into final single-pass export when no mid-stage intro/outro
+            # or deferred voiceover mix intervenes, saving a full intermediate re-encode.
+            if local_asset_mode and not (brand_intro_outro or _reference_outro) and not _defer_full_voiceover_mix:
+                _deferred_logo_config = {
+                    "logo_path": full_logo_path,
+                    "position": logo_cfg.get("position", "top_right"),
+                    "size_ratio": logo_cfg.get("size_ratio", 0.08),
+                    "margin_ratio": logo_cfg.get("margin_ratio", 0.03),
+                    "opacity": logo_cfg.get("opacity", 0.9),
+                    "fade_in": logo_cfg.get("fade_in", 0.5),
+                    "fade_out": logo_cfg.get("fade_out", 0.5),
+                }
+                print("🏷️  品牌 Logo 水印将并入最终单遍导出（免二次重编码）")
+            else:
+                try:
+                    print(f"🏷️  添加品牌 Logo 水印...")
+                    add_logo_watermark(
+                        video=sfx_path,
+                        output=watermarked_path,
+                        logo_path=full_logo_path,
+                        position=logo_cfg.get("position", "top_right"),
+                        size_ratio=logo_cfg.get("size_ratio", 0.08),
+                        margin_ratio=logo_cfg.get("margin_ratio", 0.03),
+                        opacity=logo_cfg.get("opacity", 0.9),
+                        fade_in=logo_cfg.get("fade_in", 0.5),
+                        fade_out=logo_cfg.get("fade_out", 0.5),
+                    )
+                    sfx_path = watermarked_path
+                except Exception as e:
+                    print(f"⚠️  Logo 水印添加失败：{e}")
         else:
             print(f"⚠️  Logo 文件不存在：{full_logo_path}，跳过水印")
 
@@ -8455,13 +8470,27 @@ def run_generation_pipeline(
         # auto_trim 已在字幕前提前执行（用 -c copy 流复制），此处直接对 sfx_path 做最终编码。
         # 不再额外调用 auto_trim_video，节省一次完整重编码。
         douyin_video_cfg = DOUYIN_CONFIG
-        export_final_video(
-            input_video=sfx_path,
-            output=final_path,
-            resolution=douyin_video_cfg["resolution"],
-            fps=douyin_video_cfg["fps"],
-            bitrate=douyin_video_cfg["bitrate"],
-        )
+        if _deferred_logo_config is not None:
+            from render_backend import render_single_pass_composite
+
+            render_single_pass_composite(
+                input_video=sfx_path,
+                output=final_path,
+                resolution=douyin_video_cfg["resolution"],
+                fps=int(douyin_video_cfg["fps"]),
+                bitrate=douyin_video_cfg["bitrate"],
+                logo_config=_deferred_logo_config,
+                normalize_audio=True,
+                profile="final",
+            )
+        else:
+            export_final_video(
+                input_video=sfx_path,
+                output=final_path,
+                resolution=douyin_video_cfg["resolution"],
+                fps=douyin_video_cfg["fps"],
+                bitrate=douyin_video_cfg["bitrate"],
+            )
         print(f"✅ 最终成片已导出：{final_path.name}")
 
         # #10 修复：输出文件完整性校验（存在 + 大小 + 时长）
@@ -8761,44 +8790,6 @@ def run_generation_pipeline(
             except Exception as _nle_err:
                 print(f"⚠️  NLE 工程导出跳过：{_nle_err}")
         print(f"⚠️  智能语义贴图失败，保留原片：{sticker_error}")
-
-    if local_asset_mode and local_production_plan:
-        try:
-            from timeline_export import export_all_nle_timelines
-
-            _nle_audio_tracks: List[Dict[str, Any]] = []
-            if voiceover_enabled and voiceover_audio and Path(voiceover_audio).is_file():
-                _nle_audio_tracks.append({
-                    "name": "voiceover",
-                    "role": "voiceover",
-                    "path": str(voiceover_audio),
-                    "start": 0.0,
-                    "volume": 1.0,
-                })
-            if bgm_file and Path(bgm_file).is_file():
-                _bgm_seg = _selected_bgm_segment if "_selected_bgm_segment" in locals() else {}
-                _nle_audio_tracks.append({
-                    "name": Path(bgm_file).stem,
-                    "role": "bgm",
-                    "path": str(bgm_file),
-                    "start": 0.0,
-                    "source_start": float((_bgm_seg or {}).get("start_time") or 0.0),
-                    "volume": 0.25 if voiceover_enabled else 0.6,
-                })
-            _nle_exports = export_all_nle_timelines(
-                local_production_plan,
-                final_dir,
-                output_name,
-                audio_tracks=_nle_audio_tracks,
-                resolution=DOUYIN_CONFIG.get("resolution", OUTPUT_RESOLUTION),
-                fps=int(DOUYIN_CONFIG.get("fps", OUTPUT_FPS)),
-            )
-            print(
-                f"🎞️  已导出可编辑工程文件：{_nle_exports['otio'].name} / "
-                f"{_nle_exports['fcpxml'].name} / {_nle_exports['jianying_draft'].parent.name}/"
-            )
-        except Exception as _nle_err:
-            print(f"⚠️  NLE 工程导出跳过：{_nle_err}")
 
     # ============================================================
     # 发布级质量门禁：放在 pipeline 内部，保证单条和批量入口都执行

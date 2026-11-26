@@ -1271,89 +1271,6 @@ def adjust_clip_duration(
         return output_path
 
 
-def adjust_clip_speed_ramp(
-    clip_path: Path,
-    target_duration: float,
-    output_path: Path,
-    *,
-    mode: str = "ease_in_out",
-    interpolate_slowmo: bool = True,
-) -> Path:
-    """Adjust clip duration with a 3-zone speed ramp or motion-interpolated slow-mo.
-
-    - When slowing down (``speed_ratio < 0.85``) and ``interpolate_slowmo=True``,
-      uses FFmpeg ``minterpolate`` (MCI/blend) so slow-motion stays fluid rather
-      than stuttering.
-    - When speeding up with ``mode="ease_in_out"`` on clips >= 1.5s, applies a
-      fast-in / normal-hero / fast-out speed curve that preserves natural motion
-      during the middle hero beat while landing cleanly on ``target_duration``.
-    """
-    from render_backend import video_encode_args
-
-    clip_path = Path(clip_path)
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    orig_dur = _get_clip_duration(clip_path)
-    if orig_dur <= 0.1 or abs(orig_dur - target_duration) < 0.08:
-        shutil.copy2(clip_path, output_path)
-        return output_path
-
-    speed_ratio = max(0.5, min(2.0, orig_dur / max(target_duration, 0.2)))
-
-    # Smooth motion-interpolated slow-motion
-    if speed_ratio < 0.85 and interpolate_slowmo:
-        vf = (
-            f"setpts={1.0 / speed_ratio:.4f}*PTS,"
-            f"minterpolate=fps={OUTPUT_FPS}:mi_mode=blend"
-        )
-        cmd = [
-            "ffmpeg", "-y", "-i", str(clip_path),
-            "-vf", vf,
-            "-t", f"{target_duration:.3f}",
-            *video_encode_args(profile="intermediate", bitrate=OUTPUT_BITRATE, allow_hw=True),
-            "-an", "-movflags", "+faststart",
-            str(output_path),
-        ]
-        try:
-            run_ffmpeg(cmd, timeout=180, retries=1)
-            if output_path.is_file() and output_path.stat().st_size > 1000:
-                return output_path
-        except Exception:
-            pass
-
-    # 3-zone ease-in / hero / ease-out speed ramp for sped-up showcase clips
-    if mode == "ease_in_out" and speed_ratio > 1.15 and orig_dur >= 1.5:
-        edge_src = orig_dur * 0.25
-        mid_src = orig_dur * 0.50
-        mid_speed = max(1.0, min(speed_ratio, 1.0 + (speed_ratio - 1.0) * 0.45))
-        mid_out = mid_src / mid_speed
-        rem_out = max(0.2, target_duration - mid_out)
-        edge_speed = max(1.0, min(2.5, (2.0 * edge_src) / rem_out))
-        fc = (
-            f"[0:v]trim=0:{edge_src:.3f},setpts=(PTS-STARTPTS)/{edge_speed:.4f}[v0];"
-            f"[0:v]trim={edge_src:.3f}:{edge_src + mid_src:.3f},setpts=(PTS-STARTPTS)/{mid_speed:.4f}[v1];"
-            f"[0:v]trim={edge_src + mid_src:.3f}:{orig_dur:.3f},setpts=(PTS-STARTPTS)/{edge_speed:.4f}[v2];"
-            f"[v0][v1][v2]concat=n=3:v=1:a=0,fps={OUTPUT_FPS}[vout]"
-        )
-        cmd = [
-            "ffmpeg", "-y", "-i", str(clip_path),
-            "-filter_complex", fc,
-            "-map", "[vout]",
-            "-t", f"{target_duration:.3f}",
-            *video_encode_args(profile="intermediate", bitrate=OUTPUT_BITRATE, allow_hw=True),
-            "-an", "-movflags", "+faststart",
-            str(output_path),
-        ]
-        try:
-            run_ffmpeg(cmd, timeout=180, retries=1)
-            if output_path.is_file() and output_path.stat().st_size > 1000:
-                return output_path
-        except Exception:
-            pass
-
-    return adjust_clip_duration(clip_path, target_duration, output_path, method="speed")
-
-
 def _build_atempo_filter(speed_ratio: float) -> str:
     """
     构建 atempo 滤镜链（atempo 单次范围 0.5-2.0，超出时用多级串联）。
@@ -3130,26 +3047,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             _t = text.replace(chr(10), "\\N")
             _t = _inject_highlights(_t, highlight_words, color_tag)
             display_text = f"{anim_tag}{color_tag}{_t}"
-            ass_lines.append(
-                f"Dialogue: 0,{start_str},{end_str},{base_style},,0,0,{item_margin_v},,{display_text}"
-            )
-
-        elif item_animation == "karaoke":
-            word_timings = sub.get("word_timings") or []
-            if word_timings:
-                parts = []
-                for wt in word_timings:
-                    token = str(wt.get("word") or "")
-                    if not token:
-                        continue
-                    cs = max(2, int(round(max(0.02, float(wt.get("end", 0)) - float(wt.get("start", 0))) * 100)))
-                    parts.append(f"{{\\kf{cs}}}{token}")
-                karaoke_body = "".join(parts) or text
-            else:
-                chars = list(text)
-                per_cs = max(2, int(round((duration * 100) / max(len(chars), 1))))
-                karaoke_body = "".join(f"{{\\kf{per_cs}}}{ch}" for ch in chars)
-            display_text = f"{{\\1c{ass_accent}\\2c{ass_primary}}}{karaoke_body}"
             ass_lines.append(
                 f"Dialogue: 0,{start_str},{end_str},{base_style},,0,0,{item_margin_v},,{display_text}"
             )

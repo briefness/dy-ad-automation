@@ -56,6 +56,35 @@ def _ngrams(text: str, size: int = 2) -> set[str]:
     return {normalized[index:index + size] for index in range(len(normalized) - size + 1)}
 
 
+# Domain-agnostic visual-action & physical-state equivalence groups.
+# Bridges natural sales-copy phrasing ("出门随手带一包") to literal visual
+# observations ("手持独立小袋装进包里") without adding any product-category
+# vocabulary or relaxing factual Evidence Anchor boundaries.
+_UNIVERSAL_VISUAL_CONCEPT_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("hold", ("手持", "拿着", "拿取", "握持", "端着", "拿起", "手拿", "拎起", "捧着", "举起")),
+    ("pour", ("倒入", "倒出", "冲泡", "注水", "倒进", "倾倒", "浇入", "注入", "冲开")),
+    ("open", ("撕开", "拆开", "打开", "开盖", "拧开", "开启", "揭开", "掰开", "剪开")),
+    ("pack_portable", ("独立包装", "小袋", "分装", "袋装", "便携", "随身", "随手带", "一包", "小包", "单包")),
+    ("place_in", ("放入", "放进", "塞进", "装进", "放包", "装包", "摆放", "摆在", "放在")),
+    ("closeup", ("特写", "近景", "微距", "细节", "质感", "纹理", "清楚看到", "看细节")),
+    ("origin_env", ("种植", "种植园", "农田", "田间", "农场", "山地", "茶园", "果园", "花田", "产地", "产区", "原野")),
+    ("craft_proc", ("制作", "加工", "工艺", "手工", "烘焙", "炒制", "熬制", "研磨", "筛选", "工序", "车间")),
+    ("consume", ("饮用", "喝下", "品尝", "入口", "尝一", "喝一", "试喝", "试吃")),
+    ("surface", ("桌面", "台面", "办公桌", "餐桌", "厨台", "柜台")),
+    ("container_pack", ("包装", "瓶身", "盒身", "袋身", "标签", "瓶装", "盒装", "罐装")),
+)
+
+
+def _matched_concepts(normalized_text: str) -> set[str]:
+    if not normalized_text:
+        return set()
+    return {
+        concept
+        for concept, aliases in _UNIVERSAL_VISUAL_CONCEPT_GROUPS
+        if any(alias in normalized_text for alias in aliases)
+    }
+
+
 def semantic_overlap(left: Any, right: Any) -> float:
     left_text = _normalize(left)
     right_text = _normalize(right)
@@ -65,7 +94,15 @@ def semantic_overlap(left: Any, right: Any) -> float:
         return min(1.0, min(len(left_text), len(right_text)) / max(len(left_text), len(right_text)) + 0.35)
     left_grams = _ngrams(left_text)
     right_grams = _ngrams(right_text)
-    return len(left_grams & right_grams) / max(len(left_grams | right_grams), 1)
+    ngram_score = len(left_grams & right_grams) / max(len(left_grams | right_grams), 1)
+    left_concepts = _matched_concepts(left_text)
+    right_concepts = _matched_concepts(right_text)
+    if left_concepts and right_concepts:
+        shared = left_concepts & right_concepts
+        if shared:
+            concept_score = min(0.55, (len(shared) / len(left_concepts | right_concepts)) * 0.55)
+            return max(ngram_score, concept_score)
+    return ngram_score
 
 
 def _anchors(contract: Mapping[str, Any]) -> Dict[str, str]:

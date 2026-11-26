@@ -1,9 +1,9 @@
-"""Adaptive shot-boundary detection and compact local visual descriptors."""
+"""Adaptive shot-boundary detection and compact visual descriptors for window deduplication."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, List, Sequence
 
 
 def detect_adaptive_scene_cuts(
@@ -18,16 +18,14 @@ def detect_adaptive_scene_cuts(
 ) -> List[float]:
     """Detect shot boundaries using adaptive rolling-baseline HSV content deltas.
 
-    Uses PySceneDetect's ``AdaptiveDetector`` when ``scenedetect`` is installed,
-    and otherwise runs an equivalent OpenCV+NumPy adaptive rolling-window HSV
-    delta detector that resists flashes, camera shake, and exposure drift far
-    better than a fixed global ``gt(scene, threshold)`` threshold.
+    Delegates to PySceneDetect's ``AdaptiveDetector`` when installed, and otherwise
+    uses an equivalent OpenCV+NumPy rolling-window HSV detector that resists
+    flashes, camera shake, and exposure drift better than a static global threshold.
     """
     source = Path(source)
     if duration <= min_scene_seconds * 1.5:
         return []
 
-    # Tier 1: delegate to PySceneDetect AdaptiveDetector if available
     try:
         from scenedetect import AdaptiveDetector, detect  # type: ignore
 
@@ -37,7 +35,6 @@ def detect_adaptive_scene_cuts(
     except Exception:
         pass
 
-    # Tier 2: native OpenCV + NumPy adaptive HSV + luminance rolling-window detector
     try:
         import cv2
         import numpy as np
@@ -71,7 +68,6 @@ def detect_adaptive_scene_cuts(
                 hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV).astype(np.float32)
                 ts = frame_idx / native_fps
                 if prev_hsv is not None:
-                    # Weighted H/S/V mean absolute difference (PySceneDetect ContentDetector formula)
                     dh = np.abs(hsv[:, :, 0] - prev_hsv[:, :, 0])
                     dh = np.minimum(dh, 180.0 - dh) * (255.0 / 90.0)
                     ds = np.abs(hsv[:, :, 1] - prev_hsv[:, :, 1])
@@ -99,7 +95,6 @@ def detect_adaptive_scene_cuts(
         if not neighbors:
             continue
         baseline = max(1.0, float(sum(neighbors) / len(neighbors)))
-        # Must be a local peak above the rolling neighborhood
         if val >= adaptive_threshold * baseline and val >= max(neighbors):
             cuts.append(timestamps[i])
 
@@ -119,11 +114,7 @@ def _filter_cuts(raw_cuts: Sequence[float], duration: float, min_scene_seconds: 
 
 
 def compute_visual_descriptor_from_frames(frames_bgr: Sequence[Any]) -> List[float]:
-    """Compute a normalized 48-D visual descriptor (HSV histogram + spatial edge grid).
-
-    Deterministic, zero-GPU, fast to store in ``index.json``, and useful for
-    near-duplicate suppression, visual continuity scoring, and alternate-shot retrieval.
-    """
+    """Compute a compact 48-D HSV+edge descriptor for intra-shot static window deduplication."""
     if not frames_bgr:
         return []
     import cv2
@@ -139,23 +130,18 @@ def compute_visual_descriptor_from_frames(frames_bgr: Sequence[Any]) -> List[flo
         s_hist = cv2.calcHist([hsv], [1], None, [8], [0, 256]).flatten()
         v_hist = cv2.calcHist([hsv], [2], None, [8], [0, 256]).flatten()
         color_vec = np.concatenate([h_hist, s_hist, v_hist]).astype(np.float32)
-        color_norm = float(np.linalg.norm(color_vec)) + 1e-6
-        color_vec = color_vec / color_norm
+        color_vec = color_vec / (float(np.linalg.norm(color_vec)) + 1e-6)
 
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 60, 150).astype(np.float32) / 255.0
-        grid = []
         gh, gw = edges.shape
-        for r in range(4):
-            for c in range(4):
-                cell = edges[
-                    r * gh // 4:(r + 1) * gh // 4,
-                    c * gw // 4:(c + 1) * gw // 4,
-                ]
-                grid.append(float(np.mean(cell)) if cell.size else 0.0)
+        grid = [
+            float(np.mean(edges[r * gh // 4:(r + 1) * gh // 4, c * gw // 4:(c + 1) * gw // 4]))
+            for r in range(4)
+            for c in range(4)
+        ]
         edge_vec = np.array(grid, dtype=np.float32)
-        edge_norm = float(np.linalg.norm(edge_vec)) + 1e-6
-        edge_vec = edge_vec / edge_norm
+        edge_vec = edge_vec / (float(np.linalg.norm(edge_vec)) + 1e-6)
 
         combined = np.concatenate([color_vec * 0.75, edge_vec * 0.25])
         combined /= float(np.linalg.norm(combined)) + 1e-6
@@ -169,7 +155,7 @@ def compute_visual_descriptor_from_frames(frames_bgr: Sequence[Any]) -> List[flo
 
 
 def visual_cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
-    """Cosine similarity in [0, 1] between two visual descriptor vectors."""
+    """Cosine similarity in [0, 1] between two visual descriptors."""
     if not vec_a or not vec_b or len(vec_a) != len(vec_b):
         return 0.0
     dot = sum(float(a) * float(b) for a, b in zip(vec_a, vec_b))
@@ -178,55 +164,3 @@ def visual_cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> 
     if norm_a <= 1e-8 or norm_b <= 1e-8:
         return 0.0
     return max(0.0, min(1.0, dot / (norm_a * norm_b)))
-
-
-def rank_similar_windows(
-    target_window: Dict[str, Any],
-    windows: Sequence[Dict[str, Any]],
-    *,
-    limit: int = 6,
-    exclude_same_source_overlap: bool = True,
-) -> List[Dict[str, Any]]:
-    """Rank candidate alternative windows by visual + role similarity for interactive swapping."""
-    target_vec = target_window.get("visual_descriptor") or []
-    target_role = str(
-        target_window.get("selected_role")
-        or (target_window.get("analysis") or {}).get("product_story_role")
-        or ""
-    ).lower()
-    target_source = str(target_window.get("source_video") or target_window.get("source_path") or "")
-    target_start = float(target_window.get("source_start", target_window.get("start", 0.0)) or 0.0)
-    target_end = float(target_window.get("source_end", target_window.get("end", 0.0)) or 0.0)
-
-    scored: List[Tuple[float, Dict[str, Any]]] = []
-    for win in windows:
-        analysis = win.get("analysis") or {}
-        if analysis.get("usable_for_ad") is False:
-            continue
-        win_source = str(win.get("source_path") or win.get("source_video") or "")
-        win_start = float(win.get("start") or 0.0)
-        win_end = float(win.get("end") or 0.0)
-        if exclude_same_source_overlap and Path(win_source).name == Path(target_source).name:
-            overlap = max(0.0, min(target_end, win_end) - max(target_start, win_start))
-            if overlap > 0.5:
-                continue
-
-        sim = visual_cosine_similarity(target_vec, win.get("visual_descriptor") or [])
-        win_role = str(analysis.get("product_story_role") or "").lower()
-        role_bonus = 0.35 if target_role and win_role == target_role else 0.0
-        conf_bonus = 0.15 * float(analysis.get("confidence") or 0.5)
-        score = round(0.50 * sim + role_bonus + conf_bonus, 4)
-        scored.append((score, {
-            "window_id": win.get("window_id", ""),
-            "source_path": str(win.get("source_path") or ""),
-            "source_video": str(win.get("source_video") or Path(win_source).name),
-            "start": round(win_start, 3),
-            "end": round(win_end, 3),
-            "duration": round(max(0.0, win_end - win_start), 3),
-            "role": win_role or "unknown",
-            "summary": str(analysis.get("summary") or analysis.get("visual_summary") or ""),
-            "similarity": score,
-        }))
-
-    scored.sort(key=lambda item: item[0], reverse=True)
-    return [item for _, item in scored[:max(1, limit)]]

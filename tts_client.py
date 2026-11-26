@@ -1328,19 +1328,6 @@ def align_voiceover_lines_to_audio_pauses(
                 aligned = refined
         except Exception:
             pass
-
-    try:
-        from audio_alignment import build_word_timings
-
-        for item in aligned:
-            if not item.get("word_timings"):
-                item["word_timings"] = build_word_timings(
-                    str(item.get("text") or ""),
-                    float(item["start"]),
-                    float(item["end"]),
-                )
-    except Exception:
-        pass
     return aligned
 
 

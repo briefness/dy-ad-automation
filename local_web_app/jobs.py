@@ -34,7 +34,7 @@ class JobManager:
         process.start();
         try: os.setpgid(process.pid, process.pid)
         except (OSError, AttributeError): pass
-        self.job = {"id": uuid.uuid4().hex, "kind": kind, "process": process, "queue": queue, "stage": "queued", "progress": 0, "logs": [], "result": None, "error": None, "started_at": time.time(), "cancelled": False}
+        self.job = {"id": uuid.uuid4().hex, "kind": kind, "process": process, "queue": queue, "stage": "queued", "progress": 0, "logs": [], "result": None, "error": None, "diagnostics": None, "started_at": time.time(), "cancelled": False}
         return self.public_status()
 
     def poll(self) -> dict:
@@ -52,7 +52,10 @@ class JobManager:
             elif message["kind"] == "result":
                 job["result"] = message["result"]; job["stage"] = "completed"; job["progress"] = 100
                 if job["kind"] == "preflight": self.last_preflight = job["result"]
-            elif message["kind"] == "error": job["error"] = message["error"]; job["stage"] = "cancelled" if job["cancelled"] else "failed"
+            elif message["kind"] == "error":
+                job["error"] = message["error"]
+                job["diagnostics"] = message.get("diagnostics")
+                job["stage"] = "cancelled" if job["cancelled"] else "failed"
         if not job["process"].is_alive() and job["stage"] not in {"completed", "failed", "cancelled"}: job["stage"] = "failed"; job["error"] = job["error"] or "worker unexpectedly exited"
         return self.public_status()
 
@@ -78,4 +81,4 @@ class JobManager:
 
     def public_status(self) -> dict:
         if not self.job: return {"active": False}
-        job = self.job; return {k: job[k] for k in ("id", "kind", "stage", "progress", "logs", "result", "error", "started_at", "cancelled") } | {"active": job["process"].is_alive() and job["stage"] not in {"completed", "failed", "cancelled"}}
+        job = self.job; return {k: job[k] for k in ("id", "kind", "stage", "progress", "logs", "result", "error", "diagnostics", "started_at", "cancelled") } | {"active": job["process"].is_alive() and job["stage"] not in {"completed", "failed", "cancelled"}}
